@@ -14,18 +14,22 @@ function(add_group_gemm_w4a16_xe20_inst POLICY ELEMENT_S ELEMENT_A SANITIZED)
     set(GROUP_GEMM_W4A16_XE20_INST_SRCS ${GROUP_GEMM_W4A16_XE20_INST_SRCS} PARENT_SCOPE)
 endfunction()
 
-# Policy menu. select_w4a16_tile_m() in GroupGemmW4A16Xe20.cpp picks one per
-# call from the average rows-per-expert:
+# Policy menu. select_w4a16_policy_id() in GroupGemmW4A16Xe20.cpp picks one per
+# call from the average rows-per-expert and the GEMM shape:
 #   w4a16_policy_m_8_n_64    <_8,  _64,  _32>  — avg_m <= 4
 #   w4a16_policy_m_16_n_64   <_16, _64,  _32>  — avg_m <= 8
-#   w4a16_policy_m_32_n_64   <_32, _64,  _32>  — small avg_m
-#   w4a16_policy_m_64_n_128  <_64, _128, _32>  — mid avg_m
-#   w4a16_policy_m_128_n_128 <_128,_128, _32>  — large avg_m
+#   w4a16_policy_m_32_n_64   <_32, _64,  _32>  — avg_m <= 32
+#   w4a16_policy_m_64_n_128  <_64, _128, _32>  — large avg_m, short K or N tail
+#   w4a16_policy_m_64_n_256  <_64, _256, _32>  — large avg_m
+#   w4a16_policy_m_128_n_128 <_128,_128, _32>  — measurement reference only
 # group_size (32/64/128/256) is compiled into every unit as a runtime branch,
-# so it does not multiply the instance count. Total: 5 policies x 2 (int4/mxfp4)
-# x 2 (bf16/fp16 activation) = 20 units.
-foreach(policy w4a16_policy_m_8_n_64 w4a16_policy_m_16_n_64 w4a16_policy_m_32_n_64
-               w4a16_policy_m_64_n_128 w4a16_policy_m_128_n_128)
+# so it does not multiply the instance count. Total: 6 policies x 2 (int4/mxfp4)
+# x 2 (bf16/fp16 activation) = 24 units.
+set(GROUP_GEMM_W4A16_XE20_POLICIES
+    w4a16_policy_m_8_n_64 w4a16_policy_m_16_n_64 w4a16_policy_m_32_n_64
+    w4a16_policy_m_64_n_128 w4a16_policy_m_64_n_256 w4a16_policy_m_128_n_128)
+
+foreach(policy ${GROUP_GEMM_W4A16_XE20_POLICIES})
     foreach(act_tag bf16 fp16)
         if(act_tag STREQUAL "bf16")
             set(element_a "cutlass::bfloat16_t")

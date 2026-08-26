@@ -37,6 +37,8 @@
 
 #include <sycl/sycl.hpp>
 
+#include <cstdlib>
+
 #include "sgl_kernel_export.h"
 #include "sycl/Utils.h"
 #include "sycl/kernels/moe/xe20/w4a16/gemm_xe2_policy.hpp"
@@ -57,6 +59,8 @@ void w4a16_launch(
     const int gemm_n,
     const int gemm_k,
     const int* rows_per_expert,
+    const int* row_offsets,
+    const int total_rows,
     const int num_experts,
     const int group_size,
     int32_t* atomic_buffer);
@@ -74,6 +78,8 @@ void w4a16_launch(
       const int,                                                                       \
       const int,                                                                       \
       const int*,                                                                      \
+      const int*,                                                                      \
+      const int,                                                                       \
       const int,                                                                       \
       const int,                                                                       \
       int32_t*);
@@ -88,6 +94,7 @@ DECLARE_W4A16_POLICY(w4a16_policy_m_8_n_64)
 DECLARE_W4A16_POLICY(w4a16_policy_m_16_n_64)
 DECLARE_W4A16_POLICY(w4a16_policy_m_32_n_64)
 DECLARE_W4A16_POLICY(w4a16_policy_m_64_n_128)
+DECLARE_W4A16_POLICY(w4a16_policy_m_64_n_256)
 DECLARE_W4A16_POLICY(w4a16_policy_m_128_n_128)
 
 #undef DECLARE_W4A16_POLICY
@@ -95,53 +102,77 @@ DECLARE_W4A16_POLICY(w4a16_policy_m_128_n_128)
 
 namespace {
 
-// GEMM shape -> tile policy, weighted by how much of each tile the GEMM fills.
+// GEMM shape -> tile policy. Ids match the policy order in
+// GroupGemmW4A16Xe20.cmake and w4a16_policy() in src/jit/moe_jit.cpp:
+//   0: 8x64   1: 16x64   2: 32x64   3: 64x128   4: 64x256   5: 128x128
 //
 // The grouped GEMM tiles every expert's rows independently, so a policy with an
-// M tile of T computes ceil(avg_m / T) * T rows per expert whatever avg_m is.
-// Picking the widest tile unconditionally therefore falls off a cliff just past
-// a multiple of T: at avg_m = 129 an M=128 tile does 256 rows of work for 129
-// rows of data and loses half the machine. N tails have the same effect: a
-// policy computes ceil(gemm_n / tile_n) * tile_n columns. Scoring each candidate
-// by its peak throughput times both fill factors estimates which policy finishes
-// first.
+// M tile of T computes ceil(rows_e / T) * T rows for expert e, and a tile is
+// only as good as the fraction of itself the rows fill. What the host can see is
+// the *mean* rows per expert, and on real routing the mean does not bound that
+// fraction: all three GPT-OSS-120B prefill layers average 128 rows per expert,
+// yet their per-expert rows run from 0 to 3573, so a 128-row tile that the mean
+// scores as a perfect fit really fills 0.61-0.82 of itself. Reading the routing
+// histogram would need a device-to-host copy on every call.
 //
-// The peaks below are measured on Xe2 (Arc Pro B60, bf16 activations) at
-// avg_m values that fill each tile exactly, in TFLOP/s. They are only ever
-// compared against each other, so the absolute scale does not matter -- what
-// matters is that a wider tile is worth more per row but wastes more of a
-// partial tile. GPT-OSS gemm1 (N=5760, K=2880) and DeepSeek-V4 gemm1
-// (N=4096, K=4096) agree on this ordering.
-constexpr int kW4A16TileM[] = {32, 64, 128};
-constexpr int kW4A16TileN[] = {64, 128, 128};
-constexpr float kW4A16TilePeakTflops[] = {49.0f, 64.0f, 68.0f};
+// So the mean picks the M tile only where it bounds the padding -- below one
+// tile of rows -- and everything above runs the 64-row tile, whose padding is at
+// most ceil(rows_e / 64) * 64 whatever the tail looks like (1.234x on the real
+// layer-0 histogram, against 1.6-1.9x for a 128-row tile). Measured on the real
+// TP=4 layer-0 routing vector, the 64-row tile this picks beats the 128-row
+// policy the menu used to select by 34% (gemm2: 60.5 against 45.1 TFLOP/s) and
+// 36% (gemm1: 67.1 against 49.3).
+//
+// That leaves BLK_N, and the two 64-row tiles differ only there. Their
+// padding-free rates on Arc Pro B60 (bf16 activations, gemm1 geometry with the M
+// padding removed, TFLOP/s) are 82.9 for the 256-wide tile and 75.6 for the
+// 128-wide one; only the ratio matters below, as it prices how much N tail the
+// wider tile may waste before the narrower one wins.
+constexpr float kW4A16PeakN256 = 82.9f;
+constexpr float kW4A16PeakN128 = 75.6f;
 
-int select_w4a16_tile_m(int avg_m, int gemm_n) {
-  int best_tile_m = kW4A16TileM[0];
-  float best_score = 0.0f;
-  for (size_t i = 0; i < sizeof(kW4A16TileM) / sizeof(kW4A16TileM[0]); ++i) {
-    const int tile_m = kW4A16TileM[i];
-    const int tile_n = kW4A16TileN[i];
-    const int rows_computed = ((avg_m + tile_m - 1) / tile_m) * tile_m;
-    const int columns_computed = ((gemm_n + tile_n - 1) / tile_n) * tile_n;
-    const float score = kW4A16TilePeakTflops[i] * static_cast<float>(avg_m) / static_cast<float>(rows_computed) *
-                        static_cast<float>(gemm_n) / static_cast<float>(columns_computed);
-    if (score > best_score) {
-      best_score = score;
-      best_tile_m = tile_m;
-    }
-  }
-  return best_tile_m;
+// A short K demotes the wide tile outright. An MoE layer's second GEMM contracts
+// over the sharded intermediate size (736 at TP=4, 384 at TP=8) instead of the
+// hidden size, so its k-loop is 4-8x shorter and the per-work-group-tile costs
+// the 256-wide tile pays -- its extra B load and its epilogue -- amortise over
+// that much less dpas. Measured on the real TP=4 layer-0 gemm2 (N=2880, K=736)
+// the 128-wide tile is 60.5 TFLOP/s against the 256-wide tile's 52.7, a 15% gap
+// the N-fill score below cannot see: at N=2880 it scores the wide tile 77.7
+// against 75.6 and would select it, so this branch has to come first.
+constexpr int kW4A16ShortK = 1024;
+
+int round_up(int value, int multiple) {
+  return (value + multiple - 1) / multiple * multiple;
 }
 
-int select_w4a16_policy_id(int avg_m, int gemm_n) {
+int select_w4a16_policy_id(int avg_m, int gemm_n, int gemm_k) {
   if (avg_m <= 4) return 0;
   if (avg_m <= 8) return 1;
+  if (avg_m <= 32) return 2;
+  if (gemm_k <= kW4A16ShortK) return 3;
 
-  const int tile_m = select_w4a16_tile_m(avg_m, gemm_n);
-  if (tile_m <= 32) return 2;
-  if (tile_m <= 64) return 3;
-  return 4;
+  // Long K: the wider tile wins unless its N tail wastes more than it is worth.
+  // A policy computes ceil(gemm_n / BLK_N) * BLK_N columns, and ceil at 256 is
+  // never kinder than ceil at 128, so this only ever demotes the wide tile --
+  // e.g. N=1152 leaves it 0.9 filled against 1.0, which its 1.097x rate cannot
+  // pay for, while N=2880 (0.9375 against 1.0) it still wins on long K.
+  const float fill_n256 = static_cast<float>(gemm_n) / static_cast<float>(round_up(gemm_n, 256));
+  const float fill_n128 = static_cast<float>(gemm_n) / static_cast<float>(round_up(gemm_n, 128));
+  return kW4A16PeakN256 * fill_n256 >= kW4A16PeakN128 * fill_n128 ? 4 : 3;
+}
+
+// Measurement hook: force one policy id so a benchmark can price every tile from
+// a single build. Unset in production; an out-of-range value is ignored.
+constexpr int kW4A16MaxPolicyId = 5;
+
+int w4a16_forced_policy_id() {
+  static const int forced = [] {
+    const char* value = std::getenv("SGL_MOE_W4A16_POLICY_ID");
+    if (value == nullptr || *value == '\0') return -1;
+    const int id = std::atoi(value);
+    return (id >= 0 && id <= kW4A16MaxPolicyId) ? id : -1;
+  }();
+  return forced;
 }
 
 }  // namespace
@@ -248,9 +279,11 @@ SGL_KERNEL_EXPORT void moe_grouped_mm_nt_xe20_w4a16(
   auto stream = at::xpu::getCurrentXPUStream();
   auto queue = stream.queue();
   at::Tensor atomic_buffer = at::empty({static_cast<long>(1)}, activations.options().dtype(at::kInt));
+  queue.memset(atomic_buffer.data_ptr<int>(), 0, sizeof(int32_t));
 
   const int avg_m = total_m / static_cast<int>(n_experts);
-  const int policy_id = select_w4a16_policy_id(avg_m, gemm_n);
+  const int forced_policy_id = w4a16_forced_policy_id();
+  const int policy_id = forced_policy_id >= 0 ? forced_policy_id : select_w4a16_policy_id(avg_m, gemm_n, gemm_k);
   const bool is_fp16_act = activations.scalar_type() == at::ScalarType::Half;
 #define LAUNCH_W4A16(Policy)                                                                  \
   do {                                                                                        \
@@ -267,6 +300,8 @@ SGL_KERNEL_EXPORT void moe_grouped_mm_nt_xe20_w4a16(
             gemm_n,                                                                           \
             gemm_k,                                                                           \
             rows_per_expert.data_ptr<int>(),                                                  \
+            nullptr,                                                                          \
+            total_m,                                                                          \
             static_cast<int>(n_experts),                                                      \
             static_cast<int>(group_size),                                                     \
             atomic_buffer.data_ptr<int>());                                                   \
@@ -282,6 +317,8 @@ SGL_KERNEL_EXPORT void moe_grouped_mm_nt_xe20_w4a16(
             gemm_n,                                                                           \
             gemm_k,                                                                           \
             rows_per_expert.data_ptr<int>(),                                                  \
+            nullptr,                                                                          \
+            total_m,                                                                          \
             static_cast<int>(n_experts),                                                      \
             static_cast<int>(group_size),                                                     \
             atomic_buffer.data_ptr<int>());                                                   \
@@ -299,6 +336,8 @@ SGL_KERNEL_EXPORT void moe_grouped_mm_nt_xe20_w4a16(
             gemm_n,                                                                           \
             gemm_k,                                                                           \
             rows_per_expert.data_ptr<int>(),                                                  \
+            nullptr,                                                                          \
+            total_m,                                                                          \
             static_cast<int>(n_experts),                                                      \
             static_cast<int>(group_size),                                                     \
             atomic_buffer.data_ptr<int>());                                                   \
@@ -314,6 +353,8 @@ SGL_KERNEL_EXPORT void moe_grouped_mm_nt_xe20_w4a16(
             gemm_n,                                                                           \
             gemm_k,                                                                           \
             rows_per_expert.data_ptr<int>(),                                                  \
+            nullptr,                                                                          \
+            total_m,                                                                          \
             static_cast<int>(n_experts),                                                      \
             static_cast<int>(group_size),                                                     \
             atomic_buffer.data_ptr<int>());                                                   \
@@ -337,6 +378,9 @@ SGL_KERNEL_EXPORT void moe_grouped_mm_nt_xe20_w4a16(
         LAUNCH_W4A16(w4a16_policy_m_64_n_128);  \
         break;                                  \
       case 4:                                   \
+        LAUNCH_W4A16(w4a16_policy_m_64_n_256);  \
+        break;                                  \
+      case 5:                                   \
         LAUNCH_W4A16(w4a16_policy_m_128_n_128); \
         break;                                  \
     }                                           \
@@ -360,6 +404,8 @@ SGL_KERNEL_EXPORT void moe_grouped_mm_nt_xe20_w4a16(
             gemm_n,
             gemm_k,
             rows_per_expert.data_ptr<int>(),
+            nullptr,
+            total_m,
             static_cast<int>(n_experts),
             static_cast<int>(group_size),
             atomic_buffer.data_ptr<int>(),

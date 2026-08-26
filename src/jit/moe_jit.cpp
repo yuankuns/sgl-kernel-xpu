@@ -152,6 +152,8 @@ using W4A16Fn = void (*)(
     int,
     int,
     const int*,
+    const int*,
+    int,
     int,
     int,
     int*);
@@ -169,6 +171,8 @@ const char* w4a16_policy(int policy_id) {
     case 3:
       return "w4a16_policy_m_64_n_128";
     case 4:
+      return "w4a16_policy_m_64_n_256";
+    case 5:
       return "w4a16_policy_m_128_n_128";
     default:
       return nullptr;
@@ -239,6 +243,8 @@ bool w4a16_grouped_gemm_launch(
     int gemm_n,
     int gemm_k,
     const int* rows_per_expert,
+    const int* row_offsets,
+    int total_rows,
     int num_experts,
     int group_size,
     int* atomic_buffer,
@@ -256,6 +262,8 @@ bool w4a16_grouped_gemm_launch(
      gemm_n,
      gemm_k,
      rows_per_expert,
+     row_offsets,
+     total_rows,
      num_experts,
      group_size,
      atomic_buffer);
