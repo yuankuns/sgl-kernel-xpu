@@ -29,8 +29,12 @@
 # experts, hidden=4096, intermediate=2048) and higher-load model points.
 # Set SGL_MOE_BENCH_CLAIM_ONLY=1 for the Arc Pro B60 claim shape from the
 # optimized W4A16 kernel: E=128, M=128, N=1472, K=2880.
-# Set SGL_MOE_BENCH_GPT_OSS=1 to additionally run the two real GPT-OSS-120B
-# TP=4 prefill-L0 routing examples from the upstream W4A16 benchmark.
+# Set SGL_MOE_BENCH_GPT_OSS=1 to additionally run every GPT-OSS-120B shape: both
+# GEMMs at TP=1/2/4/8, each in the prefill regime (the real ragged layer-0
+# routing vector, as in the upstream W4A16 benchmark) and at three decode batch
+# sizes. That is 32 measurements over 8 distinct weight sets, so the CPU-side
+# MXFP4 quantization dominates the run; narrow it with
+# SGL_MOE_BENCH_GPT_OSS_ONLY=<substring of the workload name>.
 #
 # Run:
 #   python benchmark/bench_moe_w4a16_grouped_gemm.py
@@ -244,10 +248,52 @@ GPT_OSS_120B_TP4_L0_ROWS = (
     20,
     2340,
 )
-GPT_OSS_BENCH_EXAMPLES = (
-    ("gpt-oss-120b-tp4-prefill-l0-gemm1", 1472, 2880, GPT_OSS_120B_TP4_L0_ROWS),
-    ("gpt-oss-120b-tp4-prefill-l0-gemm2", 2880, 736, GPT_OSS_120B_TP4_L0_ROWS),
-)
+
+def _gpt_oss_120b_examples():
+    """Every GPT-OSS-120B grouped-GEMM shape this kernel can be asked for.
+
+    hidden=2880, 128 experts, top-4, expert intermediate=2880. Tensor
+    parallelism replicates the experts and shards the intermediate dimension,
+    so every rank sees all 128 experts and the same routing; only N (gemm1) or
+    K (gemm2) shrinks. The per-rank shard is the MXFP4 group-aligned
+    ceil(2880/TP/32)*32, which is why TP=4 is 736 and not 720.
+
+    Two load regimes per shape, because they land on opposite sides of the
+    dispatcher and on opposite rooflines. Prefill uses the real ragged layer-0
+    routing vector and is compute-bound; decode is uniform, at the batch sizes
+    that put mean rows per expert on each small-tile band (tokens*4/128: 32 ->
+    1, 256 -> 8, 1024 -> 32), and is bound by reading the whole weight set.
+
+    Shapes for one (N, K) are emitted adjacently so they share the single-entry
+    CPU weight cache: 8 quantizations, not 32.
+    """
+    examples = []
+    for tp, shard in ((1, 2880), (2, 1440), (4, 736), (8, 384)):
+        for gemm, n, k in (("gemm1", 2 * shard, 2880), ("gemm2", 2880, shard)):
+            examples.append(
+                (
+                    f"gpt-oss-120b-tp{tp}-prefill-l0-{gemm}",
+                    n,
+                    k,
+                    GPT_OSS_120B_TP4_L0_ROWS,
+                )
+            )
+            for avg_m in (1, 8, 32):
+                examples.append(
+                    (
+                        f"gpt-oss-120b-tp{tp}-decode-m{avg_m}-{gemm}",
+                        n,
+                        k,
+                        (avg_m,) * len(GPT_OSS_120B_TP4_L0_ROWS),
+                    )
+                )
+    return tuple(examples)
+
+
+GPT_OSS_BENCH_EXAMPLES = _gpt_oss_120b_examples()
+# Substring filter over the workload names above, for pricing one TP config or
+# one regime without paying for the other seven quantizations.
+GPT_OSS_BENCH_FILTER = os.environ.get("SGL_MOE_BENCH_GPT_OSS_ONLY", "")
 print(
     f"[config] grouped-GEMM shape set: "
     f"{'claim-only' if RUN_CLAIM_ONLY else 'full' if RUN_FULL_SHAPES else 'quick'} "
@@ -732,6 +778,8 @@ def _run_gpt_oss_benchmark_examples():
 
     rows = []
     for name, n, k, routed_rows in GPT_OSS_BENCH_EXAMPLES:
+        if GPT_OSS_BENCH_FILTER and GPT_OSS_BENCH_FILTER not in name:
+            continue
         inputs = _prepare_inputs(
             len(routed_rows),
             sum(routed_rows) // len(routed_rows),
@@ -749,15 +797,21 @@ def _run_gpt_oss_benchmark_examples():
         )
         total_m = inputs["total_m"]
         tflops = 2 * total_m * n * k / (ms / 1e3) / 1e12
+        # The decode points do very little math per byte of weight, so TOPS says
+        # nothing about how close to the roofline they are; price the compulsory
+        # traffic too (packed weights K/2 per element, E8M0 scales K/32, A, D).
+        experts = len(routed_rows)
+        bytes_moved = experts * n * (k // 2 + k // 32) + total_m * (k + n) * 2
         rows.append(
             {
                 "workload": name,
-                "experts": len(routed_rows),
+                "experts": experts,
                 "total_m": total_m,
                 "N": n,
                 "K": k,
                 "median_ms": round(ms, 4),
                 "TOPS": round(tflops, 2),
+                "GB/s": round(bytes_moved / (ms / 1e3) / 1e9, 1),
             }
         )
         del inputs

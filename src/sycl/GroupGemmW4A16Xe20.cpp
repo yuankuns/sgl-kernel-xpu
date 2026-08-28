@@ -141,12 +141,32 @@ constexpr float kW4A16PeakN128 = 75.6f;
 // against 75.6 and would select it, so this branch has to come first.
 constexpr int kW4A16ShortK = 1024;
 
+// A short K also reaches the smallest tile, at a different threshold and for the
+// opposite reason: there the launch reads every expert's weights to do very
+// little arithmetic, so it runs at the memory roofline (390-450 GB/s of the
+// part's 456) and the tile only has to keep its subgroups fed. Below ~24 k-loop
+// iterations the 8-row tile stops filling the pipeline and the 16-row tile is
+// faster, uniformly across the band. Measured at N=2880, E=128, the 16-row tile
+// against the 8-row one, at avg_m = 1 / 2 / 4:
+//
+//   K=384   +2.04% +2.50% +2.17%
+//   K=736   +0.66% +0.84% +0.51%
+//   K=1024  -0.88% -0.64% -0.47%
+//   K=1152  -1.25% -1.01% -0.50%
+//   K=1440  -1.05% -0.70% -0.32%
+//   K=2880  -0.99% -0.68% -0.39%
+//
+// so the crossover is between 736 and 1024, and 768 is the group-aligned value
+// in between. This is the decode path of an MoE layer's second GEMM: at TP=8 it
+// contracts over K=384 and at TP=4 over K=736.
+constexpr int kW4A16TinyMShortK = 768;
+
 int round_up(int value, int multiple) {
   return (value + multiple - 1) / multiple * multiple;
 }
 
 int select_w4a16_policy_id(int avg_m, int gemm_n, int gemm_k) {
-  if (avg_m <= 4) return 0;
+  if (avg_m <= 4) return gemm_k <= kW4A16TinyMShortK ? 1 : 0;
   if (avg_m <= 8) return 1;
   if (avg_m <= 32) return 2;
   if (gemm_k <= kW4A16ShortK) return 3;

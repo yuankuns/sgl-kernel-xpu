@@ -977,14 +977,32 @@ def test_moe_grouped_mm_nt_xe20_w4a16_mxfp4_ragged_unaligned_n(dtype):
         (8, 32),  # smallest MXFP4 group and N corner
     ],
 )
-def test_moe_grouped_mm_nt_xe20_w4a16_mxfp4_target_accuracy_shapes(gemm_n, gemm_k):
+@pytest.mark.parametrize(
+    "rows_per_expert",
+    [
+        [3, 0, 8],  # mean 3: the 8-row tile, or the 16-row one on short K
+        [5, 0, 12],  # mean 5: the 16-row tile
+        [50, 0, 70],  # mean 40: the 64-row tiles, 256-wide N where N allows
+    ],
+)
+def test_moe_grouped_mm_nt_xe20_w4a16_mxfp4_target_accuracy_shapes(
+    gemm_n, gemm_k, rows_per_expert
+):
     """Reference-checked MXFP4 coverage for every shape in 0410c82d51.
 
     The small ragged routing distribution retains the original commit's
     zero-row and non-tile-multiple cases without making the production-width
     reference GEMM prohibitively large.
+
+    The three row vectors exist to select different tiles. Dispatch keys on the
+    mean rows per expert and on K, so crossing these three means with these four
+    K values selects the 8x64, 16x64, 64x128 and 64x256 policies -- including the
+    64x256 tile that serves GPT-OSS-120B prefill, which no other test reaches,
+    and both sides of the short-K branch inside the smallest band. Together with
+    the ragged unaligned-N test above (mean 14, the 32x64 tile) that is every
+    policy the host can select; the 128x128 reference tile is reachable only
+    through the SGL_MOE_W4A16_POLICY_ID measurement hook.
     """
-    rows_per_expert = [5, 0, 12]
     num_experts = len(rows_per_expert)
     inputs = _build_moe_gemm_inputs(
         num_experts=num_experts,
