@@ -35,14 +35,13 @@
 #include <c10/xpu/XPUStream.h>
 #include <torch/all.h>
 
-#include <sycl/sycl.hpp>
-
 #include <cstdint>
+#include <sycl/sycl.hpp>
 #include <unordered_map>
 
 #include "sgl_kernel_export.h"
 #include "sycl/Utils.h"
-#include "sycl/kernels/moe/xe20/w4a16_launch_policy.hpp"
+#include "sycl/kernels/moe/xe20/w4a16/launch_policy.hpp"
 #ifdef USE_MOE_JIT
 #include "jit/moe_jit.h"
 #endif
@@ -111,10 +110,6 @@ constexpr float kW4A16PeakN256 = 82.9f;
 constexpr float kW4A16PeakN128 = 75.6f;
 constexpr int kW4A16ShortK = 1024;
 
-int round_up(int value, int multiple) {
-  return (value + multiple - 1) / multiple * multiple;
-}
-
 bool want_nskip(int gemm_n, int tile_n) {
   const int tail = gemm_n % tile_n;
   return tail != 0 && tail <= tile_n / 2;
@@ -145,8 +140,8 @@ int select_w4a16_policy_id(int avg_m, int gemm_n, int gemm_k) {
     return want_nskip(gemm_n, 128) ? 4 : 3;
   }
 
-  const float fill_n256 = static_cast<float>(gemm_n) / round_up(gemm_n, 256);
-  const float fill_n128 = static_cast<float>(gemm_n) / round_up(gemm_n, 128);
+  const float fill_n256 = static_cast<float>(gemm_n) / cute::round_up(gemm_n, 256);
+  const float fill_n128 = static_cast<float>(gemm_n) / cute::round_up(gemm_n, 128);
   if (kW4A16PeakN256 * fill_n256 >= kW4A16PeakN128 * fill_n128) {
     return want_nskip(gemm_n, 256) ? 6 : 5;
   }
@@ -337,34 +332,34 @@ SGL_KERNEL_EXPORT void moe_grouped_mm_nt_xe20_w4a16(
     }                                                                                         \
   } while (0)
 
-#define DISPATCH_W4A16_POLICY()                 \
-  do {                                          \
-    switch (policy_id) {                        \
-      case 0:                                   \
-        LAUNCH_W4A16(w4a16_launch_policy_m_8_n_64);    \
-        break;                                  \
-      case 1:                                   \
-        LAUNCH_W4A16(w4a16_launch_policy_m_16_n_64);   \
-        break;                                  \
-      case 2:                                   \
-        LAUNCH_W4A16(w4a16_launch_policy_m_32_n_64);   \
-        break;                                  \
-      case 3:                                   \
-        LAUNCH_W4A16(w4a16_launch_policy_m_64_n_128);  \
-        break;                                  \
-      case 4:                                   \
+#define DISPATCH_W4A16_POLICY()                            \
+  do {                                                     \
+    switch (policy_id) {                                   \
+      case 0:                                              \
+        LAUNCH_W4A16(w4a16_launch_policy_m_8_n_64);        \
+        break;                                             \
+      case 1:                                              \
+        LAUNCH_W4A16(w4a16_launch_policy_m_16_n_64);       \
+        break;                                             \
+      case 2:                                              \
+        LAUNCH_W4A16(w4a16_launch_policy_m_32_n_64);       \
+        break;                                             \
+      case 3:                                              \
+        LAUNCH_W4A16(w4a16_launch_policy_m_64_n_128);      \
+        break;                                             \
+      case 4:                                              \
         LAUNCH_W4A16(w4a16_launch_policy_m_64_n_128_skip); \
-        break;                                  \
-      case 5:                                   \
-        LAUNCH_W4A16(w4a16_launch_policy_m_64_n_256);  \
-        break;                                  \
-      case 6:                                   \
+        break;                                             \
+      case 5:                                              \
+        LAUNCH_W4A16(w4a16_launch_policy_m_64_n_256);      \
+        break;                                             \
+      case 6:                                              \
         LAUNCH_W4A16(w4a16_launch_policy_m_64_n_256_skip); \
-        break;                                  \
-      case 7:                                   \
-        LAUNCH_W4A16(w4a16_launch_policy_m_128_n_128); \
-        break;                                  \
-    }                                           \
+        break;                                             \
+      case 7:                                              \
+        LAUNCH_W4A16(w4a16_launch_policy_m_128_n_128);     \
+        break;                                             \
+    }                                                      \
   } while (0)
 
 #ifdef USE_MOE_JIT
