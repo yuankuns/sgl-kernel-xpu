@@ -27,6 +27,8 @@
 # includes GPT-OSS geometry (4 local experts, hidden=2880, intermediate=2880).
 # Set SGL_MOE_BENCH_FULL_SHAPES=1 to also include DeepSeek-V4 geometry (32 local
 # experts, hidden=4096, intermediate=2048) and higher-load model points.
+# Set SGL_MOE_BENCH_GPT_OSS_TP4_L0=1 to time the real GPT-OSS-120B TP=4
+# layer-0 routing vector from fmha-cri's W4A16 MoE example.
 #
 # Run:
 #   python benchmark/bench_moe_w4a16_grouped_gemm.py
@@ -99,6 +101,7 @@ FULL_BENCH_SHAPES = QUICK_BENCH_SHAPES + [
 ]
 
 RUN_FULL_SHAPES = os.environ.get("SGL_MOE_BENCH_FULL_SHAPES") == "1"
+RUN_GPT_OSS_TP4_L0 = os.environ.get("SGL_MOE_BENCH_GPT_OSS_TP4_L0") == "1"
 BENCH_SHAPES = FULL_BENCH_SHAPES if RUN_FULL_SHAPES else QUICK_BENCH_SHAPES
 print(
     f"[config] grouped-GEMM shape set: "
@@ -109,6 +112,140 @@ print(
 
 ALL_RESULTS = []
 _MXFP4_CPU_WEIGHT_CACHE = {}
+
+# GPT-OSS-120B TP=4, layer 0. This is the real 128-expert routing vector from
+# fmha-cri's examples/16_bmg_moe_gemm/gpt_oss_120b_workloads.hpp. The total is
+# 16,384 routed rows; its long tails are why the 64-row production tile matters.
+GPT_OSS_120B_TP4_L0_ROWS = (
+    50,
+    32,
+    48,
+    37,
+    60,
+    54,
+    32,
+    267,
+    100,
+    33,
+    72,
+    12,
+    1422,
+    47,
+    70,
+    176,
+    474,
+    21,
+    76,
+    35,
+    47,
+    72,
+    45,
+    37,
+    41,
+    101,
+    27,
+    102,
+    699,
+    48,
+    65,
+    80,
+    43,
+    46,
+    62,
+    59,
+    114,
+    12,
+    33,
+    4,
+    56,
+    74,
+    86,
+    56,
+    74,
+    78,
+    199,
+    3,
+    138,
+    36,
+    98,
+    81,
+    42,
+    228,
+    58,
+    205,
+    117,
+    82,
+    88,
+    47,
+    107,
+    58,
+    56,
+    78,
+    69,
+    128,
+    51,
+    88,
+    110,
+    55,
+    83,
+    349,
+    51,
+    67,
+    67,
+    30,
+    1028,
+    58,
+    46,
+    55,
+    39,
+    39,
+    52,
+    538,
+    398,
+    112,
+    72,
+    190,
+    196,
+    21,
+    61,
+    33,
+    35,
+    23,
+    208,
+    43,
+    39,
+    18,
+    46,
+    137,
+    53,
+    42,
+    57,
+    682,
+    48,
+    124,
+    32,
+    32,
+    151,
+    29,
+    56,
+    82,
+    53,
+    59,
+    98,
+    88,
+    39,
+    151,
+    51,
+    124,
+    39,
+    45,
+    49,
+    80,
+    85,
+    40,
+    20,
+    2340,
+)
 
 
 def _quantize_bf16_weights_mxfp4(num_experts: int, N: int, K: int):
@@ -255,6 +392,7 @@ def _prepare_inputs(
     gemm_k: int,
     recipe: str = "mxfp4",
     backend: str = "sgl",
+    rows_per_expert=None,
 ):
     """Build the XPU tensors for one provider.
 
@@ -278,8 +416,16 @@ def _prepare_inputs(
     torch.manual_seed(0)
     torch.xpu.manual_seed_all(0)
 
-    total_m = num_experts * avg_m
-    total_rows = torch.full((num_experts,), avg_m, dtype=torch.int32, device="xpu")
+    if rows_per_expert is None:
+        total_m = num_experts * avg_m
+        total_rows = torch.full(
+            (num_experts,), avg_m, dtype=torch.int32, device="xpu"
+        )
+    else:
+        if len(rows_per_expert) != num_experts:
+            raise ValueError("rows_per_expert must have one value per expert")
+        total_m = sum(rows_per_expert)
+        total_rows = torch.tensor(rows_per_expert, dtype=torch.int32, device="xpu")
 
     a = torch.empty((total_m, gemm_k), dtype=torch.bfloat16, device="xpu").normal_(
         0, 0.01
@@ -511,6 +657,51 @@ def benchmark(num_experts, avg_m, gemm_n, gemm_k, provider):
     return ms
 
 
+def _run_gpt_oss_tp4_l0_benchmark():
+    """Time the real ragged GPT-OSS TP=4 layer-0 production calls.
+
+    This uses the same registered op as the model path.  The warmup is expressed
+    in device-time iterations rather than host time, so it reaches the stable
+    GPU clock before the median is collected.
+    """
+    rows = GPT_OSS_120B_TP4_L0_ROWS
+    shapes = (
+        ("gpt-oss-120b-tp4-prefill-l0-gemm1", 1472, 2880),
+        ("gpt-oss-120b-tp4-prefill-l0-gemm2", 2880, 736),
+    )
+    print("\n[GPT-OSS TP4 L0 production routing]", flush=True)
+    for name, gemm_n, gemm_k in shapes:
+        inputs = _prepare_inputs(
+            len(rows),
+            sum(rows) // len(rows),
+            gemm_n,
+            gemm_k,
+            recipe="mxfp4",
+            backend="sgl",
+            rows_per_expert=rows,
+        )
+        for _ in range(20):
+            _run_mxfp4_fused(inputs)
+        torch.xpu.synchronize()
+        ms, ms_min, ms_max = triton.testing.do_bench(
+            lambda: _run_mxfp4_fused(inputs),
+            warmup=6000,
+            rep=1000,
+            quantiles=[0.5, 0.2, 0.8],
+        )
+        total_m = inputs["total_m"]
+        tflops = 2 * total_m * gemm_n * gemm_k / (ms / 1e3) / 1e12
+        print(
+            f"{name}: rows={total_m}, N={gemm_n}, K={gemm_k}, "
+            f"median={ms:.4f} ms, p20={ms_min:.4f} ms, p80={ms_max:.4f} ms, "
+            f"{tflops:.2f} TFLOP/s",
+            flush=True,
+        )
+        del inputs
+        gc.collect()
+        torch.xpu.empty_cache()
+
+
 def _correctness_check(rel_tol=CORRECTNESS_REL_TOL):
     """Cross-check sgl_kernel vs vLLM outputs on the same logical weights.
 
@@ -573,6 +764,8 @@ def _correctness_check(rel_tol=CORRECTNESS_REL_TOL):
 if __name__ == "__main__":
     _correctness_check()
     benchmark.run(print_data=False)
+    if RUN_GPT_OSS_TP4_L0:
+        _run_gpt_oss_tp4_l0_benchmark()
     print("\nBenchmark finished!\n")
     import pandas as pd
 
