@@ -47,12 +47,21 @@ def test_rel_proj_small_t_matches_inkling_shapes(t, h, kv_heads):
     out = torch.empty(t, h, e, device="xpu", dtype=torch.bfloat16)
 
     returned = rel_proj_small_t(r, proj, tau, out)
-    reference = _reference(r, proj, tau)
+    # The kernel accumulates in fp32 and rounds once, on store, to bf16, so the
+    # reference has to be rounded the same way -- comparing a bf16 result to an
+    # unrounded fp32 reference needs an atol as large as one bf16 mantissa step
+    # at the largest output (1.6e-2 at |out| ~ 4), which is loose enough to hide
+    # a real regression rather than to measure one.
+    reference = _reference(r, proj, tau).bfloat16().float()
 
     assert returned.data_ptr() == out.data_ptr()
     assert out.is_contiguous()
     assert out.shape == (t, h, e)
-    torch.testing.assert_close(out.float(), reference, rtol=2e-2, atol=2e-2)
+    # rtol is two bf16 mantissa steps (bf16 keeps 8 fraction bits); atol only
+    # covers the 16-term dot products that cancel to near zero, where the
+    # kernel's accumulation order shows through at the fp32 level (worst case
+    # measured over 9 seeds x 3 shapes: 2.9e-8).
+    torch.testing.assert_close(out.float(), reference, rtol=2.0**-7, atol=1e-6)
 
 
 def test_rel_proj_small_t_rejects_contiguous_r():
