@@ -7,7 +7,9 @@ try:
 except (ImportError, AttributeError):
     HAS_XPU = False
 
-pytestmark = pytest.mark.skipif(not HAS_XPU, reason="Inkling relative projection requires XPU")
+pytestmark = pytest.mark.skipif(
+    not HAS_XPU, reason="Inkling relative projection requires XPU"
+)
 
 
 def _make_packed_r(t: int, h: int, kv_heads: int, d: int) -> torch.Tensor:
@@ -30,23 +32,18 @@ def _reference(
 
 
 @pytest.mark.parametrize(
-    ("t", "h", "kv_heads", "with_tau"),
+    ("t", "h", "kv_heads"),
     [
-        (1, 24, 2, True),
-        (9, 12, 1, True),
-        (32, 6, 1, True),
-        (9, 12, 1, False),
+        (1, 24, 2),
+        (9, 12, 1),
+        (32, 6, 1),
     ],
 )
-def test_rel_proj_small_t_matches_inkling_shapes(t, h, kv_heads, with_tau):
+def test_rel_proj_small_t_matches_inkling_shapes(t, h, kv_heads):
     d, e = 16, 1024
     r = _make_packed_r(t, h, kv_heads, d)
     proj = torch.randn(d, e, device="xpu", dtype=torch.bfloat16) * 0.1
-    tau = (
-        1.0 + 0.1 * torch.rand(t, device="xpu", dtype=torch.float32)
-        if with_tau
-        else None
-    )
+    tau = 1.0 + 0.1 * torch.rand(t, device="xpu", dtype=torch.float32)
     out = torch.empty(t, h, e, device="xpu", dtype=torch.bfloat16)
 
     returned = rel_proj_small_t(r, proj, tau, out)
@@ -58,31 +55,23 @@ def test_rel_proj_small_t_matches_inkling_shapes(t, h, kv_heads, with_tau):
     torch.testing.assert_close(out.float(), reference, rtol=2e-2, atol=2e-2)
 
 
-@pytest.mark.parametrize("with_tau", [False, True])
-def test_rel_proj_small_t_generic_tail_fallback(with_tau):
-    t, h, d, e = 5, 3, 13, 65
+def test_rel_proj_small_t_rejects_contiguous_r():
+    t, h, d, e = 5, 12, 16, 1024
+    r = torch.randn(t, h, d, device="xpu", dtype=torch.bfloat16)
+    proj = torch.randn(d, e, device="xpu", dtype=torch.bfloat16)
+    tau = torch.ones(t, device="xpu", dtype=torch.float32)
+
+    with pytest.raises(RuntimeError, match="packed qkvr"):
+        rel_proj_small_t(r, proj, tau)
+
+
+@pytest.mark.parametrize(("d", "e"), [(13, 1024), (16, 65)])
+def test_rel_proj_small_t_rejects_nonproduction_projection_shape(d, e):
+    t, h = 5, 3
     packed = torch.randn(t, h * d + 19, device="xpu", dtype=torch.bfloat16)
     r = packed[:, : h * d].view(t, h, d)
-    proj = torch.randn(d, e, device="xpu", dtype=torch.bfloat16) * 0.1
-    tau = (
-        1.0 + 0.1 * torch.rand(t, device="xpu", dtype=torch.float32)
-        if with_tau
-        else None
-    )
+    proj = torch.randn(d, e, device="xpu", dtype=torch.bfloat16)
+    tau = torch.ones(t, device="xpu", dtype=torch.float32)
 
-    out = rel_proj_small_t(r, proj, tau)
-    reference = _reference(r, proj, tau)
-
-    torch.testing.assert_close(out.float(), reference, rtol=2e-2, atol=2e-2)
-
-
-def test_rel_proj_small_t_tau_prescale_rounding():
-    t, h, d, e = 9, 12, 16, 1024
-    r = _make_packed_r(t, h, 1, d)
-    proj = torch.randn(d, e, device="xpu", dtype=torch.bfloat16) * 0.1
-    tau = 1.0 + 0.5 * torch.rand(t, device="xpu", dtype=torch.float32)
-
-    out = rel_proj_small_t(r, proj, tau)
-    pre_scaled_r = (r.float() * tau.view(-1, 1, 1)).bfloat16()
-
-    assert torch.equal(out, rel_proj_small_t(pre_scaled_r.contiguous(), proj))
+    with pytest.raises(RuntimeError, match="only production"):
+        rel_proj_small_t(r, proj, tau)

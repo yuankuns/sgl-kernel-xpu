@@ -242,7 +242,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   /*
    * Inkling relative-attention projection
    */
-  m.def("inkling_rel_proj_small_t(Tensor r, Tensor proj, Tensor? tau, Tensor(a!) out) -> Tensor(a!)");
+  m.def("inkling_rel_proj_small_t(Tensor r, Tensor proj, Tensor tau, Tensor(a!) out) -> Tensor(a!)");
   m.impl("inkling_rel_proj_small_t", torch::kXPU, &inkling_rel_proj_small_t);
 
   /*

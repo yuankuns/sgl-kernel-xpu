@@ -37,6 +37,38 @@ def _time_ms(fn, warmup: int, iterations: int) -> float:
     return start.elapsed_time(end) / iterations
 
 
+def _time_ms_graph(fn, warmup: int, iterations: int, reps: int = 15) -> float:
+    """Time `fn` from a captured graph replay.
+
+    At production Inkling shapes this kernel runs in a few microseconds, which is
+    less than the eager per-call dispatch cost, so `_time_ms` measures the Python
+    and runtime submit path instead of the kernel. Replaying `iterations` captured
+    launches keeps the submit cost out of the timed region.
+    """
+    for _ in range(warmup):
+        fn()
+    torch.xpu.synchronize()
+
+    graph = torch.xpu.XPUGraph()
+    with torch.xpu.graph(graph):
+        for _ in range(iterations):
+            fn()
+    for _ in range(5):
+        graph.replay()
+    torch.xpu.synchronize()
+
+    start = torch.xpu.Event(enable_timing=True)
+    end = torch.xpu.Event(enable_timing=True)
+    best = float("inf")
+    for _ in range(reps):
+        start.record()
+        graph.replay()
+        end.record()
+        torch.xpu.synchronize()
+        best = min(best, start.elapsed_time(end) / iterations)
+    return best
+
+
 def _cases(suite: str) -> list[RelProjCase]:
     if suite == "quick":
         return [
@@ -63,18 +95,25 @@ def main() -> None:
     parser.add_argument("--suite", choices=["quick", "inkling"], default="quick")
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--iterations", type=int, default=100)
+    parser.add_argument(
+        "--mode",
+        choices=["eager", "graph"],
+        default="graph",
+        help="graph replays captured launches so the kernel, not the dispatch "
+        "path, is what gets timed",
+    )
     args = parser.parse_args()
+
+    timer = _time_ms_graph if args.mode == "graph" else _time_ms
 
     d, e = 16, 1024
     torch.xpu.set_device(0)
     proj = torch.randn(d, e, device="xpu", dtype=torch.bfloat16)
     for case in _cases(args.suite):
         r = _make_r(case, d)
-        tau = 1.0 + 0.1 * torch.rand(
-            case.t, device="xpu", dtype=torch.float32
-        )
+        tau = 1.0 + 0.1 * torch.rand(case.t, device="xpu", dtype=torch.float32)
         out = torch.empty(case.t, case.h, e, device="xpu", dtype=torch.bfloat16)
-        elapsed_ms = _time_ms(
+        elapsed_ms = timer(
             lambda: rel_proj_small_t(r, proj, tau, out),
             args.warmup,
             args.iterations,

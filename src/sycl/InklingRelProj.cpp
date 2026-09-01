@@ -7,12 +7,13 @@
 #include <ATen/ATen.h>
 #include <torch/all.h>
 
+#include <algorithm>
 #include <cstdint>
-#include <optional>
-#include <sycl/ext/intel/esimd.hpp>
 #include <sycl/sycl.hpp>
 
+#include "SYCLHelpers.h"
 #include "Utils.h"
+#include "comm/Numerics.h"
 #include "sgl_kernel_export.h"
 
 namespace {
@@ -22,13 +23,9 @@ using bf16_t = sycl::ext::oneapi::bfloat16;
 constexpr int64_t kDefaultBlock = 256;
 constexpr int64_t kRelProjVec = 8;
 
-inline int64_t ceil_div_i64(int64_t x, int64_t y) {
-  return (x + y - 1) / y;
-}
-
-inline int64_t round_up_i64(int64_t x, int64_t multiple) {
-  return ceil_div_i64(x, multiple) * multiple;
-}
+// Production Inkling shapes: r is [t, h, 16] and proj is [16, 1024].
+constexpr int64_t kRelProjD = 16;
+constexpr int64_t kRelProjE = 1024;
 
 inline float bf16_raw_to_float(uint16_t raw) {
   return sycl::bit_cast<float>(static_cast<uint32_t>(raw) << 16);
@@ -56,79 +53,26 @@ struct RelProjParams {
   bf16_t* out = nullptr;
   int64_t t = 0;
   int64_t h = 0;
-  int64_t d = 0;
-  int64_t e = 0;
   int64_t r_stride_t = 0;
 };
 
-template <bool HasTau>
-class InklingRelProjBf16D16EsimdKernel {
- public:
-  RelProjParams params;
-  int64_t chunks_per_row;
-
-  void operator()(sycl::item<1> item) const SYCL_ESIMD_KERNEL {
-    int64_t linear = static_cast<int64_t>(item.get_linear_id());
-    int64_t total = params.t * params.h * chunks_per_row;
-    if (linear >= total) {
-      return;
-    }
-
-    int64_t chunk = linear % chunks_per_row;
-    int64_t th = linear / chunks_per_row;
-    int64_t ti = th / params.h;
-    int64_t hi = th - ti * params.h;
-    int64_t e0 = chunk * 16;
-
-    float scale = 1.0f;
-    if constexpr (HasTau) {
-      scale = params.tau[ti];
-    }
-
-    sycl::ext::intel::esimd::simd<float, 8> acc_lo(0.0f);
-    sycl::ext::intel::esimd::simd<float, 8> acc_hi(0.0f);
-    const bf16_t* r_row = params.r + ti * params.r_stride_t + hi * params.d;
-
-#pragma unroll
-    for (int d = 0; d < 16; ++d) {
-      float r_value = bf16_to_float(r_row[d]);
-      if constexpr (HasTau) {
-        r_value = bf16_to_float(float_to_bf16(r_value * scale));
-      }
-
-      auto raw = sycl::ext::intel::esimd::block_load<uint32_t, 8>(
-          reinterpret_cast<const uint32_t*>(params.proj + static_cast<int64_t>(d) * params.e) + e0 / 2);
-      auto lo_bits = (raw & 0x0000ffffu) << 16;
-      auto hi_bits = raw & 0xffff0000u;
-      acc_lo += lo_bits.template bit_cast_view<float>() * r_value;
-      acc_hi += hi_bits.template bit_cast_view<float>() * r_value;
-    }
-
-    auto lo_bits = acc_lo.template bit_cast_view<uint32_t>();
-    auto hi_bits = acc_hi.template bit_cast_view<uint32_t>();
-    auto lo_round = ((lo_bits >> 16) & 1u) + 0x7fffu;
-    auto hi_round = ((hi_bits >> 16) & 1u) + 0x7fffu;
-    auto packed = ((lo_bits + lo_round) >> 16) | (((hi_bits + hi_round) >> 16) << 16);
-
-    bf16_t* out_row = params.out + (ti * params.h + hi) * params.e;
-    sycl::ext::intel::esimd::block_store<uint32_t, 8>(reinterpret_cast<uint32_t*>(out_row) + e0 / 2, packed);
-  }
-};
-
-template <bool HasTau>
-void launch_rel_proj_bf16_d16_esimd(sycl::queue& queue, const RelProjParams& params) {
-  int64_t chunks_per_row = params.e / 16;
-  int64_t total = params.t * params.h * chunks_per_row;
-  InklingRelProjBf16D16EsimdKernel<HasTau> kernel{params, chunks_per_row};
-  queue.parallel_for<InklingRelProjBf16D16EsimdKernel<HasTau>>(sycl::range<1>(static_cast<std::size_t>(total)), kernel);
-}
-
-template <bool HasTau, int64_t Vec>
+// out[t, h, :] = bf16(tau[t] * r[t, h, :]) @ proj
+//
+// The projection matrix is only 16x1024 (32 KiB) while the row count t*h is 6 to
+// 768, so the arithmetic is trivial and the kernel is bound by how many times
+// `proj` is re-read. One work-item owns `Vec` consecutive output columns and
+// keeps that column slice of `proj` in registers, then walks `MTile` rows of
+// r: `proj` is fetched once per (row tile, column slice) instead of once per
+// output row. `MTile` trades that reuse against the number of work-items, which
+// is what keeps the tiny decode shapes latency-bound rather than starved.
+template <int MTile, int Vec>
 class InklingRelProjKernel {
  public:
+  static_assert(Vec % 2 == 0, "Vec must be even so proj/out move as 32-bit pairs");
+
   RelProjParams params;
   int64_t total;
-  int64_t e_vecs;
+  int64_t col_slices;
 
   void operator()(sycl::nd_item<1> item) const {
     int64_t idx = static_cast<int64_t>(item.get_global_id(0));
@@ -136,78 +80,108 @@ class InklingRelProjKernel {
       return;
     }
 
-    int64_t e_vec = idx % e_vecs;
-    int64_t th = idx / e_vecs;
-    int64_t ti = th / params.h;
-    int64_t hi = th - ti * params.h;
-    int64_t e0 = e_vec * Vec;
+    // Consecutive work-items take consecutive column slices so that a subgroup
+    // reads and writes one contiguous run of `proj` / `out`.
+    int64_t col_slice = idx % col_slices;
+    int64_t m_tile = idx / col_slices;
+    int64_t e0 = col_slice * Vec;
 
-    float scale = 1.0f;
-    if constexpr (HasTau) {
-      scale = params.tau[ti];
-    }
-
-    float acc[Vec];
+    float proj_tile[kRelProjD][Vec];
 #pragma unroll
-    for (int64_t i = 0; i < Vec; ++i) {
-      acc[i] = 0.0f;
+    for (int64_t d = 0; d < kRelProjD; ++d) {
+      const uint32_t* proj_row = reinterpret_cast<const uint32_t*>(params.proj + d * kRelProjE);
+#pragma unroll
+      for (int64_t i = 0; i < Vec / 2; ++i) {
+        uint32_t pair = proj_row[e0 / 2 + i];
+        proj_tile[d][2 * i] = bf16_raw_to_float(static_cast<uint16_t>(pair & 0xffffu));
+        proj_tile[d][2 * i + 1] = bf16_raw_to_float(static_cast<uint16_t>(pair >> 16));
+      }
     }
 
-    const bf16_t* r_row = params.r + ti * params.r_stride_t + hi * params.d;
-    for (int64_t d = 0; d < params.d; ++d) {
-      float r_value = bf16_to_float(r_row[d]);
-      if constexpr (HasTau) {
-        r_value = bf16_to_float(float_to_bf16(r_value * scale));
+    int64_t m = m_tile * MTile;
+    int64_t rows = params.t * params.h;
+    int64_t ti = m / params.h;
+    int64_t hi = m - ti * params.h;
+
+#pragma unroll
+    for (int64_t mm = 0; mm < MTile; ++mm) {
+      if (m >= rows) {
+        return;
       }
 
-      const bf16_t* proj_row = params.proj + d * params.e;
+      float scale = params.tau[ti];
+      const bf16_t* r_row = params.r + ti * params.r_stride_t + hi * kRelProjD;
+
+      float acc[Vec];
 #pragma unroll
       for (int64_t i = 0; i < Vec; ++i) {
-        int64_t e_col = e0 + i;
-        if (e_col < params.e) {
-          acc[i] += r_value * bf16_to_float(proj_row[e_col]);
+        acc[i] = 0.0f;
+      }
+
+#pragma unroll
+      for (int64_t d = 0; d < kRelProjD; ++d) {
+        // Pre-scaling r to bf16 before the fp32 accumulation is part of the
+        // reference numerics, not an approximation.
+        float r_value = bf16_to_float(float_to_bf16(bf16_to_float(r_row[d]) * scale));
+#pragma unroll
+        for (int64_t i = 0; i < Vec; ++i) {
+          acc[i] += r_value * proj_tile[d][i];
         }
       }
-    }
 
-    bf16_t* out_row = params.out + (ti * params.h + hi) * params.e;
+      uint32_t* out_row = reinterpret_cast<uint32_t*>(params.out + m * kRelProjE);
 #pragma unroll
-    for (int64_t i = 0; i < Vec; ++i) {
-      int64_t e_col = e0 + i;
-      if (e_col < params.e) {
-        out_row[e_col] = float_to_bf16(acc[i]);
+      for (int64_t i = 0; i < Vec / 2; ++i) {
+        out_row[e0 / 2 + i] = static_cast<uint32_t>(bf16_float_to_raw(acc[2 * i])) |
+                              (static_cast<uint32_t>(bf16_float_to_raw(acc[2 * i + 1])) << 16);
+      }
+
+      ++m;
+      if (++hi == params.h) {
+        hi = 0;
+        ++ti;
       }
     }
   }
 };
 
-template <bool HasTau, int64_t Vec = kRelProjVec>
+template <int MTile, int Vec>
+void submit_rel_proj_kernel(sycl::queue& queue, const RelProjParams& params) {
+  int64_t col_slices = kRelProjE / Vec;
+  int64_t total = CeilDiv(params.t * params.h, static_cast<int64_t>(MTile)) * col_slices;
+  int64_t block = std::min<int64_t>(kDefaultBlock, col_slices);
+  int64_t global = RoundUp(total, block);
+  InklingRelProjKernel<MTile, Vec> kernel{params, total, col_slices};
+  sycl_kernel_submit(global, block, queue, kernel);
+}
+
 void launch_rel_proj_kernel(sycl::queue& queue, const RelProjParams& params) {
-  int64_t e_vecs = ceil_div_i64(params.e, Vec);
-  int64_t total = params.t * params.h * e_vecs;
-  if (total == 0) {
+  int64_t rows = params.t * params.h;
+  if (rows == 0) {
     return;
   }
 
-  if (params.t <= 4 && params.d == 16 && params.e % 16 == 0) {
-    launch_rel_proj_bf16_d16_esimd<HasTau>(queue, params);
-    return;
+  // Deepen the row tile only while enough row tiles remain to fill the machine:
+  // below ~kMinRowTiles tiles the kernel is latency-bound and extra `proj` reuse
+  // costs more parallelism than it saves bandwidth. Tuned on BMG/B60.
+  constexpr int64_t kMinRowTiles = 40;
+  if (rows >= kMinRowTiles * 16) {
+    submit_rel_proj_kernel<16, kRelProjVec>(queue, params);
+  } else if (rows >= kMinRowTiles * 8) {
+    submit_rel_proj_kernel<8, kRelProjVec>(queue, params);
+  } else if (rows >= kMinRowTiles * 4) {
+    submit_rel_proj_kernel<4, kRelProjVec>(queue, params);
+  } else if (rows >= kMinRowTiles * 2) {
+    submit_rel_proj_kernel<2, kRelProjVec>(queue, params);
+  } else {
+    submit_rel_proj_kernel<1, kRelProjVec>(queue, params);
   }
-
-  int64_t global = round_up_i64(total, kDefaultBlock);
-  InklingRelProjKernel<HasTau, Vec> kernel{params, total, e_vecs};
-  queue.submit([&](sycl::handler& cgh) {
-    cgh.parallel_for(
-        sycl::nd_range<1>(
-            sycl::range<1>(static_cast<std::size_t>(global)), sycl::range<1>(static_cast<std::size_t>(kDefaultBlock))),
-        kernel);
-  });
 }
 
 }  // namespace
 
-SGL_KERNEL_EXPORT at::Tensor inkling_rel_proj_small_t(
-    const at::Tensor& r, const at::Tensor& proj, const std::optional<at::Tensor>& tau, const at::Tensor& out) {
+SGL_KERNEL_EXPORT at::Tensor
+inkling_rel_proj_small_t(const at::Tensor& r, const at::Tensor& proj, const at::Tensor& tau, const at::Tensor& out) {
   CHECK_DEVICE(r);
   CHECK_DEVICE(proj);
   CHECK_DEVICE(out);
@@ -223,37 +197,38 @@ SGL_KERNEL_EXPORT at::Tensor inkling_rel_proj_small_t(
   TORCH_CHECK(out.size(2) == proj.size(1), "inkling_rel_proj_small_t: out.size(2) must equal proj.size(1)");
   TORCH_CHECK(r.stride(2) == 1, "inkling_rel_proj_small_t: r must be contiguous on the d dimension");
   TORCH_CHECK(r.stride(1) == r.size(2), "inkling_rel_proj_small_t: r must have contiguous [h, d] rows");
+  TORCH_CHECK(r.size(2) == kRelProjD, "inkling_rel_proj_small_t: only production d_rel=16 is supported");
+  TORCH_CHECK(proj.size(1) == kRelProjE, "inkling_rel_proj_small_t: only production rel_extent=1024 is supported");
+  TORCH_CHECK(
+      r.size(0) == 1 || r.stride(0) > r.size(1) * r.size(2),
+      "inkling_rel_proj_small_t: r must be the strided trailing view of the packed qkvr output");
   TORCH_CHECK(proj.is_contiguous(), "inkling_rel_proj_small_t: proj must be contiguous");
   TORCH_CHECK(out.is_contiguous(), "inkling_rel_proj_small_t: out must be contiguous");
 
-  const float* tau_ptr = nullptr;
-  bool has_tau = tau.has_value();
-  if (has_tau) {
-    const at::Tensor& tau_tensor = tau.value();
-    CHECK_DEVICE(tau_tensor);
-    TORCH_CHECK(tau_tensor.scalar_type() == at::ScalarType::Float, "inkling_rel_proj_small_t: tau must be float32");
-    TORCH_CHECK(tau_tensor.dim() == 1, "inkling_rel_proj_small_t: tau must be 1D");
-    TORCH_CHECK(tau_tensor.numel() == r.size(0), "inkling_rel_proj_small_t: tau must have one entry per token");
-    TORCH_CHECK(tau_tensor.is_contiguous(), "inkling_rel_proj_small_t: tau must be contiguous");
-    tau_ptr = tau_tensor.data_ptr<float>();
-  }
+  CHECK_DEVICE(tau);
+  TORCH_CHECK(tau.scalar_type() == at::ScalarType::Float, "inkling_rel_proj_small_t: tau must be float32");
+  TORCH_CHECK(tau.dim() == 1, "inkling_rel_proj_small_t: tau must be 1D");
+  TORCH_CHECK(tau.numel() == r.size(0), "inkling_rel_proj_small_t: tau must have one entry per token");
+  TORCH_CHECK(tau.is_contiguous(), "inkling_rel_proj_small_t: tau must be contiguous");
 
   RelProjParams params{};
   params.r = reinterpret_cast<const bf16_t*>(r.data_ptr<at::BFloat16>());
   params.proj = reinterpret_cast<const bf16_t*>(proj.data_ptr<at::BFloat16>());
-  params.tau = tau_ptr;
+  params.tau = tau.data_ptr<float>();
   params.out = reinterpret_cast<bf16_t*>(out.data_ptr<at::BFloat16>());
   params.t = r.size(0);
   params.h = r.size(1);
-  params.d = r.size(2);
-  params.e = proj.size(1);
   params.r_stride_t = r.stride(0);
 
+  // The kernel moves proj and out as bf16 pairs.
+  TORCH_CHECK(
+      reinterpret_cast<uintptr_t>(params.proj) % sizeof(uint32_t) == 0,
+      "inkling_rel_proj_small_t: proj must be 4-byte aligned");
+  TORCH_CHECK(
+      reinterpret_cast<uintptr_t>(params.out) % sizeof(uint32_t) == 0,
+      "inkling_rel_proj_small_t: out must be 4-byte aligned");
+
   auto queue = dpcppGetCurrentQueue();
-  if (has_tau) {
-    launch_rel_proj_kernel<true>(queue, params);
-  } else {
-    launch_rel_proj_kernel<false>(queue, params);
-  }
+  launch_rel_proj_kernel(queue, params);
   return out;
 }

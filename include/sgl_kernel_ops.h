@@ -476,7 +476,7 @@ void inkling_save_intermediate_conv_windows(
  * Inkling relative-attention projection.
  */
 at::Tensor inkling_rel_proj_small_t(
-    const at::Tensor& r, const at::Tensor& proj, const std::optional<at::Tensor>& tau, const at::Tensor& out);
+    const at::Tensor& r, const at::Tensor& proj, const at::Tensor& tau, const at::Tensor& out);
 
 /*
  * Inkling fused attention prologue family.

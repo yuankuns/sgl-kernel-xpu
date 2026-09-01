@@ -6,10 +6,10 @@ import torch
 def rel_proj_small_t(
     r: torch.Tensor,
     proj: torch.Tensor,
-    tau: torch.Tensor | None = None,
+    tau: torch.Tensor,
     out: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Project BF16 relative features [T, H, D] with an optional per-token tau."""
+    """Project the production Inkling packed-r view with per-token tau."""
     if out is None:
         out = torch.empty(
             (r.shape[0], r.shape[1], proj.shape[1]),
