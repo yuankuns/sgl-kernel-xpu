@@ -100,6 +100,16 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(repo-cutlass-sycl)
 
+# Temporary Fix: CUTLASS_SYCL_TAG above predates cutlass-sycl's own fix for a DPC++
+# regression, that dropped sycl::nd_range's
+# default constructor, breaking compat::experimental::launch_policy's constructor.
+# Overwrite the header with the patched copy on every configure.
+# TODO: Drop this once CUTLASS_SYCL_TAG moves past that fix.
+configure_file(
+    ${CMAKE_CURRENT_SOURCE_DIR}/cmake/launch_policy_local.hpp
+    ${repo-cutlass-sycl_SOURCE_DIR}/include/cute/util/compat/launch_policy.hpp
+    COPYONLY
+)
 
 include_directories(
     ${CMAKE_CURRENT_SOURCE_DIR}/include
