@@ -32,15 +32,18 @@ def _reference(
 
 
 @pytest.mark.parametrize(
-    ("t", "h", "kv_heads"),
+    ("t", "h", "kv_heads", "e"),
     [
-        (1, 24, 2),
-        (9, 12, 1),
-        (32, 6, 1),
+        (1, 48, 4, 1024),
+        (9, 12, 1, 1024),
+        (32, 6, 1, 1024),
+        (1, 12, 1, 512),
+        (9, 12, 1, 512),
+        (32, 12, 1, 512),
     ],
 )
-def test_rel_proj_small_t_matches_inkling_shapes(t, h, kv_heads):
-    d, e = 16, 1024
+def test_rel_proj_small_t_matches_inkling_shapes(t, h, kv_heads, e):
+    d = 16
     r = _make_packed_r(t, h, kv_heads, d)
     proj = torch.randn(d, e, device="xpu", dtype=torch.bfloat16) * 0.1
     tau = 1.0 + 0.1 * torch.rand(t, device="xpu", dtype=torch.float32)
