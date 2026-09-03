@@ -82,7 +82,7 @@ if(DPCPP_SYCL_TARGET MATCHES "bmg")
   set(CUTLASS_SYCL_TAG  "525faea3f0f43a8aec2d21a70d44111db639a3a9")
 elseif(DPCPP_SYCL_TARGET MATCHES "cri")
   set(CUTLASS_SYCL_REPO "git@github.com:intel-innersource/libraries.ai.cutlass.internal.git")
-  set(CUTLASS_SYCL_TAG  "08168df2a18224f0ffc638d3a9d71baa16c3a7cb")
+  set(CUTLASS_SYCL_TAG  "45f300173bcefac6a798bd22ac2fab15da5886e9")
 elseif(DPCPP_SYCL_TARGET MATCHES "jgs")
   set(CUTLASS_SYCL_REPO "git@github.com:intel-innersource/libraries.ai.cutlass.internal.git")
   set(CUTLASS_SYCL_TAG  "439fd778b16de695d388eb9efc67b88c94828a3f")
@@ -100,16 +100,6 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(repo-cutlass-sycl)
 
-# Temporary Fix: CUTLASS_SYCL_TAG above predates cutlass-sycl's own fix for a DPC++
-# regression, that dropped sycl::nd_range's
-# default constructor, breaking compat::experimental::launch_policy's constructor.
-# Overwrite the header with the patched copy on every configure.
-# TODO: Drop this once CUTLASS_SYCL_TAG moves past that fix.
-configure_file(
-    ${CMAKE_CURRENT_SOURCE_DIR}/cmake/launch_policy_local.hpp
-    ${repo-cutlass-sycl_SOURCE_DIR}/include/cute/util/compat/launch_policy.hpp
-    COPYONLY
-)
 
 include_directories(
     ${CMAKE_CURRENT_SOURCE_DIR}/include

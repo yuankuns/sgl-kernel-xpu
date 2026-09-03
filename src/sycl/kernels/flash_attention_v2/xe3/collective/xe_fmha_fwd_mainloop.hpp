@@ -581,8 +581,8 @@ struct FMHAFwdMainloop<
 
     /* Initialization steps for first block: Q/K prefetch, O init */
     /* TODO: limit D prefetch for large head size, and reorder K prefetches */
-    using PreparedK_t = decltype(prepare_payloads(copy_k, tKgK(_, _, _, 0, 0), tKrK));
-    using PreparedV_t = decltype(prepare_payloads(copy_v, tVgV(_, _, _, 0, 0), tVrV));
+    using PreparedK_t = decltype(prepare_payloads(copy_k, tKgK(_, _, _, 0, 0)));
+    using PreparedV_t = decltype(prepare_payloads(copy_v, tVgV(_, _, _, 0, 0)));
     std::array<PreparedK_t, DTiles> prepared_k;
     std::array<PreparedV_t, VTiles> prepared_v;
 
@@ -597,23 +597,23 @@ struct FMHAFwdMainloop<
 
     CUTLASS_PRAGMA_UNROLL
     for (int d = 0; d < DTiles; d++) {
-      prepared_k[d] = prepare_payloads(copy_k, tKgK(_, _, _, 0, d), tKrK);
+      prepared_k[d] = prepare_payloads(copy_k, tKgK(_, _, _, 0, d));
     }
     CUTLASS_PRAGMA_UNROLL
     for (int VV = 0; VV < VTiles; VV++) {
-      prepared_v[VV] = prepare_payloads(copy_v, tVgV(_, _, _, VV, 0), tVrV);
+      prepared_v[VV] = prepare_payloads(copy_v, tVgV(_, _, _, VV, 0));
     }
 
-    [[maybe_unused]] auto prepared_pk = prepare_payloads(prefetch_k, pKgK(_, _, _, 0), pKgK(_, _, _, 0));
-    [[maybe_unused]] auto prepared_pv = prepare_payloads(prefetch_v, pVgV(_, _, _, 0), pVgV(_, _, _, 0));
+    [[maybe_unused]] auto prepared_pk = prepare_payloads(prefetch_k, pKgK(_, _, _, 0));
+    [[maybe_unused]] auto prepared_pv = prepare_payloads(prefetch_v, pVgV(_, _, _, 0));
     constexpr int kv_stride = get<1>(TileShapeQK{});
     [[maybe_unused]] int const tiles_per_page = params.page_size / kv_stride;
     [[maybe_unused]] int const batch_offset = l_coord * params.num_pages_per_seq;
 
     // Conservative optimization for cached non-paged path:
     // keep legacy prefetch, but switch K/V copy to payload pipeline.
-    using PreparedK_cache_t = decltype(prepare_payloads(copy_k_cache, tKgK_cache(_, _, _, 0, 0), tKrK));
-    using PreparedV_cache_t = decltype(prepare_payloads(copy_v_cache, tVgV_cache(_, _, _, 0, 0), tVrV));
+    using PreparedK_cache_t = decltype(prepare_payloads(copy_k_cache, tKgK_cache(_, _, _, 0, 0)));
+    using PreparedV_cache_t = decltype(prepare_payloads(copy_v_cache, tVgV_cache(_, _, _, 0, 0)));
     std::array<PreparedK_cache_t, DTiles> prepared_k_cache;
     std::array<PreparedV_cache_t, VTiles> prepared_v_cache;
     std::array<int, Stages> physical_k_tiles_cache{};
@@ -621,21 +621,21 @@ struct FMHAFwdMainloop<
     if constexpr (CachedKV && !PagedKV) {
       CUTLASS_PRAGMA_UNROLL
       for (int d = 0; d < DTiles; d++) {
-        prepared_k_cache[d] = prepare_payloads(copy_k_cache, tKgK_cache(_, _, _, 0, d), tKrK);
+        prepared_k_cache[d] = prepare_payloads(copy_k_cache, tKgK_cache(_, _, _, 0, d));
       }
       CUTLASS_PRAGMA_UNROLL
       for (int VV = 0; VV < VTiles; VV++) {
-        prepared_v_cache[VV] = prepare_payloads(copy_v_cache, tVgV_cache(_, _, _, VV, 0), tVrV);
+        prepared_v_cache[VV] = prepare_payloads(copy_v_cache, tVgV_cache(_, _, _, VV, 0));
       }
       if (blk_k0 > 0) {
         int const cache_start_delta = blk_k0 * kv_stride;
         CUTLASS_PRAGMA_UNROLL
         for (int d = 0; d < DTiles; d++) {
-          update_payloads(prepared_k_cache[d], cache_start_delta);
+          prepared_k_cache[d] += cache_start_delta;
         }
         CUTLASS_PRAGMA_UNROLL
         for (int VV = 0; VV < VTiles; VV++) {
-          update_payloads(prepared_v_cache[VV], cache_start_delta);
+          prepared_v_cache[VV] += cache_start_delta;
         }
       }
     }
@@ -655,25 +655,25 @@ struct FMHAFwdMainloop<
       const int k_start_delta = k_start * kv_stride;
       CUTLASS_PRAGMA_UNROLL
       for (int d = 0; d < DTiles; d++) {
-        update_payloads(prepared_k[d], k_start_delta);
+        prepared_k[d] += k_start_delta;
       }
       CUTLASS_PRAGMA_UNROLL
       for (int VV = 0; VV < VTiles; VV++) {
-        update_payloads(prepared_v[VV], k_start_delta);
+        prepared_v[VV] += k_start_delta;
       }
-      update_payloads(prepared_pk, k_start_delta);
-      update_payloads(prepared_pv, k_start_delta);
+      prepared_pk += k_start_delta;
+      prepared_pv += k_start_delta;
     }
     if constexpr (!GqaFusion) {
       CUTLASS_PRAGMA_UNROLL
       for (int K = 0; K < Stages; K++) {
-        prefetch_with_payloads(prefetch_k, prepared_pk, shape(pKgK(_, _, _, 0)));
-        update_payloads(prepared_pk, kv_stride);
+        prefetch(prefetch_k, prepared_pk);
+        prepared_pk += kv_stride;
       }
       CUTLASS_PRAGMA_UNROLL
       for (int K = 0; K < Stages; K++) {
-        prefetch_with_payloads(prefetch_v, prepared_pv, shape(pVgV(_, _, _, 0)));
-        update_payloads(prepared_pv, kv_stride);
+        prefetch(prefetch_v, prepared_pv);
+        prepared_pv += kv_stride;
       }
     }
     // Cache K prefetch init, still uses legacy API.
@@ -766,8 +766,8 @@ struct FMHAFwdMainloop<
 
       // V prefetch for next iteration (non-cache only; cache prefetch lives below).
       if constexpr (!is_cache && !GqaFusion) {
-        prefetch_with_payloads(prefetch_v, prepared_pv, shape(pVgV(_, _, _, 0)));
-        update_payloads(prepared_pv, kv_stride);
+        prefetch(prefetch_v, prepared_pv);
+        prepared_pv += kv_stride;
       }
       /* GEMM 1: S = K * Q */
       CUTLASS_PRAGMA_UNROLL
@@ -775,14 +775,14 @@ struct FMHAFwdMainloop<
       for (int D = 0; D < DTiles; D++) {
         if constexpr (is_cache) {
           if constexpr (!PagedKV) {
-            copy_with_multi_payloads(copy_k_cache, prepared_k_cache[D], tKrK);
-            update_payloads(prepared_k_cache[D], kv_stride);
+            copy(copy_k_cache, prepared_k_cache[D], tKrK);
+            prepared_k_cache[D] += kv_stride;
           } else {
             copy(copy_k_cur, tKgK_cur(_, _, _, k_idx, D), tKrK);
           }
         } else {
-          copy_with_multi_payloads(copy_k, prepared_k[D], tKrK);
-          update_payloads(prepared_k[D], kv_stride);
+          copy(copy_k, prepared_k[D], tKrK);
+          prepared_k[D] += kv_stride;
         }
 
         reorder(tKrK, tSrK);
@@ -849,8 +849,8 @@ struct FMHAFwdMainloop<
           prefetch(prefetch_v_cache, pVgV_cache(_, _, _, VV, k_idx));
         }
       } else if constexpr (!GqaFusion) {
-        prefetch_with_payloads(prefetch_k, prepared_pk, shape(pKgK(_, _, _, 0)));
-        update_payloads(prepared_pk, kv_stride);
+        prefetch(prefetch_k, prepared_pk);
+        prepared_pk += kv_stride;
       }
       // Prefetch V scale
       if constexpr (BlockScale) {
@@ -1013,14 +1013,14 @@ struct FMHAFwdMainloop<
       for (int VV = 0; VV < VTiles; VV++) {
         if constexpr (is_cache) {
           if constexpr (!PagedKV) {
-            copy_with_multi_payloads(copy_v_cache, prepared_v_cache[VV], tVrV);
-            update_payloads(prepared_v_cache[VV], kv_stride);
+            copy(copy_v_cache, prepared_v_cache[VV], tVrV);
+            prepared_v_cache[VV] += kv_stride;
           } else {
             copy(copy_v_cur, tVgV_cur(_, _, _, VV, k_idx), tVrV);
           }
         } else {
-          copy_with_multi_payloads(copy_v, prepared_v[VV], tVrV);
-          update_payloads(prepared_v[VV], kv_stride);
+          copy(copy_v, prepared_v[VV], tVrV);
+          prepared_v[VV] += kv_stride;
         }
         reorder(tVrV, tArV);
 
