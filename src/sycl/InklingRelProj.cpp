@@ -9,8 +9,6 @@
 
 #include <algorithm>
 #include <cstdint>
-#include <cstdlib>
-#include <iostream>
 #include <sycl/sycl.hpp>
 
 #include "SYCLHelpers.h"
@@ -67,9 +65,6 @@ struct RelProjParams {
 #if !defined(SGL_INKLING_RELPROJ_FAST_DIV)
 #define SGL_INKLING_RELPROJ_FAST_DIV 1
 #endif
-#if !defined(SGL_INKLING_RELPROJ_FAST_DIV_VERIFY)
-#define SGL_INKLING_RELPROJ_FAST_DIV_VERIFY 0
-#endif
 
 struct RelProjFastDiv {
   uint32_t magic = 0;
@@ -112,20 +107,7 @@ inline RelProjFastDiv make_rel_proj_fast_div_magic(int divisor, int max_value) {
 
 inline RelProjFastDiv make_rel_proj_fast_div(int divisor, int max_value) {
 #if SGL_INKLING_RELPROJ_FAST_DIV
-  RelProjFastDiv fd = make_rel_proj_fast_div_magic(divisor, max_value);
-#if SGL_INKLING_RELPROJ_FAST_DIV_VERIFY
-  if (fd.shift >= 0) {
-    for (int value = 0; value <= max_value; ++value) {
-      int got = static_cast<int>((static_cast<uint32_t>(value) * fd.magic) >> fd.shift);
-      if (got != value / divisor) {
-        std::cerr << "inkling rel_proj fast div is wrong: " << value << " / " << divisor << " gave " << got
-                  << ", expected " << (value / divisor) << "\n";
-        std::abort();
-      }
-    }
-  }
-#endif
-  return fd;
+  return make_rel_proj_fast_div_magic(divisor, max_value);
 #else
   (void)divisor;
   (void)max_value;
