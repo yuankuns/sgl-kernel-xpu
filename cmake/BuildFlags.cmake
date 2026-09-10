@@ -35,9 +35,11 @@ if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
   set(SYCL_OFFLINE_COMPILER_CG_OPTIONS)
   set(SYCL_OFFLINE_COMPILER_FLAGS)
 
+  # C++20 for both host and device compilation
+  set(CPP_STD c++20)
   # # -- Host flags (SYCL_CXX_FLAGS)
   list(APPEND SYCL_HOST_FLAGS -fPIC)
-  list(APPEND SYCL_HOST_FLAGS -std=c++20)
+  list(APPEND SYCL_HOST_FLAGS -std=${CPP_STD})
   # SYCL headers warnings
   list(APPEND SYCL_HOST_FLAGS -Wno-deprecated-declarations)
   list(APPEND SYCL_HOST_FLAGS -Wno-deprecated)
@@ -75,6 +77,7 @@ if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
   # 4. Linkage:
   # gcc -shared host.o kernel.o device-code.o -o libxxx.so
 
+  set(SYCL_KERNEL_OPTIONS ${SYCL_KERNEL_OPTIONS} -std=${CPP_STD})
   set(SYCL_KERNEL_OPTIONS ${SYCL_KERNEL_OPTIONS} -ftemplate-backtrace-limit=0)
   set(SYCL_KERNEL_OPTIONS ${SYCL_KERNEL_OPTIONS} -fno-sycl-unnamed-lambda)
   set(SYCL_KERNEL_OPTIONS ${SYCL_KERNEL_OPTIONS} -sycl-std=2020)
