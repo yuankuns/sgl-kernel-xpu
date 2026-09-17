@@ -1,0 +1,950 @@
+#pragma once
+
+#include <torch/all.h>
+
+#include <cassert>
+#include <cstdint>
+#include <sycl/sycl.hpp>
+
+#include "../../Utils.h"
+#include "../../gdn_attn/gdn_attn_utils.h"
+#include "gemm.hpp"
+
+namespace gdn {
+using namespace cute;
+static constexpr int MaxThreadsPerSM = 512;
+static constexpr int elem_per_item = 2;
+static constexpr int sub_group_size = 16;
+static constexpr float eps = 0.000001f;
+static constexpr int chunk_size = gdn::chunk_size_xe2;
+static constexpr int A_block_size = gdn::A_block_size_xe2;
+
+struct chunk_gemm_policy_64x64x32_2x1 {
+  using WGTile = Shape<_64, _64, _32>;
+  using SGLayout = Layout<Shape<_2, _1, _1>, Stride<_1, _1, _0>>;
+};
+
+struct chunk_gemm_policy_64x64x32_2x2 {
+  using WGTile = Shape<_64, _64, _32>;
+  using SGLayout = Layout<Shape<_2, _2, _1>, Stride<_2, _1, _0>>;
+};
+
+struct chunk_gemm_policy_64x64x32_4x2 {
+  using WGTile = Shape<_64, _64, _32>;
+  using SGLayout = Layout<Shape<_4, _2, _1>, Stride<_2, _1, _0>>;
+};
+
+struct chunk_gemm_policy_16x16x16 {
+  using WGTile = Shape<_16, _16, _16>;
+  using SGLayout = Layout<Shape<_1, _1, _1>, Stride<_1, _1, _0>>;
+};
+
+using chunk_gemm_policy_compute_A = chunk_gemm_policy_64x64x32_2x2;
+using chunk_gemm_policy_inverse = chunk_gemm_policy_16x16x16;
+using chunk_gemm_policy_compute_wu = chunk_gemm_policy_64x64x32_2x1;
+using chunk_gemm_policy_fwd_o = chunk_gemm_policy_64x64x32_4x2;
+
+CUTE_DEVICE float act_softplus(float& x, float beta = 1.0f, float threshold = 20.0f) {
+  if (beta * x < threshold) {
+    return sycl::log(1.0f + sycl::exp(beta * x)) / beta;
+  } else
+    return x;
+}
+
+template <typename T>
+CUTE_DEVICE void chunk_prepare_kernel(
+    const float* a,
+    const float* A_log,
+    const T* dt_bias,
+    int* total_chunks,
+    const int* query_start_loc,
+    const int total_virtual_seqlen,
+    const int batch_size,
+    const int num_v_heads,
+    const int head_v_dim) {
+  auto item = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+  int group_id = item.get_group(1);
+  int group_range = item.get_group_range(1);
+  auto sg = item.get_sub_group();
+  int sg_id = sg.get_group_linear_id();
+  int sg_range = sg.get_group_linear_range();
+  int sg_local_id = sg.get_local_linear_id();
+
+  int total_sg_range = group_range * sg_range;
+  int total_sg_id = group_id * sg_range + sg_id;
+
+  int pre_chunks = 0;
+  const int chunk_range = total_sg_range / num_v_heads;
+  int chunk_id = total_sg_id % chunk_range;
+  const int v_head_id = total_sg_id / chunk_range;
+
+  const float A_log_exp_h = -sycl::exp(A_log[v_head_id]);
+  const float dt_bias_h = static_cast<float>(dt_bias[v_head_id]);
+
+  for (int batch_id = 0; batch_id < batch_size; ++batch_id) {
+    const int seq_start_offset = query_start_loc[batch_id];
+    const int seq_end_offset = query_start_loc[batch_id + 1];
+    const int seq_len = seq_end_offset - seq_start_offset;
+
+    const int current_chunks = (seq_len + chunk_size - 1) / chunk_size;
+    const int cumsum_chunks = pre_chunks + current_chunks;
+
+    if (chunk_id >= cumsum_chunks) {
+      pre_chunks = cumsum_chunks;
+      continue;
+    }
+
+    while (chunk_id < cumsum_chunks) {
+      const int chunk_start_offset = chunk_id * chunk_size;
+
+      // assume that (chunk_size % sub_group_size == 0)
+      constexpr int local_num = chunk_size / sub_group_size;
+      float g_local[local_num] = {};
+      float g_local_sum = 0.0f;
+      CUTE_UNROLL
+      for (int c = 0; c < local_num; ++c) {
+        g_local[c] = a[(chunk_start_offset + sg_local_id * local_num + c) + v_head_id * total_virtual_seqlen];
+      }
+      CUTE_UNROLL
+      for (int c = 0; c < local_num; ++c) {
+        float a_h = g_local[c] + dt_bias_h;
+        a_h = act_softplus(a_h) * A_log_exp_h;
+        g_local[c] = a_h;
+        g_local_sum += a_h;
+      }
+      g_local_sum = sycl::inclusive_scan_over_group(sg, g_local_sum, sycl::plus<float>());
+      CUTE_UNROLL
+      for (int c = local_num - 1; c >= 0; --c) {
+        const_cast<float*>(a)[(chunk_start_offset + sg_local_id * local_num + c) + v_head_id * total_virtual_seqlen] =
+            g_local_sum;
+        g_local_sum -= g_local[c];
+      }
+
+      chunk_id += chunk_range;
+    }
+    pre_chunks = cumsum_chunks;
+  }
+  if (group_id == 0 && sg_id == 0 && sg_local_id == 0) {
+    *total_chunks = pre_chunks;
+  }
+}
+
+template <typename T, class TiledMMA>
+CUTE_DEVICE void chunk_compute_wu_kernel(
+    const sycl::local_accessor<float, 1>& slm_mem_const,
+    T* A,
+    T* w,
+    T* u,
+    const T* q,
+    const T* k,
+    const T* v,
+    const float* b,
+    const float* a,
+    const float* A_log,
+    const T* dt_bias,
+    const int* query_start_loc,
+    const bool* has_initial_state,
+    const int total_virtual_seqlen,
+    const int batch_size,
+    const int num_k_heads,
+    const int head_k_dim,
+    const int num_v_heads,
+    const int head_v_dim) {
+  auto item = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+  int local_id = item.get_local_linear_id();
+  int local_range = item.get_local_range(2);
+  int chunk_id = item.get_group(1);
+  const int global_chunk_range = item.get_group_range(1);
+
+  // l2norm for q, k
+  int group_id = item.get_group(1);
+  int group_range = item.get_group_range(1);
+  auto sg = item.get_sub_group();
+  int sg_id = sg.get_group_linear_id();
+  int sg_range = sg.get_group_linear_range();
+  int sg_local_id = sg.get_local_linear_id();
+
+  float* slm_mem = static_cast<float*>(slm_mem_const.template get_multi_ptr<sycl::access::decorated::no>().get());
+  float* A_log_slm_ptr = slm_mem;
+  float* dt_bias_slm_ptr = A_log_slm_ptr + num_v_heads;
+  float* g_slm_ptr = dt_bias_slm_ptr + num_v_heads;
+  float* beta_slm_ptr = g_slm_ptr + chunk_size;
+
+  TiledMMA mma{};
+  auto wg_tile = mma.tile_mnk();
+  auto thr_mma = mma.get_slice(local_id);
+
+  static constexpr auto tile_m = get<0>(wg_tile);
+  static constexpr auto tile_n = get<1>(wg_tile);
+
+  static constexpr auto ATOM_M = get<1>(typename TiledMMA::ThrLayoutVMNK{}.shape());
+  static constexpr auto ATOM_N = get<2>(typename TiledMMA::ThrLayoutVMNK{}.shape());
+
+  static constexpr auto SG_M = tile_m / ATOM_M;  // BLK_M / ATOM_M;
+  static constexpr auto SG_N = tile_n / ATOM_N;  // BLK_N / ATOM_N;
+
+  auto sg_local_m_coord = cutlass::get_sub_group_id() / ATOM_N;
+  auto sg_local_n_coord = cutlass::get_sub_group_id() % ATOM_N;
+  int m_tile_start = 0;
+  int n_tile_start = 0;
+  int m_sg_start = sg_local_m_coord * SG_M;
+  int n_sg_start = sg_local_n_coord * SG_N;
+
+  using TileShape = decltype(mma.tile_mnk());
+
+  int pre_chunks = 0;
+
+  const int kv_ratio = num_v_heads / num_k_heads;
+
+  for (int batch_id = 0; batch_id < batch_size; ++batch_id) {
+    const bool initial_state = has_initial_state == nullptr || has_initial_state[batch_id];
+    const int seq_start_offset = query_start_loc[batch_id];
+    const int seq_end_offset = query_start_loc[batch_id + 1];
+    const int seq_len = seq_end_offset - seq_start_offset;
+
+    const int current_chunks = (seq_len + chunk_size - 1) / chunk_size;
+    const int cumsum_chunks = pre_chunks + current_chunks;
+
+    if (chunk_id >= cumsum_chunks) {
+      pre_chunks = cumsum_chunks;
+      continue;
+    }
+
+    while (chunk_id < cumsum_chunks) {
+      const int chunk_start_offset = chunk_id * chunk_size;
+
+      for (int v_head_id = 0; v_head_id < num_v_heads; ++v_head_id) {
+        // WAR fence: previous iteration's sub-groups may still be
+        // reading beta_slm_ptr/g_slm_ptr; all must arrive before any
+        // sub-group refills the SLM for this iteration.
+        item.barrier(sycl::access::fence_space::local_space);
+        CUTE_UNROLL
+        for (int e = local_id; e < chunk_size; e += local_range) {
+          float beta_value = b[(chunk_start_offset + e) + v_head_id * total_virtual_seqlen];
+          float a_value = a[(chunk_start_offset + e) + v_head_id * total_virtual_seqlen];
+          beta_slm_ptr[e] = beta_value;
+          g_slm_ptr[e] = sycl::exp(a_value) * beta_value;
+        }
+
+        item.barrier(sycl::access::fence_space::local_space);
+
+        auto A_ptr =
+            A + static_cast<int64_t>(v_head_id) * total_virtual_seqlen * chunk_size + chunk_start_offset * chunk_size;
+        auto A_tensor_shape = make_shape(chunk_size, chunk_size);
+        auto A_tensor = make_tensor(make_gmem_ptr(A_ptr), make_layout(A_tensor_shape, make_stride(chunk_size, _1{})));
+
+        auto v_ptr = v + static_cast<int64_t>(chunk_start_offset) * num_v_heads * head_v_dim + v_head_id * head_v_dim;
+        auto V_tensor_T_shape = make_shape(head_v_dim, chunk_size);
+        auto V_tensor_T = make_tensor(
+            make_gmem_ptr(v_ptr), make_layout(V_tensor_T_shape, make_stride(_1{}, head_v_dim * num_v_heads)));
+        auto U_ptr =
+            u + static_cast<int64_t>(v_head_id) * total_virtual_seqlen * head_v_dim + chunk_start_offset * head_v_dim;
+        auto U_tensor_shape = make_shape(chunk_size, head_v_dim);
+        auto U_tensor = make_tensor(make_gmem_ptr(U_ptr), make_layout(U_tensor_shape, make_stride(head_v_dim, _1{})));
+
+        Tensor cU = make_identity_tensor(U_tensor.shape());
+        auto copy_U_c = get_block_2d_copy_D<void>(mma, U_tensor);
+        auto thr_copy_U_c = copy_U_c.get_slice(local_id);
+
+        for (int dv = 0; dv < head_v_dim / chunk_size; ++dv) {
+          Tensor gU_C = local_tile(cU, wg_tile, make_coord(0, dv, 0), Step<_1, _1, X>{});
+          auto tCrU_c = thr_copy_U_c.partition_sg_fragment_S(gU_C);
+          auto tCgU_c = thr_copy_U_c.partition_D(gU_C);
+          auto tSrU_c = thr_mma.partition_sg_fragment_C(gU_C);
+          clear(tSrU_c);
+          gemm_TTS_k_multi(A_tensor, V_tensor_T, tSrU_c, 0, dv, mma, beta_slm_ptr);
+          reorder(tSrU_c, tCrU_c);
+          copy(copy_U_c, tCrU_c, tCgU_c);
+        }
+
+        if (((chunk_id - pre_chunks) != 0) || initial_state) {
+          auto k_ptr = k + static_cast<int64_t>(chunk_start_offset) * num_k_heads * head_k_dim +
+                       (v_head_id / kv_ratio) * head_k_dim;
+          auto K_tensor_T_shape = make_shape(head_k_dim, chunk_size);
+          auto K_tensor_T = make_tensor(
+              make_gmem_ptr(k_ptr), make_layout(K_tensor_T_shape, make_stride(_1{}, head_k_dim * num_k_heads)));
+          auto W_ptr =
+              w + static_cast<int64_t>(v_head_id) * total_virtual_seqlen * head_k_dim + chunk_start_offset * head_k_dim;
+          auto W_tensor_shape = make_shape(chunk_size, head_k_dim);
+          auto W_tensor = make_tensor(make_gmem_ptr(W_ptr), make_layout(W_tensor_shape, make_stride(head_k_dim, _1{})));
+
+          Tensor cW = make_identity_tensor(W_tensor.shape());
+          auto copy_W_c = get_block_2d_copy_D<void>(mma, W_tensor);
+          auto thr_copy_W_c = copy_W_c.get_slice(local_id);
+
+          for (int dk = 0; dk < head_k_dim / chunk_size; ++dk) {
+            Tensor gW_C = local_tile(cW, wg_tile, make_coord(0, dk, 0), Step<_1, _1, X>{});
+            auto tCrW_c = thr_copy_W_c.partition_sg_fragment_S(gW_C);
+            auto tCgW_c = thr_copy_W_c.partition_D(gW_C);
+            auto tSrW_c = thr_mma.partition_sg_fragment_C(gW_C);
+            clear(tSrW_c);
+            gemm_TTS_k_multi(A_tensor, K_tensor_T, tSrW_c, 0, dk, mma, g_slm_ptr);
+            reorder(tSrW_c, tCrW_c);
+            copy(copy_W_c, tCrW_c, tCgW_c);
+          }
+        }
+      }
+      chunk_id += global_chunk_range;
+    }
+    pre_chunks = cumsum_chunks;
+  }
+}
+
+template <typename T, typename StateT, class TiledMMA>
+CUTE_DEVICE void chunk_fwd_o_kernel(
+    const sycl::local_accessor<float, 1>& slm_mem_const,  // [3 * chunk_size]
+    T* core_attn_out,                                     // [total_seqlen, num_v_heads, head_v_dim]
+    T* A,        // [num_v_heads, total_virtual_seqlen, chunk_size], temp O2 buffer
+    T* w,        // [num_v_heads, total_virtual_seqlen, head_k_dim]
+    T* u,        // [num_v_heads, total_virtual_seqlen, head_v_dim]
+    const T* q,  // [total_virtual_seqlen, num_k_heads, head_k_dim]
+    const T* k,  // [total_virtual_seqlen, num_k_heads, head_k_dim]
+    const float* a,
+    StateT* ssm_state,  // [cache_batch_size, num_v_heads, head_v_dim, head_k_dim]
+    const int ssm_state_stride_0,
+    const int* query_start_loc,
+    const int* cache_indices,
+    const bool* has_initial_state,
+    const int* token_indx,  // [total_virtual_seqlen] or nullptr; must be contiguous per
+                            // chunk (see TODO at its use below) -- not an arbitrary gather map
+    const int batch_size,
+    const int total_virtual_seqlen,
+    const int num_k_heads,
+    const int head_k_dim,
+    const int num_v_heads,
+    const int head_v_dim) {
+  auto item = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+  int local_id = item.get_local_linear_id();
+  int current_batch_id = item.get_group(0);
+  int v_head_id = item.get_group(1);
+  int local_range = item.get_local_range(2);
+
+  auto sg = item.get_sub_group();
+  int sg_local_id = sg.get_local_linear_id();
+
+  float* slm_mem = static_cast<float*>(slm_mem_const.template get_multi_ptr<sycl::access::decorated::no>().get());
+  float* g_slm_ptr = slm_mem;
+  float* g_multi_slm_ptr = slm_mem + chunk_size;
+  float* g_exp_slm_ptr = g_multi_slm_ptr + chunk_size;
+
+  TiledMMA mma{};
+  auto wg_tile = mma.tile_mnk();
+
+  static constexpr auto tile_m = get<0>(wg_tile);
+  static constexpr auto tile_n = get<1>(wg_tile);
+
+  static constexpr auto ATOM_M = get<1>(typename TiledMMA::ThrLayoutVMNK{}.shape());
+  static constexpr auto ATOM_N = get<2>(typename TiledMMA::ThrLayoutVMNK{}.shape());
+
+  static constexpr auto SG_M = tile_m / ATOM_M;  // BLK_M / ATOM_M;
+  static constexpr auto SG_N = tile_n / ATOM_N;  // BLK_N / ATOM_N;
+
+  auto sg_local_m_coord = cutlass::get_sub_group_id() / ATOM_N;
+  auto sg_local_n_coord = cutlass::get_sub_group_id() % ATOM_N;
+  int m_tile_start = 0;
+  int n_tile_start = 0;
+  int m_sg_start = sg_local_m_coord * SG_M;
+  int n_sg_start = sg_local_n_coord * SG_N;
+
+  const int kv_ratio = num_v_heads / num_k_heads;
+  const int kv_head_id = v_head_id / kv_ratio;
+
+  int pre_chunks = 0;
+
+  for (int batch_id = 0; batch_id < batch_size; ++batch_id) {
+    const bool initial_state = has_initial_state[batch_id];
+    const int seq_start_offset = query_start_loc[batch_id];
+    const int seq_end_offset = query_start_loc[batch_id + 1];
+    const int seq_len = seq_end_offset - seq_start_offset;
+
+    const int current_chunks = (seq_len + chunk_size - 1) / chunk_size;
+
+    if (current_batch_id != batch_id) {
+      pre_chunks += current_chunks;
+      continue;
+    }
+
+    StateT* ssm_state_ptr = ssm_state + static_cast<int64_t>(cache_indices[batch_id]) * ssm_state_stride_0 +
+                            v_head_id * head_v_dim * head_k_dim;
+
+    for (int chunk_id = 0; chunk_id < current_chunks; ++chunk_id) {
+      const bool has_prev_state = (chunk_id != 0) || initial_state;
+      const int out_chunk_offset = seq_start_offset + chunk_id * chunk_size;
+      const int chunk_offset = (pre_chunks + chunk_id) * chunk_size;
+
+      int current_chunk_size = chunk_size;
+      if ((chunk_id + 1) * chunk_size > seq_len) {
+        current_chunk_size = seq_len - chunk_id * chunk_size;
+      }
+
+      // The core_attn_out store below (O_ptr/O_tensor) assumes token_indx is
+      // contiguous across this chunk, i.e. token_indx[out_chunk_offset + r] ==
+      // token_indx[out_chunk_offset] + r for all r in [0, current_chunk_size). It
+      // derives a single affine base pointer from token_indx[out_chunk_offset] and
+      // reuses the block-2D copy's fixed row stride instead of a per-row gather, to
+      // avoid the cost of scattering every output row individually.
+      // TODO Revisit with a per-row scatter (or reject non-contiguous maps at the interface)
+      // if this assumption is ever violated (e.g. by interleaved mixed/spec batches).
+      if (token_indx != nullptr && local_id == 0) {
+        for (int r = 1; r < current_chunk_size; ++r) {
+          assert(token_indx[out_chunk_offset + r] == token_indx[out_chunk_offset] + r);
+        }
+      }
+
+      float g_last_value = a[(chunk_offset + current_chunk_size - 1) + v_head_id * total_virtual_seqlen];
+      float g_last_value_exp = sycl::native::exp(g_last_value);
+      // WAR fence: the previous chunk iteration's sub-groups may
+      // still be reading g_slm_ptr/g_multi_slm_ptr/g_exp_slm_ptr in
+      // their output/state GEMM epilogues; all must arrive before any
+      // sub-group refills these SLM buffers for this chunk.
+      item.barrier(sycl::access::fence_space::local_space);
+      CUTE_UNROLL
+      for (int e = local_id; e < current_chunk_size; e += local_range) {
+        float g_cumsum_value = a[(chunk_offset + e) + v_head_id * total_virtual_seqlen];
+        g_slm_ptr[e] = g_cumsum_value;
+        g_multi_slm_ptr[e] = sycl::native::exp(g_last_value - g_cumsum_value);
+        g_exp_slm_ptr[e] = sycl::native::exp(g_cumsum_value);
+      }
+
+      CUTE_UNROLL
+      for (int e = current_chunk_size + local_id; e < chunk_size; e += local_range) {
+        g_slm_ptr[e] = 0.0f;
+        g_multi_slm_ptr[e] = 0.0f;
+        g_exp_slm_ptr[e] = 0.0f;
+      }
+      item.barrier(sycl::access::fence_space::local_space);
+
+      auto W_ptr = w + v_head_id * total_virtual_seqlen * head_k_dim + chunk_offset * head_k_dim;
+      auto W_tensor_shape = make_shape(chunk_size, head_k_dim);
+      auto W_tensor = make_tensor(make_gmem_ptr(W_ptr), make_layout(W_tensor_shape, make_stride(head_k_dim, _1{})));
+
+      auto U_ptr = u + v_head_id * total_virtual_seqlen * head_v_dim + chunk_offset * head_v_dim;
+      auto U_tensor_shape = make_shape(chunk_size, head_v_dim);
+      auto U_tensor = make_tensor(make_gmem_ptr(U_ptr), make_layout(U_tensor_shape, make_stride(head_v_dim, _1{})));
+
+      StateT* S_ptr = ssm_state_ptr;
+      auto S_tensor_shape = make_shape(head_v_dim, head_k_dim);
+      auto S_tensor = make_tensor(make_gmem_ptr(S_ptr), make_layout(S_tensor_shape, make_stride(head_k_dim, _1{})));
+
+      Tensor cU = make_identity_tensor(U_tensor.shape());
+
+      auto copy_U_c = get_block_2d_copy_C<void>(mma, U_tensor);
+      auto copy_U_d = get_block_2d_copy_D<void>(mma, U_tensor);
+
+      auto thr_copy_U_c = copy_U_c.get_slice(local_id);
+      auto thr_copy_U_d = copy_U_d.get_slice(local_id);
+
+      auto thr_mma = mma.get_slice(local_id);
+
+      auto q_ptr = q + chunk_offset * num_k_heads * head_k_dim + kv_head_id * head_k_dim;
+      auto Q_tensor_shape = make_shape(current_chunk_size, head_k_dim);
+      auto Q_tensor =
+          make_tensor(make_gmem_ptr(q_ptr), make_layout(Q_tensor_shape, make_stride(head_k_dim * num_k_heads, _1{})));
+
+      auto k_ptr = k + chunk_offset * num_k_heads * head_k_dim + kv_head_id * head_k_dim;
+      auto K_tensor_shape = make_shape(chunk_size, head_k_dim);
+      auto K_tensor =
+          make_tensor(make_gmem_ptr(k_ptr), make_layout(K_tensor_shape, make_stride(head_k_dim * num_k_heads, _1{})));
+
+      auto O2_ptr = A + static_cast<int64_t>(v_head_id) * total_virtual_seqlen * chunk_size + chunk_offset * chunk_size;
+      auto O2_tensor_shape = make_shape(current_chunk_size, chunk_size);
+      auto O2_tensor = make_tensor(make_gmem_ptr(O2_ptr), make_layout(O2_tensor_shape, make_stride(chunk_size, _1{})));
+      Tensor cO2 = make_identity_tensor(O2_tensor_shape);
+      auto copy_O2_c = get_block_2d_copy_D<void>(mma, O2_tensor);
+      auto thr_copy_O2_c = copy_O2_c.get_slice(local_id);
+
+      Tensor gO2_C = local_tile(cO2, wg_tile, make_coord(0, 0, 0), Step<_1, _1, X>{});
+      auto tCrO2_c = thr_copy_O2_c.partition_sg_fragment_S(gO2_C);
+      auto tCgO2_c = thr_copy_O2_c.partition_D(gO2_C);
+      auto tSrO2_c = thr_mma.partition_sg_fragment_C(gO2_C);
+
+      // QK MMA: compute O2 = mask(Q × K^T) first (no dependency on WS)
+      clear(tSrO2_c);
+      gemm_TTS(Q_tensor, K_tensor, tSrO2_c, 0, 0, mma);
+
+      CUTE_UNROLL
+      for (int sn = 0; sn < SG_N / sub_group_size; ++sn) {
+        int n_idx = n_tile_start + n_sg_start + sn * sub_group_size + sg_local_id;
+        CUTE_UNROLL
+        for (int sm = 0; sm < SG_M; ++sm) {
+          int m_idx = m_tile_start + m_sg_start + sm;
+          tSrO2_c(sn * SG_M + sm) *= sycl::native::exp(g_slm_ptr[(m_idx)] - g_slm_ptr[n_idx]);
+          if (m_idx < n_idx) {
+            tSrO2_c(sn * SG_M + sm) = 0.0f;
+          }
+        }
+      }
+      reorder(tSrO2_c, tCrO2_c);
+      copy(copy_O2_c, tCrO2_c, tCgO2_c);
+
+      auto U_tensor_T_shape = make_shape(head_v_dim, chunk_size);
+      auto U_tensor_T = make_tensor(make_gmem_ptr(U_ptr), make_layout(U_tensor_T_shape, make_stride(_1{}, head_v_dim)));
+      auto O_ptr = core_attn_out +
+                   (token_indx ? token_indx[out_chunk_offset] : out_chunk_offset) * num_v_heads * head_v_dim +
+                   v_head_id * head_v_dim;
+      auto O_tensor_shape = make_shape(current_chunk_size, head_v_dim);
+      auto O_tensor =
+          make_tensor(make_gmem_ptr(O_ptr), make_layout(O_tensor_shape, make_stride(num_v_heads * head_v_dim, _1{})));
+
+      Tensor cO = make_identity_tensor(O_tensor.shape());
+      auto copy_O_c = get_block_2d_copy_D<void>(mma, O_tensor);
+      auto thr_copy_O_c = copy_O_c.get_slice(local_id);
+
+      if (has_prev_state) {
+        // Fused WS+QS dv loop: S[dv] is loaded once per k_tile and reused
+        // in registers for both WS (W×S) and QS (Q×S) DPAS operations.
+        for (int dv = 0; dv < head_v_dim / chunk_size; ++dv) {
+          // --- Fused WS+QS MMA: share S[dv] load in registers ---
+          Tensor gU_C = local_tile(cU, wg_tile, make_coord(0, dv, 0), Step<_1, _1, X>{});
+          auto tSrU_d = thr_mma.partition_sg_fragment_C(gU_C);
+          clear(tSrU_d);
+
+          Tensor gO_C = local_tile(cO, wg_tile, make_coord(0, dv, 0), Step<_1, _1, X>{});
+          auto tSrO_c = thr_mma.partition_sg_fragment_C(gO_C);
+          clear(tSrO_c);
+
+          // Fused gemm: W×S[dv] -> tSrU_d, Q×S[dv] -> tSrO_c
+          // S is loaded once and reused in registers for both
+          gemm_TTS_fused_2A(W_tensor, Q_tensor, S_tensor, tSrU_d, tSrO_c, 0, 0, dv, mma);
+
+          // --- WS epilogue: U_new[dv] = U_old[dv] - W×S[dv] ---
+          auto tCrU_d = thr_copy_U_d.partition_sg_fragment_S(gU_C);
+          auto tCgU_d = thr_copy_U_d.partition_D(gU_C);
+          auto tCrU_c_save = thr_copy_U_c.partition_sg_fragment_D(gU_C);
+          reorder(tSrU_d, tCrU_c_save);
+
+          auto tCgU_c = thr_copy_U_c.partition_S(gU_C);
+          auto tCrU_c = thr_copy_U_c.partition_sg_fragment_D(gU_C);
+          copy(copy_U_c, tCgU_c, tCrU_c);
+
+          CUTE_UNROLL
+          for (int i = 0; i < tCrU_c_save.size(); ++i) {
+            tCrU_c(i) -= tCrU_c_save(i);
+          }
+
+          reorder(tCrU_c, tCrU_d);
+          copy(copy_U_d, tCrU_d, tCgU_d);
+
+          // --- QS epilogue: apply exp(g) scaling ---
+          CUTE_UNROLL
+          for (int sn = 0; sn < SG_N / sub_group_size; ++sn) {
+            int n_idx = n_tile_start + n_sg_start + sn * sub_group_size + sg_local_id;
+            CUTE_UNROLL
+            for (int sm = 0; sm < SG_M; ++sm) {
+              int m_idx = m_tile_start + m_sg_start + sm;
+              tSrO_c(sn * SG_M + sm) *= g_exp_slm_ptr[(m_idx)];
+            }
+          }
+
+          // Barrier: ensure U_new[dv] is visible across all subgroups
+          // before O2U reads it via U_tensor_T.
+          item.barrier(sycl::access::fence_space::local_space);
+
+          // --- O2U MMA: O[dv] += O1[dv] + O2 × U_T[dv] ---
+          gemm_TTS(O2_tensor, U_tensor_T, tSrO_c, 0, dv, mma);
+          auto tCrO_c = thr_copy_O_c.partition_sg_fragment_S(gO_C);
+          auto tCgO_c = thr_copy_O_c.partition_D(gO_C);
+          reorder(tSrO_c, tCrO_c);
+          copy(copy_O_c, tCrO_c, tCgO_c);
+        }
+      }
+
+      auto K_tensor_T_shape = make_shape(head_k_dim, chunk_size);
+      auto K_tensor_T =
+          make_tensor(make_gmem_ptr(k_ptr), make_layout(K_tensor_T_shape, make_stride(_1{}, head_k_dim * num_k_heads)));
+
+      Tensor cS = make_identity_tensor(S_tensor.shape());
+      auto copy_S_c = get_block_2d_copy_C<void>(mma, S_tensor);
+      auto copy_S_d = get_block_2d_copy_D<void>(mma, S_tensor);
+      auto thr_copy_S_c = copy_S_c.get_slice(local_id);
+      auto thr_copy_S_d = copy_S_d.get_slice(local_id);
+
+      for (int dv = 0; dv < head_v_dim / chunk_size; ++dv) {
+        for (int dk = 0; dk < head_k_dim / chunk_size; ++dk) {
+          Tensor gS_C = local_tile(cS, wg_tile, make_coord(dv, dk, 0), Step<_1, _1, X>{});
+          auto tCrS_d = thr_copy_S_d.partition_sg_fragment_S(gS_C);
+          auto tCgS_d = thr_copy_S_d.partition_D(gS_C);
+          auto tSrS_d = thr_mma.partition_sg_fragment_C(gS_C);
+
+          // Seed accumulator with exp(g_last) * S_prev when previous state
+          // exists; otherwise start from zeros.
+          if (has_prev_state) {
+            auto tCgS_c = thr_copy_S_c.partition_S(gS_C);
+            auto tCrS_c = thr_copy_S_c.partition_sg_fragment_D(gS_C);
+            copy(copy_S_c, tCgS_c, tCrS_c);
+
+            reorder(tCrS_c, tSrS_d);
+            CUTE_UNROLL
+            for (int i = 0; i < tCrS_c.size(); ++i) {
+              tSrS_d(i) *= g_last_value_exp;
+            }
+          } else {
+            clear(tSrS_d);
+          }
+
+          gemm_TTS_k_multi(U_tensor_T, K_tensor_T, tSrS_d, dv, dk, mma, g_multi_slm_ptr);
+          reorder(tSrS_d, tCrS_d);
+          copy(copy_S_d, tCrS_d, tCgS_d);
+        }
+      }
+
+      if (!has_prev_state) {
+        for (int dv = 0; dv < head_v_dim / chunk_size; ++dv) {
+          Tensor gO_C = local_tile(cO, wg_tile, make_coord(0, dv, 0), Step<_1, _1, X>{});
+          auto tCrO_c = thr_copy_O_c.partition_sg_fragment_S(gO_C);
+          auto tCgO_c = thr_copy_O_c.partition_D(gO_C);
+          auto tSrO_c = thr_mma.partition_sg_fragment_C(gO_C);
+
+          clear(tSrO_c);
+          gemm_TTS(O2_tensor, U_tensor_T, tSrO_c, 0, dv, mma);
+          reorder(tSrO_c, tCrO_c);
+          copy(copy_O_c, tCrO_c, tCgO_c);
+        }
+      }
+    }
+    pre_chunks += current_chunks;
+  }
+}
+
+template <typename T, typename StateTag>
+class ChunkPrepareKernel;
+
+template <typename T, typename StateTag>
+class ChunkInverseKernel;
+
+template <typename T, typename StateTag>
+class ChunkComputeWUKernel;
+
+template <typename T, typename StateT>
+class ChunkFwdOKernel;
+
+// Forward declaration only: defined in chunk_compute_A_inverse_fused.hpp,
+// included (after this header) by chunk_gated_delta_rule.cpp. Fuses the
+// compute-A step with the matrix-inverse step into a single kernel launch,
+// replacing the previous separate chunk_compute_A_kernel +
+// chunk_inverse_opt_kernel launches.
+template <typename T, typename StateT>
+void launch_chunk_compute_A_inverse_fused(
+    sycl::queue& queue,
+    T* A,
+    const T* k,
+    const float* b,
+    const float* a,
+    int* total_chunks,
+    const int total_virtual_seqlen,
+    const int num_k_heads,
+    const int head_k_dim,
+    const int num_v_heads,
+    const int head_v_dim);
+
+template <typename T, typename StateT>
+void kernel_launcher(
+    sycl::queue& queue,
+    T* core_attn_out,
+    const T* q,
+    const T* k,
+    const T* v,
+    T* A,
+    T* w,
+    T* u,
+    int* total_chunks,
+    const float* b,
+    const float* a,
+    const float* A_log,
+    const T* dt_bias,
+    StateT* ssm_state,
+    const int ssm_state_stride_0,
+    const int* query_start_loc,
+    const int* cache_indices,
+    const bool* has_initial_state,
+    const int* token_indx,
+    const int batch_size,
+    const int total_virtual_seqlen,
+    const int num_k_heads,
+    const int head_k_dim,
+    const int num_v_heads,
+    const int head_v_dim) {
+  using Element_non_CV = cutlass::platform::remove_cv_t<T>;
+  auto op = XE_DPAS_TT<8, float, Element_non_CV>{};
+
+  int sm_count = cutlass::KernelHardwareInfo::query_device_multiprocessor_count(0);
+  static constexpr int MaxThreadsPerSM = 512;
+
+  namespace syclex = sycl::ext::oneapi::experimental;
+  namespace intelex = sycl::ext::intel::experimental;
+
+  syclex::properties kernel_props{syclex::sub_group_size<cute::detail::subgroup_size>, intelex::grf_size<256>};
+
+  // prepare data for A, W, U compute
+  sycl::range<3> local_prepare(1, 1, MaxThreadsPerSM);
+  sycl::range<3> global_prepare(1, sm_count, 1);
+  int slm_size_prepare = num_v_heads * 2 + chunk_size;
+
+  queue.submit([&](sycl::handler& cgh) {
+    cgh.parallel_for<ChunkPrepareKernel<T, StateT>>(
+        sycl::nd_range<3>{global_prepare * local_prepare, local_prepare}, kernel_props, [=](auto) {
+          chunk_prepare_kernel<T>(
+              a,
+              A_log,
+              dt_bias,
+              total_chunks,
+              query_start_loc,
+              total_virtual_seqlen,
+              batch_size,
+              num_v_heads,
+              head_v_dim);
+        });
+  });
+
+  // compute A + invert: single fused kernel launch (see chunk_compute_A_inverse_fused.hpp).
+  launch_chunk_compute_A_inverse_fused<T, StateT>(
+      queue, A, k, b, a, total_chunks, total_virtual_seqlen, num_k_heads, head_k_dim, num_v_heads, head_v_dim);
+
+  // compute W U
+  using WGTileComputeWU = chunk_gemm_policy_compute_wu::WGTile;
+  using SGLayoutComputeWU = chunk_gemm_policy_compute_wu::SGLayout;
+  using MMAComputeWU =
+      typename TiledMMAHelper<MMA_Atom<decltype(op)>, Layout<WGTileComputeWU>, SGLayoutComputeWU>::TiledMMA;
+  auto mmaComputeWU = MMAComputeWU{};
+  int MaxThreadsPerWorkgroupComputeWU = size(mmaComputeWU);
+  sycl::range<3> local_compute_wu(1, 1, MaxThreadsPerWorkgroupComputeWU);
+  sycl::range<3> global_compute_wu(1, sm_count * MaxThreadsPerSM / MaxThreadsPerWorkgroupComputeWU, 1);
+  int slm_size_compute_wu = num_v_heads * 2 + chunk_size * 2;
+
+  queue.submit([&](sycl::handler& cgh) {
+    sycl::local_accessor<float, 1> local_mem(sycl::range<1>(slm_size_compute_wu), cgh);
+    cgh.parallel_for<ChunkComputeWUKernel<T, StateT>>(
+        sycl::nd_range<3>{global_compute_wu * local_compute_wu, local_compute_wu}, kernel_props, [=](auto) {
+          chunk_compute_wu_kernel<T, MMAComputeWU>(
+              local_mem,
+              A,
+              w,
+              u,
+              q,
+              k,
+              v,
+              b,
+              a,
+              A_log,
+              dt_bias,
+              query_start_loc,
+              has_initial_state,
+              total_virtual_seqlen,
+              batch_size,
+              num_k_heads,
+              head_k_dim,
+              num_v_heads,
+              head_v_dim);
+        });
+  });
+
+  // compute O
+  using WGTileFwdO = chunk_gemm_policy_fwd_o::WGTile;
+  using SGLayoutFwdO = chunk_gemm_policy_fwd_o::SGLayout;
+  using MMAFwdO = typename TiledMMAHelper<MMA_Atom<decltype(op)>, Layout<WGTileFwdO>, SGLayoutFwdO>::TiledMMA;
+  auto mmaFwdO = MMAFwdO{};
+  int MaxThreadsPerWorkgroupFwdO = size(mmaFwdO);
+  sycl::range<3> local_fwd_o(1, 1, MaxThreadsPerWorkgroupFwdO);
+  sycl::range<3> global_fwd_o(batch_size, num_v_heads, 1);
+  int slm_size_fwd_o = chunk_size + chunk_size + chunk_size;
+
+  queue.submit([&](sycl::handler& cgh) {
+    sycl::local_accessor<float, 1> local_mem(sycl::range<1>(slm_size_fwd_o), cgh);
+    cgh.parallel_for<ChunkFwdOKernel<T, StateT>>(
+        sycl::nd_range<3>{global_fwd_o * local_fwd_o, local_fwd_o}, kernel_props, [=](auto) {
+          chunk_fwd_o_kernel<T, StateT, MMAFwdO>(
+              local_mem,
+              core_attn_out,
+              A,
+              w,
+              u,
+              q,
+              k,
+              a,
+              ssm_state,
+              ssm_state_stride_0,
+              query_start_loc,
+              cache_indices,
+              has_initial_state,
+              token_indx,
+              batch_size,
+              total_virtual_seqlen,
+              num_k_heads,
+              head_k_dim,
+              num_v_heads,
+              head_v_dim);
+        });
+  });
+}
+
+// The host dispatcher does torch marshalling only; it is excluded from the JIT
+// instance TU (which just instantiates the selected kernel_launcher).
+#ifndef SGL_GDN_JIT_ENTRY
+void chunk_gated_delta_rule_impl(
+    sycl::queue& queue,
+    torch::Tensor& core_attn_out,                           // [total_seqlen, num_v_heads, head_v_dim]
+    const torch::Tensor& q,                                 // [total_virtual_seqlen, num_k_heads, head_k_dim]
+    const torch::Tensor& k,                                 // [total_virtual_seqlen, num_k_heads, head_k_dim]
+    const torch::Tensor& v,                                 // [total_virtual_seqlen, num_v_heads, head_v_dim]
+    const torch::Tensor& b,                                 // [num_v_heads, total_virtual_seqlen]
+    const torch::Tensor& a,                                 // [num_v_heads, total_virtual_seqlen]
+    const torch::Tensor& A_log,                             // [num_v_heads]
+    const torch::Tensor& dt_bias,                           // [num_v_heads]
+    torch::Tensor& ssm_state,                               // [cache_batch_size, num_v_heads, head_v_dim, head_k_dim]
+    const torch::Tensor& query_start_loc,                   // [batch_size + 1]
+    const torch::Tensor& cache_indices,                     // [batch_size]
+    const std::optional<torch::Tensor>& has_initial_state,  // [batch_size] or None
+    const int num_prefills,
+    const int num_decodes,
+    const int* token_indx) {
+  if (num_prefills == 0 && num_decodes == 0) {
+    return;
+  }
+
+  int batch_size = query_start_loc.size(0) - 1;
+  if (num_prefills == 0 && num_decodes > 0) {
+    batch_size = num_decodes;
+  }
+  const int total_seqlen = core_attn_out.size(0);
+  const int total_virtual_seqlen = q.size(0);
+  const int num_k_heads = q.size(1);
+  const int head_k_dim = q.size(2);
+  const int num_v_heads = v.size(1);
+  const int head_v_dim = v.size(2);
+  const int ssm_state_stride_0 = ssm_state.stride(0);
+
+  TORCH_CHECK(num_v_heads % num_k_heads == 0);
+
+  TORCH_CHECK(A_log.scalar_type() == at::kFloat, "A_log dtype must be float32, but got ", A_log.scalar_type());
+  TORCH_CHECK(
+      dt_bias.scalar_type() == core_attn_out.scalar_type(),
+      "dt_bias dtype must match core_attn_out dtype (float16/bfloat16), but "
+      "got dt_bias=",
+      dt_bias.scalar_type(),
+      ", core_attn_out=",
+      core_attn_out.scalar_type());
+
+  auto dtype = core_attn_out.dtype();
+  auto device = core_attn_out.device();
+
+  int padding_size = batch_size * (chunk_size - 1);
+
+  torch::Tensor A = torch::zeros(
+      {num_v_heads, total_seqlen + padding_size, chunk_size}, torch::dtype(dtype).device(device).requires_grad(false));
+  torch::Tensor w = torch::zeros(
+      {num_v_heads, total_seqlen + padding_size, head_k_dim}, torch::dtype(dtype).device(device).requires_grad(false));
+  torch::Tensor u = torch::zeros(
+      {num_v_heads, total_seqlen + padding_size, head_v_dim}, torch::dtype(dtype).device(device).requires_grad(false));
+  torch::Tensor total_chunks = torch::zeros({1}, torch::dtype(torch::kInt32).device(device).requires_grad(false));
+
+#define KERNEL_LAUNCHER(scalar_t, state_scalar_t)                                                       \
+  kernel_launcher<scalar_t, state_scalar_t>(                                                            \
+      queue,                                                                                            \
+      reinterpret_cast<scalar_t*>(core_attn_out.data_ptr()),                                            \
+      reinterpret_cast<scalar_t*>(q.data_ptr()),                                                        \
+      reinterpret_cast<scalar_t*>(k.data_ptr()),                                                        \
+      reinterpret_cast<scalar_t*>(v.data_ptr()),                                                        \
+      reinterpret_cast<scalar_t*>(A.data_ptr()),                                                        \
+      reinterpret_cast<scalar_t*>(w.data_ptr()),                                                        \
+      reinterpret_cast<scalar_t*>(u.data_ptr()),                                                        \
+      reinterpret_cast<int*>(total_chunks.data_ptr()),                                                  \
+      reinterpret_cast<float*>(b.data_ptr()),                                                           \
+      reinterpret_cast<float*>(a.data_ptr()),                                                           \
+      reinterpret_cast<float*>(A_log.data_ptr()),                                                       \
+      reinterpret_cast<scalar_t*>(dt_bias.data_ptr()),                                                  \
+      reinterpret_cast<state_scalar_t*>(ssm_state.data_ptr()),                                          \
+      ssm_state_stride_0,                                                                               \
+      reinterpret_cast<int*>(query_start_loc.data_ptr()),                                               \
+      reinterpret_cast<int*>(cache_indices.data_ptr()),                                                 \
+      has_initial_state.has_value() ? reinterpret_cast<bool*>(has_initial_state->data_ptr()) : nullptr, \
+      token_indx,                                                                                       \
+      batch_size,                                                                                       \
+      total_virtual_seqlen,                                                                             \
+      num_k_heads,                                                                                      \
+      head_k_dim,                                                                                       \
+      num_v_heads,                                                                                      \
+      head_v_dim);
+
+#define DISPATCH_STATE_DTYPE(scalar_t)                                                                           \
+  do {                                                                                                           \
+    if (ssm_state.scalar_type() == at::kFloat) {                                                                 \
+      using state_scalar_t = float;                                                                              \
+      KERNEL_LAUNCHER(scalar_t, state_scalar_t)                                                                  \
+    } else if (ssm_state.scalar_type() == at::kBFloat16) {                                                       \
+      using state_scalar_t = bfloat16_t;                                                                         \
+      KERNEL_LAUNCHER(scalar_t, state_scalar_t)                                                                  \
+    } else if (ssm_state.scalar_type() == at::kHalf) {                                                           \
+      using state_scalar_t = half_t;                                                                             \
+      KERNEL_LAUNCHER(scalar_t, state_scalar_t)                                                                  \
+    } else {                                                                                                     \
+      TORCH_CHECK(false, "ssm_state dtype must be float32/float16/bfloat16, but got ", ssm_state.scalar_type()); \
+    }                                                                                                            \
+  } while (0)
+
+#ifdef USE_GDN_JIT
+  const bool is_half = core_attn_out.scalar_type() == at::kHalf;
+  TORCH_CHECK(
+      is_half || core_attn_out.scalar_type() == at::kBFloat16,
+      "core_attn_out dtype must be float16/bfloat16, but got ",
+      core_attn_out.scalar_type());
+  int state_code;
+  if (ssm_state.scalar_type() == at::kFloat) {
+    state_code = 0;
+  } else if (ssm_state.scalar_type() == at::kBFloat16) {
+    state_code = 1;
+  } else if (ssm_state.scalar_type() == at::kHalf) {
+    state_code = 2;
+  } else {
+    TORCH_CHECK(false, "ssm_state dtype must be float32/float16/bfloat16, but got ", ssm_state.scalar_type());
+  }
+  const bool* has_init_ptr =
+      has_initial_state.has_value() ? reinterpret_cast<const bool*>(has_initial_state->data_ptr()) : nullptr;
+  std::string jit_err;
+  const bool ok = sgl::gdn_jit::chunk_launch(
+      is_half,
+      state_code,
+      &queue,
+      core_attn_out.data_ptr(),
+      q.data_ptr(),
+      k.data_ptr(),
+      v.data_ptr(),
+      A.data_ptr(),
+      w.data_ptr(),
+      u.data_ptr(),
+      b.data_ptr(),
+      a.data_ptr(),
+      A_log.data_ptr(),
+      dt_bias.data_ptr(),
+      ssm_state.data_ptr(),
+      ssm_state_stride_0,
+      reinterpret_cast<const int*>(query_start_loc.data_ptr()),
+      reinterpret_cast<const int*>(cache_indices.data_ptr()),
+      has_init_ptr,
+      token_indx,
+      batch_size,
+      total_virtual_seqlen,
+      num_k_heads,
+      head_k_dim,
+      num_v_heads,
+      head_v_dim,
+      jit_arch_code(),
+      &jit_err);
+  TORCH_CHECK(ok, "GDN chunk JIT launch failed: ", jit_err);
+#else
+  if (core_attn_out.scalar_type() == at::kBFloat16) {
+    using scalar_t = bfloat16_t;
+    DISPATCH_STATE_DTYPE(scalar_t);
+  } else if (core_attn_out.scalar_type() == at::kHalf) {
+    using scalar_t = half_t;
+    DISPATCH_STATE_DTYPE(scalar_t);
+  } else {
+    TORCH_CHECK(false, "core_attn_out dtype must be float16/bfloat16, but got ", core_attn_out.scalar_type());
+  }
+#endif
+
+#undef DISPATCH_STATE_DTYPE
+#undef KERNEL_LAUNCHER
+}
+#endif  // SGL_GDN_JIT_ENTRY
+
+}  // namespace gdn

@@ -212,7 +212,25 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "    int      sm_margin,"
       "    Tensor(a!)?  out=None) -> (Tensor(a!), Tensor, Tensor, Tensor)");
   m.impl("fwd", torch::kXPU, make_pytorch_shim(&mha_fwd));
-#endif
+
+  m.def(
+      "gdn_attention(Tensor! core_attn_out, Tensor! z, Tensor projected_states_qkvz, Tensor projected_states_ba, "
+      "int num_k_heads, int num_v_heads, int head_k_dim, int head_v_dim, "
+      "Tensor! conv_state, Tensor! ssm_state, Tensor conv_weights, Tensor? conv_bias, str activation, Tensor A_log, "
+      "Tensor dt_bias, int num_prefills, int num_decodes, int num_spec_decodes, Tensor? has_initial_state, "
+      "Tensor? non_spec_query_start_loc, Tensor? non_spec_token_indx, Tensor? non_spec_state_indices_tensor, "
+      "Tensor? spec_query_start_loc, Tensor? spec_token_indx, Tensor? spec_state_indices_tensor, "
+      "Tensor? num_accepted_tokens, int num_actual_tokens, int tp_size, bool reorder_input, "
+      "Tensor? workspace=None) -> ()");
+  m.impl("gdn_attention", torch::kXPU, &gdn_attention);
+
+  m.def(
+      "gdn_attention_workspace_bytes_needed(int num_prefills, int num_decodes, int non_spec_token, "
+      "int batch_size, int num_k_heads, int num_v_heads, int head_k_dim, int head_v_dim, int tp_size, "
+      "ScalarType dtype) -> int");
+  m.impl(
+      "gdn_attention_workspace_bytes_needed", c10::DispatchKey::BackendSelect, &gdn_attention_workspace_bytes_needed);
+  #endif
 
   m.def("flash_mla_get_workspace_size", &flash_mla_get_workspace_size);
 

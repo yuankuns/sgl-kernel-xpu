@@ -745,6 +745,58 @@ void mxfp4_blockwise_scaled_grouped_mm(
     const torch::Tensor& workspace);
 #endif
 
+#if SYCL_INTEL_TARGET == 20 || SYCL_INTEL_TARGET == 35
+/*
+ * From GDN (Gated DeltaNet) attention
+ */
+void gdn_attention(
+    torch::Tensor& core_attn_out,
+    torch::Tensor& z,
+    const torch::Tensor& projected_states_qkvz,
+    const torch::Tensor& projected_states_ba,
+    const int64_t num_k_heads,
+    const int64_t num_v_heads,
+    const int64_t head_k_dim,
+    const int64_t head_v_dim,
+    torch::Tensor& conv_state,
+    torch::Tensor& ssm_state,
+    const torch::Tensor& conv_weights,
+    const std::optional<torch::Tensor>& conv_bias,
+    const std::string& activation,
+    const torch::Tensor& A_log,
+    const torch::Tensor& dt_bias,
+    const int64_t num_prefills,
+    const int64_t num_decodes,
+    const int64_t num_spec_decodes,
+    const std::optional<torch::Tensor>& has_initial_state,
+    const std::optional<torch::Tensor>& non_spec_query_start_loc,
+    const std::optional<torch::Tensor>& non_spec_token_indx,
+    const std::optional<torch::Tensor>& non_spec_state_indices_tensor,
+    const std::optional<torch::Tensor>& spec_query_start_loc,
+    const std::optional<torch::Tensor>& spec_token_indx,
+    const std::optional<torch::Tensor>& spec_state_indices_tensor,
+    const std::optional<torch::Tensor>& num_accepted_tokens,
+    const int64_t num_actual_tokens,
+    const int64_t tp_size,
+    const bool reorder_input,
+    // Optional pre-allocated scratch buffer: a single flat torch::kUInt8 tensor.
+    const std::optional<torch::Tensor>& workspace);
+
+// Exact number of bytes `gdn_attention` will carve out of its `workspace`
+// argument for a call with the given shapes/dtype.
+int64_t gdn_attention_workspace_bytes_needed(
+    const int64_t num_prefills,
+    const int64_t num_decodes,
+    const int64_t non_spec_token,
+    const int64_t batch_size,
+    const int64_t num_k_heads,
+    const int64_t num_v_heads,
+    const int64_t head_k_dim,
+    const int64_t head_v_dim,
+    const int64_t tp_size,
+    const torch::ScalarType dtype);
+#endif
+
 // Xe40 only kernels
 #if SYCL_INTEL_TARGET == 40
 void moe_grouped_mm_nt_xe40(

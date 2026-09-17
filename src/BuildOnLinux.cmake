@@ -49,6 +49,14 @@ foreach(sycl_src ${ATen_XPU_SYCL_COMMON})
   )
 endforeach()
 
+# Keep the chunk delta-rule provider retained even if the common source order changes.
+if(TARGET sgl-ops-sycl-gdn_attention
+  AND TARGET sgl-ops-sycl-chunk_gated_delta_rule)
+  target_link_libraries(
+    sgl-ops-sycl-gdn_attention
+    PRIVATE sgl-ops-sycl-chunk_gated_delta_rule)
+endif()
+
 # xe20 kernels (BMG only)
 if(DPCPP_SYCL_TARGET MATCHES "bmg")
   set(XE20_OFFLINE_COMPILER_AOT_OPTIONS "-device bmg")
