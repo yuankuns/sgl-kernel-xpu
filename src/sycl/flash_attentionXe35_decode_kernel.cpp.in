@@ -1,9 +1,9 @@
 // Auto-generated from flash_attentionXe35_decode_kernel.cpp.in
-// Template parameter: HEAD_DIM=@HEAD_DIM@
+// Template parameters: HEAD_DIM=@HEAD_DIM@, ELEM_TAG=@ELEM_TAG@
 
-#include "sycl/flash_attentionXe35_common.hpp"
+#include "sycl/kernels/flash_attention_v2/xe3/xe_fmha_fwd_decode_runner.hpp"
 
-void dispatch_xe35_decode_@HEAD_DIM@(
+void dispatch_xe35_decode_@HEAD_DIM@_@ELEM_TAG@(
     const at::Tensor& q_dense,
     const at::Tensor& k_pool,
     const at::Tensor& v_pool,
@@ -18,6 +18,9 @@ void dispatch_xe35_decode_@HEAD_DIM@(
     int max_seqlen_q,
     int max_seqlen_kv_cache,
     int page_size,
+    float q_descale,
+    float k_descale,
+    float v_descale,
     float softmax_scale,
     bool is_causal,
     bool is_local,
@@ -25,7 +28,7 @@ void dispatch_xe35_decode_@HEAD_DIM@(
     int window_size_right,
     const cutlass::bfloat16_t* sm_sink,
     bool use_sink) {
-  xe35_fmha::dispatch_xe3_kernel<@HEAD_DIM@, true, true>(
+  xe35_fmha::run_xe35_decode<@HEAD_DIM@, true, @ELEM_TYPE@>(
       q_dense,
       k_pool,
       v_pool,
@@ -40,6 +43,9 @@ void dispatch_xe35_decode_@HEAD_DIM@(
       max_seqlen_q,
       max_seqlen_kv_cache,
       page_size,
+      q_descale,
+      k_descale,
+      v_descale,
       softmax_scale,
       is_causal,
       is_local,

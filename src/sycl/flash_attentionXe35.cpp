@@ -40,15 +40,36 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> mha_fwd(
   TORCH_CHECK(cu_seqlens_q.dim() == 1, "flash_attentionXe35: cu_seqlens_q must be 1D");
   TORCH_CHECK(cu_seqlens_k.dim() == 1, "flash_attentionXe35: cache_seqlens must be 1D");
   TORCH_CHECK(!seqlens_rotary_.has_value(), "flash_attentionXe35: seqlens_rotary is not supported");
-  TORCH_CHECK(
-      !q_descale_.has_value() && !k_descale_.has_value() && !v_descale_.has_value(),
-      "flash_attentionXe35: descale is not supported");
   TORCH_CHECK(softcap == 0.0f, "flash_attentionXe35: softcap is not supported");
   const bool has_rotary = rotary_cos_.has_value() || rotary_sin_.has_value();
   TORCH_CHECK(!(has_rotary && is_rotary_interleaved), "flash_attentionXe35: rotary interleaving is not supported");
   auto q_dtype = q.scalar_type();
-  TORCH_CHECK(q_dtype == at::ScalarType::BFloat16, "flash_attentionXe35: only bf16 is supported");
+  const bool is_fp8 = q_dtype == at::ScalarType::Float8_e4m3fn || q_dtype == at::ScalarType::Float8_e5m2;
+  TORCH_CHECK(
+      q_dtype == at::ScalarType::BFloat16 || is_fp8,
+      "flash_attentionXe35: only bf16, float8_e4m3fn, and float8_e5m2 are supported");
+  TORCH_CHECK(!(is_fp8 && sinks_.has_value()), "flash_attentionXe35: FP8 does not support sinks");
   TORCH_CHECK(k.scalar_type() == q_dtype && v.scalar_type() == q_dtype, "flash_attentionXe35: q/k/v dtype mismatch");
+  const bool has_all_descales = q_descale_.has_value() && k_descale_.has_value() && v_descale_.has_value();
+  const bool has_any_descale = q_descale_.has_value() || k_descale_.has_value() || v_descale_.has_value();
+  TORCH_CHECK(
+      is_fp8 ? has_all_descales : !has_any_descale,
+      "flash_attentionXe35: FP8 requires q/k/v descale; bf16 does not accept descale");
+
+  float q_descale = 1.0f;
+  float k_descale = 1.0f;
+  float v_descale = 1.0f;
+  if (is_fp8) {
+    auto read_descale = [&](const at::Tensor& descale, const char* name) {
+      TORCH_CHECK(descale.device().is_cpu(), "flash_attentionXe35: ", name, " must be a CPU scalar");
+      TORCH_CHECK(descale.scalar_type() == at::ScalarType::Float, "flash_attentionXe35: ", name, " must be float32");
+      TORCH_CHECK(descale.numel() == 1, "flash_attentionXe35: ", name, " must contain one per-tensor scale");
+      return descale.item<float>();
+    };
+    q_descale = read_descale(q_descale_.value(), "q_descale");
+    k_descale = read_descale(k_descale_.value(), "k_descale");
+    v_descale = read_descale(v_descale_.value(), "v_descale");
+  }
   TORCH_CHECK(q.is_xpu() && k.is_xpu() && v.is_xpu(), "flash_attentionXe35: q/k/v must be xpu tensors");
   TORCH_CHECK(cu_seqlens_q.is_xpu() && cu_seqlens_k.is_xpu(), "flash_attentionXe35: cu_seqlens must be xpu tensors");
   TORCH_CHECK(cu_seqlens_q.scalar_type() == at::ScalarType::Int, "flash_attentionXe35: cu_seqlens_q must be int32");
@@ -146,7 +167,18 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> mha_fwd(
   TORCH_CHECK(head_dim == 64 || head_dim == 128, "flash_attentionXe35: only head_dim 64 and 128 are supported");
 
   c10::DeviceGuard device_guard(q.device());
-  auto opts = q.options();
+  auto opts = is_fp8 ? q.options().dtype(at::kBFloat16) : q.options();
+  if (out_.has_value()) {
+    const auto& out = out_.value();
+    TORCH_CHECK(
+        out.scalar_type() == opts.dtype().toScalarType(),
+        "flash_attentionXe35: output dtype must match the kernel output dtype");
+    TORCH_CHECK(
+        out.dim() == 3 && out.size(0) == total_q && out.size(1) == num_heads_q && out.size(2) == head_dim,
+        "flash_attentionXe35: output shape must be [total_q, num_heads_q, head_dim]");
+    TORCH_CHECK(out.device() == q.device(), "flash_attentionXe35: output must be on the same device as q");
+    TORCH_CHECK(out.stride(-1) == 1, "flash_attentionXe35: output must have a contiguous last dimension");
+  }
   // Zero the non-paged output: the split-decode path can leave parts unwritten
   // and read stale memory from a prior launch, giving NaN/non-deterministic output.
   at::Tensor out_dense;
@@ -160,103 +192,39 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> mha_fwd(
 
   // Non-paged runs as plain attention through the prefill kernel even for q==1;
   // the split-decode kernel is reserved for the paged KV cache.
-  if (max_seqlen_q == 1 && is_paged) {
-    if (head_dim == 64) {
-      (is_paged ? dispatch_xe35_decode_64 : dispatch_xe35_decode_nopage_64)(
-          q,
-          k_pool,
-          v_pool,
-          page_table_ref,
-          num_pages_per_seq,
-          cu_seqlens_q,
-          cu_seqlens_k,
-          out_dense,
-          batch,
-          num_heads_q,
-          num_heads_kv,
-          max_seqlen_q,
-          max_seqlen_k,
-          page_size,
-          softmax_scale_,
-          effective_causal,
-          is_local,
-          window_size_left,
-          window_size_right,
-          sm_sink,
-          sinks_.has_value());
-    } else {
-      (is_paged ? dispatch_xe35_decode_128 : dispatch_xe35_decode_nopage_128)(
-          q,
-          k_pool,
-          v_pool,
-          page_table_ref,
-          num_pages_per_seq,
-          cu_seqlens_q,
-          cu_seqlens_k,
-          out_dense,
-          batch,
-          num_heads_q,
-          num_heads_kv,
-          max_seqlen_q,
-          max_seqlen_k,
-          page_size,
-          softmax_scale_,
-          effective_causal,
-          is_local,
-          window_size_left,
-          window_size_right,
-          sm_sink,
-          sinks_.has_value());
-    }
+  Xe35DispatchFn* dispatch;
+  if (is_paged) {
+    dispatch = max_seqlen_q == 1 ? get_xe35_decode_dispatch(head_dim, q_dtype)
+                                 : get_xe35_prefill_dispatch(head_dim, q_dtype);
   } else {
-    if (head_dim == 64) {
-      (is_paged ? dispatch_xe35_prefill_64 : dispatch_xe35_prefill_nopage_64)(
-          q,
-          k_pool,
-          v_pool,
-          page_table_ref,
-          num_pages_per_seq,
-          cu_seqlens_q,
-          cu_seqlens_k,
-          out_dense,
-          batch,
-          num_heads_q,
-          num_heads_kv,
-          max_seqlen_q,
-          max_seqlen_k,
-          page_size,
-          softmax_scale_,
-          effective_causal,
-          is_local,
-          window_size_left,
-          window_size_right,
-          sm_sink,
-          sinks_.has_value());
-    } else {
-      (is_paged ? dispatch_xe35_prefill_128 : dispatch_xe35_prefill_nopage_128)(
-          q,
-          k_pool,
-          v_pool,
-          page_table_ref,
-          num_pages_per_seq,
-          cu_seqlens_q,
-          cu_seqlens_k,
-          out_dense,
-          batch,
-          num_heads_q,
-          num_heads_kv,
-          max_seqlen_q,
-          max_seqlen_k,
-          page_size,
-          softmax_scale_,
-          effective_causal,
-          is_local,
-          window_size_left,
-          window_size_right,
-          sm_sink,
-          sinks_.has_value());
-    }
+    TORCH_CHECK(!is_fp8, "flash_attentionXe35: non-paged FP8 is not supported");
+    dispatch = head_dim == 64 ? &dispatch_xe35_prefill_nopage_64 : &dispatch_xe35_prefill_nopage_128;
   }
+  dispatch(
+      q,
+      k_pool,
+      v_pool,
+      page_table_ref,
+      num_pages_per_seq,
+      cu_seqlens_q,
+      cu_seqlens_k,
+      out_dense,
+      batch,
+      num_heads_q,
+      num_heads_kv,
+      max_seqlen_q,
+      max_seqlen_k,
+      page_size,
+      q_descale,
+      k_descale,
+      v_descale,
+      softmax_scale_,
+      effective_causal,
+      is_local,
+      window_size_left,
+      window_size_right,
+      sm_sink,
+      sinks_.has_value());
 
   auto lse = at::zeros({num_heads_q, total_q}, opts.dtype(at::kFloat));
   auto out_accum = at::Tensor();

@@ -70,3 +70,17 @@ def ceil_div(x: int, y: int) -> int:
 
 def ceil_align(x: int, y: int) -> int:
     return ceil_div(x, y) * y
+
+
+def quantize_per_tensor_fp8(
+    tensor: torch.Tensor, fp8_dtype: torch.dtype
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    fp8_info = torch.finfo(fp8_dtype)
+    dequant_scale = tensor.abs().amax().float() / fp8_info.max
+    dequant_scale = dequant_scale.clamp_min(torch.finfo(torch.float32).tiny)
+    quantized = (
+        (tensor.float() / dequant_scale)
+        .clamp(min=fp8_info.min, max=fp8_info.max)
+        .to(fp8_dtype)
+    )
+    return quantized, dequant_scale.cpu().reshape(1)

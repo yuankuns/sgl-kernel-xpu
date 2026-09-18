@@ -431,9 +431,9 @@ struct FMHAFwdMainloop<
       int gqa_fusion_q_per_head = 0,
       TensorK_cache2D const& K_cache_2D = TensorK_cache2D{},
       TensorV_cache2D const& V_cache_2D = TensorV_cache2D{},
+      float scale_q = 1.0f,
       float scale_k = 1.0f,
       float scale_v = 1.0f,
-      float scale_q = 1.0f,
       TensorScaleQ2D const& scaleQ = TensorScaleQ2D{},
       TensorScaleK2D const& scaleK = TensorScaleK2D{},
       TensorScaleV2D const& scaleV = TensorScaleV2D{}) {

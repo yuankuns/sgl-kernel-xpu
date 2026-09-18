@@ -198,6 +198,9 @@ def flash_attn_with_kvcache(
                  might come from any of the duplicate indices.
         cache_leftpad: (batch_size,), dtype torch.int32. The index that the KV cache starts. If None, assume 0.
         page_table [optional]: (batch_size, max_num_blocks_per_seq), dtype torch.int32.
+        q_descale [optional]: CPU float32 scalar used to dequantize FP8 query values.
+        k_descale [optional]: CPU float32 scalar used to dequantize FP8 key values.
+        v_descale [optional]: CPU float32 scalar used to dequantize FP8 value values.
         softmax_scale: float. The scaling of QK^T before applying softmax.
             Default to 1 / sqrt(headdim).
         causal: bool. Whether to apply causal attention mask (e.g., for auto-regressive modeling).
@@ -213,12 +216,12 @@ def flash_attn_with_kvcache(
            Don't change this unless you know what you are doing.
         return_softmax_lse: bool. Whether to return the logsumexp of the attention scores.
         out [optional]: preallocated output buffer of shape (total_q, nheads, headdim_v),
-            dtype matching q, on the same XPU device as q, with a contiguous last dimension
-            (stride(-1) == 1). When provided, the kernel writes results directly into this
-            buffer and the returned tensor aliases it. Useful for XPU graph / torch.compile
-            capture to avoid allocating a new output tensor each step. Requires
-            ``page_table`` to be provided (paged KV cache); passing ``out`` without a
-            page table raises a ``RuntimeError``.
+            dtype matching q for BF16 input and BF16 for FP8 input, on the same XPU device
+            as q, with a contiguous last dimension (stride(-1) == 1). When provided, the
+            kernel writes results directly into this buffer and the returned tensor aliases
+            it. Useful for XPU graph / torch.compile capture to avoid allocating a new output
+            tensor each step. Requires ``page_table`` to be provided (paged KV cache);
+            passing ``out`` without a page table raises a ``RuntimeError``.
 
     Return:
         out: (total_q, nheads, headdim_v), where total_q = batch_size * seqlen (non-varlen)

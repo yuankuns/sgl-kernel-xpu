@@ -10,6 +10,7 @@ import sgl_kernel  # noqa: F401 - registers torch.ops.sgl_kernel.* custom ops
 import torch
 import torch.nn.functional as F
 from sgl_kernel.flash_attn import flash_attn_with_kvcache
+from sgl_kernel.utils import quantize_per_tensor_fp8
 
 
 def cpu_ref(
@@ -268,6 +269,90 @@ def test_flash_attention_xe3_fwd(
     assert kernel_diff <= tol, (
         f"Xe3 flash attention case={case_name} failed: kernel_diff={kernel_diff} > tol={tol} "
         f"(baseline={baseline_diff})"
+    )
+
+
+@pytest.mark.skipif(not is_xpu_available(), reason="Intel XPU not available")
+@pytest.mark.skipif(not is_cri_device(), reason="Requires a CRI (Xe3P) device")
+@pytest.mark.parametrize("fp8_dtype", [torch.float8_e4m3fn, torch.float8_e5m2])
+@pytest.mark.parametrize("head_dim", [64, 128])
+@pytest.mark.parametrize("seqlen_q", [1, 16])
+def test_flash_attention_xe3_fp8_full_qkv(fp8_dtype, head_dim, seqlen_q):
+    batch = 1
+    seqlen_k = 96
+    page_size = 64
+    num_pages = 2
+    nheads_q = 2
+    nheads_kv = 1
+    device = torch.device("xpu")
+
+    torch.manual_seed(1)
+    q_bf16 = torch.randn(
+        batch, seqlen_q, nheads_q, head_dim, device=device, dtype=torch.bfloat16
+    )
+    k_bf16 = torch.randn(
+        num_pages,
+        page_size,
+        nheads_kv,
+        head_dim,
+        device=device,
+        dtype=torch.bfloat16,
+    )
+    v_bf16 = torch.randn(
+        num_pages,
+        page_size,
+        nheads_kv,
+        head_dim,
+        device=device,
+        dtype=torch.bfloat16,
+    )
+    q, q_descale = quantize_per_tensor_fp8(q_bf16, fp8_dtype)
+    k_cache, k_descale = quantize_per_tensor_fp8(k_bf16, fp8_dtype)
+    v_cache, v_descale = quantize_per_tensor_fp8(v_bf16, fp8_dtype)
+
+    page_table = torch.tensor([[1, 0]], dtype=torch.int32, device=device)
+    cache_seqlens = torch.full((batch,), seqlen_k, dtype=torch.int32, device=device)
+    cu_seqlens_q = torch.arange(
+        0, (batch + 1) * seqlen_q, seqlen_q, dtype=torch.int32, device=device
+    )
+    softmax_scale = head_dim**-0.5
+
+    out, *_ = flash_attn_with_kvcache(
+        q.view(batch * seqlen_q, nheads_q, head_dim),
+        k_cache,
+        v_cache,
+        cache_seqlens=cache_seqlens,
+        page_table=page_table,
+        cu_seqlens_q=cu_seqlens_q,
+        max_seqlen_q=seqlen_q,
+        max_seqlen_k=seqlen_k,
+        q_descale=q_descale,
+        k_descale=k_descale,
+        v_descale=v_descale,
+        softmax_scale=softmax_scale,
+        rotary_interleaved=False,
+        return_softmax_lse=True,
+    )
+    torch.xpu.synchronize()
+
+    q_ref = (q.float().cpu() * q_descale).to(torch.bfloat16).to(device)
+    k_ref = (k_cache.float().cpu() * k_descale).to(torch.bfloat16).to(device)
+    v_ref = (v_cache.float().cpu() * v_descale).to(torch.bfloat16).to(device)
+    out_ref = cpu_ref(
+        q_ref,
+        k_ref,
+        v_ref,
+        page_table,
+        cache_seqlens,
+        seqlen_q,
+        softmax_scale,
+        upcast=True,
+    )
+
+    assert out.dtype == torch.bfloat16
+    atol = 4e-2 if fp8_dtype == torch.float8_e5m2 else 2e-2
+    torch.testing.assert_close(
+        out.view_as(out_ref).cpu(), out_ref, atol=atol, rtol=2e-2
     )
 
 

@@ -11,6 +11,7 @@
 #include <cutlass/kernel_hardware_info.hpp>
 #include <cutlass/util/GPU_Clock.hpp>
 #include <optional>
+#include <type_traits>
 
 #include "comm/common.h"
 #if defined(CUTLASS_SYCL_PROFILING_ENABLED)
@@ -35,10 +36,10 @@ inline sycl::queue& profiling_queue() {
   return queue;
 }
 
-template <class Element>
+template <class Element, class OutputElement = Element>
 struct Xe3FmhaConfig {
   using ElementInput = Element;
-  using ElementOutput = Element;
+  using ElementOutput = OutputElement;
   using ElementScale = float;
 
   using StrideQ = Stride<int, _1, int, int>;
@@ -79,13 +80,16 @@ struct Xe3FmhaConfig {
       int max_seqlen_kv_cache,
       int head_dim,
       int page_size,
+      float q_descale,
+      float k_descale,
+      float v_descale,
       float softmax_scale,
       int window_size_left,
       int window_size_right,
       const ElementInput* sm_sink) {
     static constexpr bool BlockScale = false;
     static constexpr bool F8kvF16mma = false;
-    static constexpr bool PerTensorScale = false;
+    static constexpr bool PerTensorScale = sizeof_bits_v<ElementInput> == 8;
     // Paged KV is always cached; non-paged runs as plain attention (CachedKV=false)
     // with the KV placed in the "new" slot, which is the upstream-tested path.
     static constexpr bool CachedKV = Paged;
@@ -204,9 +208,9 @@ struct Xe3FmhaConfig {
             {},
             nullptr,
             {},
-            1.0f,
-            1.0f,
-            1.0f,
+            q_descale,
+            k_descale,
+            v_descale,
             32,
             static_cast<const ElementInput*>(k_pool.data_ptr()),
             stride_k,
@@ -259,7 +263,12 @@ struct Xe3FmhaConfig {
   }
 };
 
-template <int HeadDim, bool UseDecode, bool Paged>
+template <
+  int HeadDim,
+  bool UseDecode,
+  bool Paged,
+  class Element = cutlass::bfloat16_t,
+  class OutputElement = Element>
 void dispatch_xe3_kernel(
     const at::Tensor& q_dense,
     const at::Tensor& k_pool,
@@ -275,6 +284,9 @@ void dispatch_xe3_kernel(
     int max_seqlen_q,
     int max_seqlen_kv_cache,
     int page_size,
+    float q_descale,
+    float k_descale,
+    float v_descale,
     float softmax_scale,
     bool is_causal,
     bool is_local,
@@ -287,8 +299,8 @@ void dispatch_xe3_kernel(
 
   // Paged is a compile-time parameter so each translation unit only instantiates
   // one KV-layout variant; paged and non-paged are generated as separate .cpp.
-#define XE35_INVOKE(CAUSAL, LOCAL, SINKV, STAGES, GQA, PAGEDV, QK, PV, OUT, SGL, SINKPTR)                        \
-  Xe3FmhaConfig<cutlass::bfloat16_t>::template run<CAUSAL, LOCAL, SINKV, STAGES, GQA, PAGEDV, QK, PV, OUT, SGL>( \
+#define XE35_INVOKE(CAUSAL, LOCAL, SINKV, STAGES, GQA, QK, PV, OUT, SGL, SINKPTR)                              \
+  Xe3FmhaConfig<Element, OutputElement>::template run<CAUSAL, LOCAL, SINKV, STAGES, GQA, Paged, QK, PV, OUT, SGL>( \
       q_dense,                                                                                                   \
       k_pool,                                                                                                    \
       v_pool,                                                                                                    \
@@ -304,17 +316,25 @@ void dispatch_xe3_kernel(
       max_seqlen_kv_cache,                                                                                       \
       HeadDim,                                                                                                   \
       page_size,                                                                                                 \
+      q_descale,                                                                                                 \
+      k_descale,                                                                                                 \
+      v_descale,                                                                                                 \
       softmax_scale,                                                                                             \
       window_size_left,                                                                                          \
       window_size_right,                                                                                         \
       SINKPTR)
 
-#define XE35_RUN(CAUSAL, LOCAL, STAGES, GQA, QK, PV, OUT, SGL)                          \
-  do {                                                                                  \
-    if (use_sink)                                                                       \
-      XE35_INVOKE(CAUSAL, LOCAL, true, STAGES, GQA, Paged, QK, PV, OUT, SGL, sm_sink);  \
-    else                                                                                \
-      XE35_INVOKE(CAUSAL, LOCAL, false, STAGES, GQA, Paged, QK, PV, OUT, SGL, nullptr); \
+#define XE35_RUN(CAUSAL, LOCAL, STAGES, GQA, QK, PV, OUT, SGL)                                      \
+  do {                                                                                              \
+    if constexpr (std::is_same_v<Element, cutlass::bfloat16_t>) {                                   \
+      if (use_sink)                                                                                 \
+        XE35_INVOKE(CAUSAL, LOCAL, true, STAGES, GQA, QK, PV, OUT, SGL, sm_sink);                   \
+      else                                                                                          \
+        XE35_INVOKE(CAUSAL, LOCAL, false, STAGES, GQA, QK, PV, OUT, SGL, nullptr);                  \
+    } else {                                                                                        \
+      TORCH_CHECK(!use_sink, "flash_attentionXe35: FP8 does not support sinks");                   \
+      XE35_INVOKE(CAUSAL, LOCAL, false, STAGES, GQA, QK, PV, OUT, SGL, nullptr);                    \
+    }                                                                                               \
   } while (false)
 
   if constexpr (HeadDim == 128) {
@@ -394,6 +414,32 @@ void dispatch_xe3_kernel(
 }
 
 }  // namespace xe35_fmha
+
+using Xe35DispatchFn = void(
+    const at::Tensor&,
+    const at::Tensor&,
+    const at::Tensor&,
+    const at::Tensor&,
+    int,
+    const at::Tensor&,
+    const at::Tensor&,
+    at::Tensor&,
+    int,
+    int,
+    int,
+    int,
+    int,
+    int,
+    float,
+    float,
+    float,
+    float,
+    bool,
+    bool,
+    int,
+    int,
+    const cutlass::bfloat16_t*,
+    bool);
 #pragma once
 
 #include <ATen/ATen.h>

@@ -3,12 +3,16 @@ from itertools import product
 import torch
 import triton
 from sgl_kernel.flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
+from sgl_kernel.utils import is_xe3_arch, quantize_per_tensor_fp8
 
 
 def flash_attn_baseline(
     q,
     k_cache,
     v_cache,
+    q_descale,
+    k_descale,
+    v_descale,
     causal,
     window_size,
     softmax_scale,
@@ -34,6 +38,10 @@ def flash_attn_baseline(
             cache_seqlens=cache_seqlens,
             cu_seqlens_q=cu_seqlens_q,
             max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=max_seqlen_k,
+            q_descale=q_descale,
+            k_descale=k_descale,
+            v_descale=v_descale,
             return_softmax_lse=True,
         )
         return out, lse
@@ -92,6 +100,9 @@ num_heads_q = [16]
 num_heads_kv = [4, 8]
 kv_seq_length_range = [4096]
 page_size_range = [0, 128]
+precision_range = ["bf16"]
+if is_xe3_arch():
+    precision_range.extend(["fp8_e4m3", "fp8_e5m2"])
 configs = list(
     filter(
         lambda cfg: (
@@ -107,6 +118,11 @@ configs = list(
             and (cfg[9] != 0 or not cfg[2])
             # Condition 6: sink is only supported for head_size == 64
             and (not cfg[2] or cfg[5] == 64)
+            # Condition 7: Xe35 full-QKV FP8 supports paged attention without sinks,
+            # with head dimensions 64 and 128.
+            and (
+                cfg[10] == "bf16" or (cfg[9] > 0 and not cfg[2] and cfg[5] in (64, 128))
+            )
         ),
         [
             cfg
@@ -122,6 +138,7 @@ configs = list(
                 num_heads_kv,
                 kv_seq_length_range,
                 [page_size],
+                precision_range,
             )
         ],
     )
@@ -142,6 +159,7 @@ all_results = []
             "num_heads_kv",
             "kv_seq_length",
             "page_size",
+            "precision",
         ],
         x_vals=[list(c) for c in configs],
         line_arg="provider",
@@ -164,21 +182,35 @@ def benchmark(
     q_seq_length,
     kv_seq_length,
     page_size,
+    precision,
     provider,
 ):
-    dtype = torch.bfloat16
+    input_dtype = torch.bfloat16
+    precision_dtypes = {
+        "bf16": (input_dtype, input_dtype),
+        "fp8_e4m3": (torch.float8_e4m3fn, input_dtype),
+        "fp8_e5m2": (torch.float8_e5m2, input_dtype),
+    }
+    kernel_dtype, output_dtype = precision_dtypes[precision]
+    output_element_size = torch.empty((), dtype=output_dtype).element_size()
     device = torch.device("xpu")
     # Create input tensors
     q = torch.randn(
-        (batch_size * q_seq_length, num_heads_q, head_dim), device=device, dtype=dtype
+        (batch_size * q_seq_length, num_heads_q, head_dim),
+        device=device,
+        dtype=input_dtype,
     )
     if page_size > 0:
         num_pages = (batch_size * kv_seq_length + page_size - 1) // page_size
         k_cache = torch.randn(
-            (num_pages, page_size, num_heads_kv, head_dim), device=device, dtype=dtype
+            (num_pages, page_size, num_heads_kv, head_dim),
+            device=device,
+            dtype=input_dtype,
         )
         v_cache = torch.randn(
-            (num_pages, page_size, num_heads_kv, head_dim), device=device, dtype=dtype
+            (num_pages, page_size, num_heads_kv, head_dim),
+            device=device,
+            dtype=input_dtype,
         )
         page_table = (
             torch.randperm(num_pages, device=device, dtype=torch.int32)
@@ -189,15 +221,23 @@ def benchmark(
         k_cache = torch.randn(
             (batch_size * kv_seq_length, num_heads_kv, head_dim),
             device=device,
-            dtype=dtype,
+            dtype=input_dtype,
         )
         v_cache = torch.randn(
             (batch_size * kv_seq_length, num_heads_kv, head_dim),
             device=device,
-            dtype=dtype,
+            dtype=input_dtype,
         )
         num_pages = 0
         page_table = None
+
+    q_descale = None
+    k_descale = None
+    v_descale = None
+    if kernel_dtype != input_dtype:
+        q, q_descale = quantize_per_tensor_fp8(q, kernel_dtype)
+        k_cache, k_descale = quantize_per_tensor_fp8(k_cache, kernel_dtype)
+        v_cache, v_descale = quantize_per_tensor_fp8(v_cache, kernel_dtype)
 
     cache_seqlens = (
         torch.ones(batch_size, device=device, dtype=torch.int32) * kv_seq_length
@@ -225,7 +265,11 @@ def benchmark(
             int(value) for value in torch.randint(0, kv_seq_length, (2,)).tolist()
         )
 
-    sinks = torch.randn(num_heads_q, device=device, dtype=dtype) if use_sinks else None
+    sinks = (
+        torch.randn(num_heads_q, device=device, dtype=input_dtype)
+        if use_sinks
+        else None
+    )
 
     softmax_scale = 1.0 / (head_dim**0.5)
 
@@ -237,6 +281,9 @@ def benchmark(
                 q,
                 k_cache,
                 v_cache,
+                q_descale=q_descale,
+                k_descale=k_descale,
+                v_descale=v_descale,
                 causal=causal,
                 window_size=window_size,
                 softmax_scale=softmax_scale,
@@ -282,7 +329,7 @@ def benchmark(
         * kv_seq_length
         * head_dim
         * effective_attention_ratio
-        + q.element_size() * batch_size * num_heads_q * q_seq_length * head_dim
+        + output_element_size * batch_size * num_heads_q * q_seq_length * head_dim
     )
     bandwidth = (memory_qk + memory_pv) * 1e-9 / (ms * 1e-3)
     all_results.append(
@@ -300,6 +347,7 @@ def benchmark(
             "effective_attention_ratio": effective_attention_ratio,
             "use_sinks": use_sinks,
             "page_size": page_size,
+            "precision": precision,
             "provider": provider,
             "tflops": tflops,
             "bandwidth": bandwidth,

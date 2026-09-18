@@ -136,9 +136,9 @@ class XeFMHAFwdKernel {
     StrideScaleK dScaleK{};
     const ElementScale* scaleV = nullptr;
     StrideScaleV dScaleV{};
+    float scale_q = 1.f;
     float scale_k = 1.f;
     float scale_v = 1.f;
-    float scale_q = 1.f;
     int group_size = 32;
     const ElementK* K_cache;
     StrideK dK_cache{};
@@ -489,9 +489,9 @@ class XeFMHAFwdKernel {
               gqa_fusion_q_per_head,
               K_cache(_, _, head, l_coord),
               V_cache(_, _, head, l_coord),
+              p.scale_q,
               p.scale_k,
-              p.scale_v,
-              p.scale_q);
+              p.scale_v);
 
           if constexpr (!is_empty_v<MainloopSharedStorage> && !is_empty_v<EpilogueSharedStorage>) {
             sycl::group_barrier(get_work_group<3>());
@@ -569,9 +569,9 @@ class XeFMHAFwdKernel {
             0,
             K_cache(_, _, head, l_coord),
             V_cache(_, _, head, l_coord),
+            p.scale_q,
             p.scale_k,
             p.scale_v,
-            p.scale_q,
             ScaleQ_head,
             ScaleK_head,
             ScaleV_head);
@@ -598,9 +598,9 @@ class XeFMHAFwdKernel {
             0,
             K_cache(_, _, head, l_coord),
             V_cache(_, _, head, l_coord),
+            p.scale_q,
             p.scale_k,
-            p.scale_v,
-            p.scale_q);
+            p.scale_v);
       }
       if constexpr (!is_empty_v<MainloopSharedStorage> && !is_empty_v<EpilogueSharedStorage>) {
         sycl::group_barrier(get_work_group<3>());

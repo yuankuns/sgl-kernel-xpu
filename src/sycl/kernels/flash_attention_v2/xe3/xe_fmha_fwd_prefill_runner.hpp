@@ -4,7 +4,7 @@
 
 namespace xe35_fmha {
 
-template <int HeadDim, bool Paged = true>
+template <int HeadDim, bool Paged = true, class Element = cutlass::bfloat16_t>
 inline void run_xe35_prefill(
     const at::Tensor& q_dense,
     const at::Tensor& k_pool,
@@ -20,6 +20,9 @@ inline void run_xe35_prefill(
     int max_seqlen_q,
     int max_seqlen_kv_cache,
     int page_size,
+    float q_descale,
+    float k_descale,
+    float v_descale,
     float softmax_scale,
     bool is_causal,
     bool is_local,
@@ -27,7 +30,7 @@ inline void run_xe35_prefill(
     int window_size_right,
     const cutlass::bfloat16_t* sm_sink,
     bool use_sink) {
-  dispatch_xe3_kernel<HeadDim, false, Paged>(
+  dispatch_xe3_kernel<HeadDim, false, Paged, Element, cutlass::bfloat16_t>(
       q_dense,
       k_pool,
       v_pool,
@@ -42,6 +45,9 @@ inline void run_xe35_prefill(
       max_seqlen_q,
       max_seqlen_kv_cache,
       page_size,
+      q_descale,
+      k_descale,
+      v_descale,
       softmax_scale,
       is_causal,
       is_local,
