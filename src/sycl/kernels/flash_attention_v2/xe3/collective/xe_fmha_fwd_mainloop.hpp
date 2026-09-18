@@ -610,35 +610,15 @@ struct FMHAFwdMainloop<
     [[maybe_unused]] int const tiles_per_page = params.page_size / kv_stride;
     [[maybe_unused]] int const batch_offset = l_coord * params.num_pages_per_seq;
 
-    // Conservative optimization for cached non-paged path:
-    // keep legacy prefetch, but switch K/V copy to payload pipeline.
-    using PreparedK_cache_t = decltype(prepare_payloads(copy_k_cache, tKgK_cache(_, _, _, 0, 0)));
-    using PreparedV_cache_t = decltype(prepare_payloads(copy_v_cache, tVgV_cache(_, _, _, 0, 0)));
-    std::array<PreparedK_cache_t, DTiles> prepared_k_cache;
-    std::array<PreparedV_cache_t, VTiles> prepared_v_cache;
-    std::array<int, Stages> physical_k_tiles_cache{};
+    // K layout: (k, d, h, b) with stride (1, head_size, ...) → seq is X mode
+    // V layout: (v, k, h, b) with stride (1, head_size, ...) → seq is Y mode
+    auto k_seq_delta = [](auto n) { return make_coord(n, _0{}); };
+    auto v_seq_delta = [](auto n) { return make_coord(_0{}, n); };
 
-    if constexpr (CachedKV && !PagedKV) {
-      CUTLASS_PRAGMA_UNROLL
-      for (int d = 0; d < DTiles; d++) {
-        prepared_k_cache[d] = prepare_payloads(copy_k_cache, tKgK_cache(_, _, _, 0, d));
-      }
-      CUTLASS_PRAGMA_UNROLL
-      for (int VV = 0; VV < VTiles; VV++) {
-        prepared_v_cache[VV] = prepare_payloads(copy_v_cache, tVgV_cache(_, _, _, VV, 0));
-      }
-      if (blk_k0 > 0) {
-        int const cache_start_delta = blk_k0 * kv_stride;
-        CUTLASS_PRAGMA_UNROLL
-        for (int d = 0; d < DTiles; d++) {
-          prepared_k_cache[d] += cache_start_delta;
-        }
-        CUTLASS_PRAGMA_UNROLL
-        for (int VV = 0; VV < VTiles; VV++) {
-          prepared_v_cache[VV] += cache_start_delta;
-        }
-      }
-    }
+    // Non-paged cached KV reads each tile by its logical block index at the copy
+    // sites below (mirroring the paged path); only paged needs per-stage physical
+    // tile tracking.
+    std::array<int, Stages> physical_k_tiles_cache{};
 
     if constexpr (CachedKV && PagedKV) {
       CUTLASS_PRAGMA_UNROLL
@@ -655,25 +635,25 @@ struct FMHAFwdMainloop<
       const int k_start_delta = k_start * kv_stride;
       CUTLASS_PRAGMA_UNROLL
       for (int d = 0; d < DTiles; d++) {
-        prepared_k[d] += k_start_delta;
+        prepared_k[d] += k_seq_delta(k_start_delta);
       }
       CUTLASS_PRAGMA_UNROLL
       for (int VV = 0; VV < VTiles; VV++) {
-        prepared_v[VV] += k_start_delta;
+        prepared_v[VV] += v_seq_delta(k_start_delta);
       }
-      prepared_pk += k_start_delta;
-      prepared_pv += k_start_delta;
+      prepared_pk += k_seq_delta(k_start_delta);
+      prepared_pv += v_seq_delta(k_start_delta);
     }
     if constexpr (!GqaFusion) {
       CUTLASS_PRAGMA_UNROLL
       for (int K = 0; K < Stages; K++) {
         prefetch(prefetch_k, prepared_pk);
-        prepared_pk += kv_stride;
+        prepared_pk += k_seq_delta(kv_stride);
       }
       CUTLASS_PRAGMA_UNROLL
       for (int K = 0; K < Stages; K++) {
         prefetch(prefetch_v, prepared_pv);
-        prepared_pv += kv_stride;
+        prepared_pv += v_seq_delta(kv_stride);
       }
     }
     // Cache K prefetch init, still uses legacy API.
@@ -767,22 +747,18 @@ struct FMHAFwdMainloop<
       // V prefetch for next iteration (non-cache only; cache prefetch lives below).
       if constexpr (!is_cache && !GqaFusion) {
         prefetch(prefetch_v, prepared_pv);
-        prepared_pv += kv_stride;
+        prepared_pv += v_seq_delta(kv_stride);
       }
       /* GEMM 1: S = K * Q */
       CUTLASS_PRAGMA_UNROLL
 
       for (int D = 0; D < DTiles; D++) {
         if constexpr (is_cache) {
-          if constexpr (!PagedKV) {
-            copy(copy_k_cache, prepared_k_cache[D], tKrK);
-            prepared_k_cache[D] += kv_stride;
-          } else {
-            copy(copy_k_cur, tKgK_cur(_, _, _, k_idx, D), tKrK);
-          }
+          copy(copy_k_cur, tKgK_cur(_, _, _, k_idx, D), tKrK);
         } else {
-          copy(copy_k, prepared_k[D], tKrK);
-          prepared_k[D] += kv_stride;
+          // Indexed read (mirrors the cache path); the payload-advance variant
+          // is broken in this fork and yields wrong/non-deterministic results.
+          copy(copy_k_cur, tKgK_cur(_, _, _, k_idx, D), tKrK);
         }
 
         reorder(tKrK, tSrK);
@@ -850,7 +826,7 @@ struct FMHAFwdMainloop<
         }
       } else if constexpr (!GqaFusion) {
         prefetch(prefetch_k, prepared_pk);
-        prepared_pk += kv_stride;
+        prepared_pk += k_seq_delta(kv_stride);
       }
       // Prefetch V scale
       if constexpr (BlockScale) {
@@ -915,9 +891,13 @@ struct FMHAFwdMainloop<
           for (int i = 0; i < tSrS.size(); ++i) {
             const int row_idx = get<0>(cS_thread(i));
             const int col_idx = get<1>(cS_thread(i));
-            const int row_kv_idx = (GqaFusion ? 0 : row_idx) + full_tile_offset;
-            const bool left_mask = col_idx < row_kv_idx - params.window_size_left;
-            const bool right_mask = col_idx > row_kv_idx + params.window_size_right;
+            const int row_q_idx =
+                (GqaFusion && gqa_fusion_q_per_head > 0) ? ((q_pos_base + row_idx) % gqa_fusion_q_per_head) : row_idx;
+            const int row_kv_idx = row_q_idx + full_tile_offset;
+            // A negative window size means "unbounded" on that side (no mask).
+            const bool left_mask = (params.window_size_left >= 0) && (col_idx < row_kv_idx - params.window_size_left);
+            const bool right_mask =
+                (params.window_size_right >= 0) && (col_idx > row_kv_idx + params.window_size_right);
             if (left_mask || right_mask) {
               tSrS(i) = ElementS(-INFINITY);
             }
@@ -1012,15 +992,10 @@ struct FMHAFwdMainloop<
       CUTLASS_PRAGMA_UNROLL
       for (int VV = 0; VV < VTiles; VV++) {
         if constexpr (is_cache) {
-          if constexpr (!PagedKV) {
-            copy(copy_v_cache, prepared_v_cache[VV], tVrV);
-            prepared_v_cache[VV] += kv_stride;
-          } else {
-            copy(copy_v_cur, tVgV_cur(_, _, _, VV, k_idx), tVrV);
-          }
+          copy(copy_v_cur, tVgV_cur(_, _, _, VV, k_idx), tVrV);
         } else {
-          copy(copy_v, prepared_v[VV], tVrV);
-          prepared_v[VV] += kv_stride;
+          // Indexed read (mirrors the cache path); payload-advance is broken here.
+          copy(copy_v_cur, tVgV_cur(_, _, _, VV, k_idx), tVrV);
         }
         reorder(tVrV, tArV);
 

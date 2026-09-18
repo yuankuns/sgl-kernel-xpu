@@ -230,7 +230,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "ScalarType dtype) -> int");
   m.impl(
       "gdn_attention_workspace_bytes_needed", c10::DispatchKey::BackendSelect, &gdn_attention_workspace_bytes_needed);
-  #endif
+#endif
 
   m.def("flash_mla_get_workspace_size", &flash_mla_get_workspace_size);
 

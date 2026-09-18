@@ -58,6 +58,7 @@ struct Xe3FmhaConfig {
       bool Sink,
       int PipelineStages,
       bool GqaFusion,
+      bool Paged,
       class TileShapeQK,
       class TileShapePV,
       class TileShapeOut,
@@ -85,8 +86,12 @@ struct Xe3FmhaConfig {
     static constexpr bool BlockScale = false;
     static constexpr bool F8kvF16mma = false;
     static constexpr bool PerTensorScale = false;
-    static constexpr bool CachedKV = true;
-    static constexpr bool PagedKV = true;
+    // Paged KV is always cached; non-paged runs as plain attention (CachedKV=false)
+    // with the KV placed in the "new" slot, which is the upstream-tested path.
+    static constexpr bool CachedKV = Paged;
+    // Paged (PagedKV=true) uses page_table indirection; non-paged (Paged=false)
+    // reads contiguous ragged KV addressed by the cumulative cu_seqlens_k_cache.
+    static constexpr bool PagedKV = Paged;
 
     constexpr int SGTileQ = get<0>(shape_div(TileShapeQK{}, shape(SubgroupLayoutQK{})))();
     using MMAOperation = XE_DPAS_TT<cute::gcd(SGTileQ, 8), float, ElementInput>;
@@ -157,14 +162,32 @@ struct Xe3FmhaConfig {
     cutlass::KernelHardwareInfo hw_info;
     hw_info.sm_count = cutlass::KernelHardwareInfo::query_device_multiprocessor_count(hw_info.device_id);
 
+    // page_table is only valid in the paged case; keep it null otherwise so the
+    // non-paged mainloop never dereferences an absent table.
+    const int* page_table_ptr = nullptr;
+    if constexpr (PagedKV) {
+      page_table_ptr = static_cast<const int*>(page_table.data_ptr());
+    }
+
+    // Plain attention (CachedKV=false) carries the KV in the "new" slot; paged
+    // carries it in the "cache" slot. The unused slot stays empty.
+    int* const cu_kv = cu_seqlens_k_cache.data_ptr<int>();
+    const int kv_total = static_cast<int>(k_pool.size(0));
+    const int new_max = Paged ? 0 : max_seqlen_kv_cache;
+    const int new_total = Paged ? 0 : kv_total;
+    int* const new_cu = Paged ? nullptr : cu_kv;
+    const int cache_max = Paged ? max_seqlen_kv_cache : 0;
+    const int cache_total = Paged ? kv_total : 0;
+    int* const cache_cu = Paged ? cu_kv : nullptr;
+
     typename FMHAKernel::Arguments arguments{
         {
             {batch,
              num_heads_q,
              num_heads_kv,
              {max_seqlen_q, static_cast<int>(q_dense.size(0)), cu_seqlens_q.data_ptr<int>(), nullptr},
-             {0, 0, nullptr, nullptr},
-             {max_seqlen_kv_cache, static_cast<int>(k_pool.size(0)), cu_seqlens_k_cache.data_ptr<int>(), nullptr},
+             {new_max, new_total, new_cu, nullptr},
+             {cache_max, cache_total, cache_cu, nullptr},
              head_dim,
              head_dim},
             static_cast<const ElementInput*>(q_dense.data_ptr()),
@@ -193,7 +216,7 @@ struct Xe3FmhaConfig {
         },
         {
             softmax_scale,
-            static_cast<const int*>(page_table.data_ptr()),
+            page_table_ptr,
             page_size,
             num_pages_per_seq,
             static_cast<int>(k_pool.size(0)),
@@ -207,7 +230,9 @@ struct Xe3FmhaConfig {
     TORCH_CHECK(FMHAKernel::can_implement(arguments), "flash_attentionXe35: invalid cutlass FMHA arguments");
 
     size_t workspace_size = FMHAKernel::get_workspace_size(arguments);
-    at::Tensor workspace = at::empty({static_cast<long>(workspace_size)}, q_dense.options().dtype(at::kByte));
+    // Zero-init: the split-reduction workspace is otherwise read while partially
+    // uninitialized, giving non-deterministic results across launches.
+    at::Tensor workspace = at::zeros({static_cast<long>(workspace_size)}, q_dense.options().dtype(at::kByte));
     auto* workspace_ptr = workspace_size > 0 ? workspace.data_ptr() : nullptr;
     auto status = FMHAKernel::initialize_workspace(arguments, workspace_ptr);
     TORCH_CHECK(status == cutlass::Status::kSuccess, "flash_attentionXe35: FMHA workspace initialization failed");
@@ -234,7 +259,7 @@ struct Xe3FmhaConfig {
   }
 };
 
-template <int HeadDim, bool UseDecode>
+template <int HeadDim, bool UseDecode, bool Paged>
 void dispatch_xe3_kernel(
     const at::Tensor& q_dense,
     const at::Tensor& k_pool,
@@ -260,51 +285,36 @@ void dispatch_xe3_kernel(
   const int gqa_group = num_heads_kv > 0 ? num_heads_q / num_heads_kv : 1;
   const int total_rows = gqa_group * max_seqlen_q;
 
-#define XE35_RUN(CAUSAL, LOCAL, STAGES, GQA, QK, PV, OUT, SGL)                                               \
-  do {                                                                                                       \
-    if (use_sink) {                                                                                          \
-      Xe3FmhaConfig<cutlass::bfloat16_t>::template run<CAUSAL, LOCAL, true, STAGES, GQA, QK, PV, OUT, SGL>(  \
-          q_dense,                                                                                           \
-          k_pool,                                                                                            \
-          v_pool,                                                                                            \
-          page_table,                                                                                        \
-          num_pages_per_seq,                                                                                 \
-          cu_seqlens_q,                                                                                      \
-          cu_seqlens_k_cache,                                                                                \
-          out_dense,                                                                                         \
-          batch,                                                                                             \
-          num_heads_q,                                                                                       \
-          num_heads_kv,                                                                                      \
-          max_seqlen_q,                                                                                      \
-          max_seqlen_kv_cache,                                                                               \
-          HeadDim,                                                                                           \
-          page_size,                                                                                         \
-          softmax_scale,                                                                                     \
-          window_size_left,                                                                                  \
-          window_size_right,                                                                                 \
-          sm_sink);                                                                                          \
-    } else {                                                                                                 \
-      Xe3FmhaConfig<cutlass::bfloat16_t>::template run<CAUSAL, LOCAL, false, STAGES, GQA, QK, PV, OUT, SGL>( \
-          q_dense,                                                                                           \
-          k_pool,                                                                                            \
-          v_pool,                                                                                            \
-          page_table,                                                                                        \
-          num_pages_per_seq,                                                                                 \
-          cu_seqlens_q,                                                                                      \
-          cu_seqlens_k_cache,                                                                                \
-          out_dense,                                                                                         \
-          batch,                                                                                             \
-          num_heads_q,                                                                                       \
-          num_heads_kv,                                                                                      \
-          max_seqlen_q,                                                                                      \
-          max_seqlen_kv_cache,                                                                               \
-          HeadDim,                                                                                           \
-          page_size,                                                                                         \
-          softmax_scale,                                                                                     \
-          window_size_left,                                                                                  \
-          window_size_right,                                                                                 \
-          nullptr);                                                                                          \
-    }                                                                                                        \
+  // Paged is a compile-time parameter so each translation unit only instantiates
+  // one KV-layout variant; paged and non-paged are generated as separate .cpp.
+#define XE35_INVOKE(CAUSAL, LOCAL, SINKV, STAGES, GQA, PAGEDV, QK, PV, OUT, SGL, SINKPTR)                        \
+  Xe3FmhaConfig<cutlass::bfloat16_t>::template run<CAUSAL, LOCAL, SINKV, STAGES, GQA, PAGEDV, QK, PV, OUT, SGL>( \
+      q_dense,                                                                                                   \
+      k_pool,                                                                                                    \
+      v_pool,                                                                                                    \
+      page_table,                                                                                                \
+      num_pages_per_seq,                                                                                         \
+      cu_seqlens_q,                                                                                              \
+      cu_seqlens_k_cache,                                                                                        \
+      out_dense,                                                                                                 \
+      batch,                                                                                                     \
+      num_heads_q,                                                                                               \
+      num_heads_kv,                                                                                              \
+      max_seqlen_q,                                                                                              \
+      max_seqlen_kv_cache,                                                                                       \
+      HeadDim,                                                                                                   \
+      page_size,                                                                                                 \
+      softmax_scale,                                                                                             \
+      window_size_left,                                                                                          \
+      window_size_right,                                                                                         \
+      SINKPTR)
+
+#define XE35_RUN(CAUSAL, LOCAL, STAGES, GQA, QK, PV, OUT, SGL)                          \
+  do {                                                                                  \
+    if (use_sink)                                                                       \
+      XE35_INVOKE(CAUSAL, LOCAL, true, STAGES, GQA, Paged, QK, PV, OUT, SGL, sm_sink);  \
+    else                                                                                \
+      XE35_INVOKE(CAUSAL, LOCAL, false, STAGES, GQA, Paged, QK, PV, OUT, SGL, nullptr); \
   } while (false)
 
   if constexpr (HeadDim == 128) {
@@ -378,6 +388,7 @@ void dispatch_xe3_kernel(
   }
 
 #undef XE35_RUN
+#undef XE35_INVOKE
 
   TORCH_CHECK(false, "flash_attentionXe35: only head_dim 64 and 128 are supported in Xe3 cutlass path");
 }

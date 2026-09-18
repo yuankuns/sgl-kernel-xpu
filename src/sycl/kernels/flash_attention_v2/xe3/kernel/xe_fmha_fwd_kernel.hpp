@@ -207,12 +207,22 @@ class XeFMHAFwdKernel {
       int seq_len_k_new = 0;
       // Match Xe20 paged-KV handling: cu_seqlens_k carries per-batch cache lengths
       // directly in paged mode, while non-paged mode uses a cumulative prefix sum.
-      int seq_len_k_cache;
-      if constexpr (CollectiveMainloop::PagedKV) {
-        seq_len_k_cache = problem_shape.seq_len_kv_cache.cumulative_length[batch];
+      int seq_len_k_cache = 0;
+      if constexpr (CollectiveMainloop::CachedKV) {
+        if constexpr (CollectiveMainloop::PagedKV) {
+          seq_len_k_cache = problem_shape.seq_len_kv_cache.cumulative_length[batch];
+        } else {
+          seq_len_k_cache = problem_shape.seq_len_kv_cache.cumulative_length[batch + 1] -
+                            problem_shape.seq_len_kv_cache.cumulative_length[batch];
+        }
       } else {
-        seq_len_k_cache = problem_shape.seq_len_kv_cache.cumulative_length[batch + 1] -
-                          problem_shape.seq_len_kv_cache.cumulative_length[batch];
+        // Plain attention uses the new-KV buffer for the contiguous ragged KV.
+        // The cache slot stays empty so the local-window / offset math remains in
+        // the same coordinates as the upstream FMHA configuration.
+        // cu_seqlens_k is cumulative (size batch+1), so per-batch length is the diff.
+        seq_len_k_new =
+            problem_shape.seq_len_kv.cumulative_length[batch + 1] - problem_shape.seq_len_kv.cumulative_length[batch];
+        seq_len_k_cache = 0;
       }
       return cute::make_tuple<int, int, int>(seq_len_q, seq_len_k_new, seq_len_k_cache);
     } else {
@@ -255,15 +265,26 @@ class XeFMHAFwdKernel {
         auto q_offset_wi = get<0>(tScS(0));
         auto q_offset_sg = group_broadcast(sycl::ext::oneapi::this_work_item::get_sub_group(), q_offset_wi, 0);
 
-        int offset = CollectiveMainloop::LocalMask
-                         ? seq_len_qo
-                         : cute::min(seq_len_qo, CollectiveMainloop::CachedKV ? seq_len_kv_cache : seq_len_kv);
-        discard_seq_coord = seq_len_qo - offset;
-        full_tile_offset = (CollectiveMainloop::CachedKV ? seq_len_kv_cache : seq_len_kv) - offset;
+        if constexpr (CollectiveMainloop::CausalMask) {
+          int offset = cute::min(seq_len_qo, CollectiveMainloop::CachedKV ? seq_len_kv_cache : seq_len_kv);
+          discard_seq_coord = seq_len_qo - offset;
+          full_tile_offset = (CollectiveMainloop::CachedKV ? seq_len_kv_cache : seq_len_kv) - offset;
+        } else if constexpr (CollectiveMainloop::LocalMask) {
+          // Local attention uses the true query-to-KV offset for the whole batch,
+          // not the causal clamp. This preserves the reference window band
+          // row_kv_idx = row_q_idx + (seq_len_kv - seq_len_qo), which can be negative
+          // when the KV sequence is shorter than the query sequence.
+          full_tile_offset = (CollectiveMainloop::CachedKV ? seq_len_kv_cache : seq_len_kv) - seq_len_qo;
+        }
+
         seq_coord = cute::min(seq_len_qo, (blk_q * get<0>(TileShapeQK{}) + q_offset_sg));
-        if (seq_coord < discard_seq_coord) continue;
+        if constexpr (CollectiveMainloop::CausalMask) {
+          if (seq_coord < discard_seq_coord) continue;
+        }
         if constexpr (CollectiveMainloop::CachedKV) {
           seq_len_new = 0;
+        } else if constexpr (CollectiveMainloop::LocalMask && !CollectiveMainloop::CausalMask) {
+          seq_len_new = seq_len_kv;
         } else {
           seq_len_new = full_tile_offset + cute::min(seq_len_kv, seq_coord - discard_seq_coord) + q_sg_tile;
         }
@@ -278,7 +299,9 @@ class XeFMHAFwdKernel {
         const int kblocks_new = cute::ceil_div(seq_len_new, get<1>(TileShapeQK{}));
         k_blocks = kblocks_cache + kblocks_new;
       } else {
-        k_blocks = static_cast<int>(static_cast<unsigned>(seq_len) / static_cast<unsigned>(get<1>(TileShapeQK{})));
+        // ceil (not floor) so a ragged non-paged seqlen that isn't a multiple of
+        // the tile still processes its partial last block (remainder-masked below).
+        k_blocks = cute::ceil_div(seq_len, get<1>(TileShapeQK{}));
       }
       int causal_k_block_start = 0;
       if constexpr (CollectiveMainloop::CausalMask && CollectiveMainloop::CachedKV) {
@@ -290,15 +313,17 @@ class XeFMHAFwdKernel {
       if constexpr (CollectiveMainloop::LocalMask) {
         const int tile_q = get<0>(TileShapeQK{});
         const int tile_k = get<1>(TileShapeQK{});
-        // Skip K blocks that are entirely outside the [row - window_size_left,
-        // row + window_size_right] band for all rows in this Q tile. Use Q-tile
-        // granularity so all subgroups in the workgroup agree on the loop count.
+        // Match the reference local-window semantics: the Q row is offset by the
+        // query-to-KV shift before applying the left/right band test.
         const int q_tile_min_row_kv = blk_q * tile_q + full_tile_offset;
         const int q_tile_max_row_kv = q_tile_min_row_kv + tile_q - 1;
-        const int lo_kv = cute::max(0, q_tile_min_row_kv - params.mainloop.window_size_left);
-        const int hi_kv_plus_one = q_tile_max_row_kv + params.mainloop.window_size_right + 1;
+        // A negative window size means "unbounded" on that side: clamp left to 0
+        // and right to the full K range instead of the query position.
+        const int wsl = params.mainloop.window_size_left;
+        const int wsr = params.mainloop.window_size_right;
+        const int lo_kv = (wsl < 0) ? 0 : cute::max(0, q_tile_min_row_kv - wsl);
         blk_k0 = lo_kv / tile_k;
-        blk_k1 = cute::min(k_blocks, cute::ceil_div(hi_kv_plus_one, tile_k));
+        blk_k1 = (wsr < 0) ? k_blocks : cute::min(k_blocks, cute::ceil_div(q_tile_max_row_kv + wsr + 1, tile_k));
         if (blk_k0 >= blk_k1) continue;
       }
 
@@ -320,8 +345,12 @@ class XeFMHAFwdKernel {
           offset_k_cache = 0;
           offset_v_cache = 0;
         } else {
-          offset_k = s.num_heads_kv * s.head_size_qk * kv_cumulative[idx_b];
-          offset_v = s.num_heads_kv * s.head_size_vo * kv_cumulative[idx_b];
+          // "New" K/V may be absent (cache-only non-paged, e.g. varlen prefill):
+          // its cumulative pointer is then null, so keep the base offset at 0.
+          if (kv_cumulative) {
+            offset_k = s.num_heads_kv * s.head_size_qk * kv_cumulative[idx_b];
+            offset_v = s.num_heads_kv * s.head_size_vo * kv_cumulative[idx_b];
+          }
           if (s.seq_len_kv_cache.cumulative_length) {
             auto kv_cumulative_cache = s.seq_len_kv_cache.cumulative_length;
             offset_k_cache = s.num_heads_kv * s.head_size_qk * kv_cumulative_cache[idx_b];
@@ -396,8 +425,10 @@ class XeFMHAFwdKernel {
         int fusion_full_tile_offset = full_tile_offset;
         int fusion_discard = discard_seq_coord;
         int gqa_fusion_q_per_head = 0;
-        if constexpr (CollectiveMainloop::CausalMask) {
+        if constexpr (CollectiveMainloop::CausalMask || CollectiveMainloop::LocalMask) {
           gqa_fusion_q_per_head = q_len;
+        }
+        if constexpr (CollectiveMainloop::CausalMask) {
           fusion_seq_len = seq_len_kv;
           fusion_full_tile_offset = seq_len_kv - cute::min(q_len, seq_len_kv);
           fusion_discard = 0;

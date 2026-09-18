@@ -34,15 +34,11 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> mha_fwd(
     std::optional<at::Tensor>& out_) {
   const int batch = static_cast<int>(cu_seqlens_q.size(0) - 1);
   TORCH_CHECK(batch > 0, "flash_attentionXe35: empty batch is not supported");
-  TORCH_CHECK(page_table.has_value(), "flash_attentionXe35: page_table is required");
-  auto& page_table_ref = page_table.value();
+  const bool is_paged = page_table.has_value();
 
   TORCH_CHECK(q.dim() == 3, "flash_attentionXe35: q must be (total_q, h, d)");
-  TORCH_CHECK(k.dim() == 4 && v.dim() == 4, "flash_attentionXe35: k/v must be paged (num_pages, page_size, h_kv, d)");
-  TORCH_CHECK(page_table_ref.dim() == 2, "flash_attentionXe35: page_table must be 2D");
   TORCH_CHECK(cu_seqlens_q.dim() == 1, "flash_attentionXe35: cu_seqlens_q must be 1D");
   TORCH_CHECK(cu_seqlens_k.dim() == 1, "flash_attentionXe35: cache_seqlens must be 1D");
-  TORCH_CHECK(cu_seqlens_k.size(0) == batch, "flash_attentionXe35: cache_seqlens must have size equal to batch");
   TORCH_CHECK(!seqlens_rotary_.has_value(), "flash_attentionXe35: seqlens_rotary is not supported");
   TORCH_CHECK(
       !q_descale_.has_value() && !k_descale_.has_value() && !v_descale_.has_value(),
@@ -54,22 +50,73 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> mha_fwd(
   TORCH_CHECK(q_dtype == at::ScalarType::BFloat16, "flash_attentionXe35: only bf16 is supported");
   TORCH_CHECK(k.scalar_type() == q_dtype && v.scalar_type() == q_dtype, "flash_attentionXe35: q/k/v dtype mismatch");
   TORCH_CHECK(q.is_xpu() && k.is_xpu() && v.is_xpu(), "flash_attentionXe35: q/k/v must be xpu tensors");
-  TORCH_CHECK(
-      page_table_ref.is_xpu() && cu_seqlens_q.is_xpu() && cu_seqlens_k.is_xpu(),
-      "flash_attentionXe35: page_table/cu_seqlens must be xpu tensors");
+  TORCH_CHECK(cu_seqlens_q.is_xpu() && cu_seqlens_k.is_xpu(), "flash_attentionXe35: cu_seqlens must be xpu tensors");
   TORCH_CHECK(cu_seqlens_q.scalar_type() == at::ScalarType::Int, "flash_attentionXe35: cu_seqlens_q must be int32");
   TORCH_CHECK(cu_seqlens_k.scalar_type() == at::ScalarType::Int, "flash_attentionXe35: cache_seqlens must be int32");
-  TORCH_CHECK(page_table_ref.scalar_type() == at::ScalarType::Int, "flash_attentionXe35: page_table must be int32");
+  TORCH_CHECK(cu_seqlens_q.stride(0) == 1, "flash_attentionXe35: cu_seqlens_q must be contiguous");
+  TORCH_CHECK(cu_seqlens_k.stride(0) == 1, "flash_attentionXe35: cache_seqlens must be contiguous");
+  TORCH_CHECK(
+      q.stride(-1) == 1 && k.stride(-1) == 1 && v.stride(-1) == 1,
+      "flash_attentionXe35: last dimension must be contiguous");
 
   const int total_q = static_cast<int>(q.size(0));
   const int num_heads_q = static_cast<int>(q.size(1));
   const int head_dim = static_cast<int>(q.size(2));
-  const int num_pages = static_cast<int>(k.size(0));
-  const int page_size = static_cast<int>(k.size(1));
-  const int num_heads_kv = static_cast<int>(k.size(2));
-  const int num_pages_per_seq = static_cast<int>(page_table_ref.size(1));
+  TORCH_CHECK(q.stride(1) == head_dim, "flash_attentionXe35: q must be contiguous on [total_q, h, d]");
 
-  TORCH_CHECK(page_size == 64 || page_size == 128, "flash_attentionXe35: only page_size 64 and 128 are supported");
+  // page_size == 0 signals the non-paged (contiguous ragged KV) launch downstream.
+  int num_heads_kv = 0;
+  int page_size = 0;
+  int num_pages_per_seq = 0;
+  at::Tensor k_pool;
+  at::Tensor v_pool;
+  at::Tensor page_table_ref;
+
+  if (is_paged) {
+    page_table_ref = page_table.value();
+    TORCH_CHECK(k.dim() == 4 && v.dim() == 4, "flash_attentionXe35: k/v must be paged (num_pages, page_size, h_kv, d)");
+    TORCH_CHECK(page_table_ref.dim() == 2, "flash_attentionXe35: page_table must be 2D");
+    TORCH_CHECK(cu_seqlens_k.size(0) == batch, "flash_attentionXe35: cache_seqlens must have size equal to batch");
+    TORCH_CHECK(page_table_ref.is_xpu(), "flash_attentionXe35: page_table must be an xpu tensor");
+    TORCH_CHECK(page_table_ref.scalar_type() == at::ScalarType::Int, "flash_attentionXe35: page_table must be int32");
+    TORCH_CHECK(page_table_ref.is_contiguous(), "flash_attentionXe35: page_table must be contiguous");
+
+    const int num_pages = static_cast<int>(k.size(0));
+    page_size = static_cast<int>(k.size(1));
+    num_heads_kv = static_cast<int>(k.size(2));
+    num_pages_per_seq = static_cast<int>(page_table_ref.size(1));
+    TORCH_CHECK(page_size == 64 || page_size == 128, "flash_attentionXe35: only page_size 64 and 128 are supported");
+    TORCH_CHECK(k.size(3) == head_dim && v.size(3) == head_dim, "flash_attentionXe35: head_dim mismatch between q/k/v");
+    TORCH_CHECK(
+        k.size(1) == v.size(1) && k.size(2) == v.size(2), "flash_attentionXe35: k/v shape mismatch on page/head axes");
+    TORCH_CHECK(v.size(1) == page_size && v.size(2) == num_heads_kv, "flash_attentionXe35: k/v shape mismatch");
+
+    k_pool = k.as_strided(
+        {static_cast<int64_t>(num_pages) * page_size,
+         static_cast<int64_t>(num_heads_kv),
+         static_cast<int64_t>(head_dim)},
+        {k.stride(1), k.stride(2), k.stride(3)});
+    v_pool = v.as_strided(
+        {static_cast<int64_t>(num_pages) * page_size,
+         static_cast<int64_t>(num_heads_kv),
+         static_cast<int64_t>(head_dim)},
+        {v.stride(1), v.stride(2), v.stride(3)});
+  } else {
+    // Non-paged contiguous ragged KV: k/v are (total_k, h_kv, d) and the kernel
+    // locates each sequence via cumulative lengths in cu_seqlens_k (size batch+1).
+    TORCH_CHECK(k.dim() == 3 && v.dim() == 3, "flash_attentionXe35: non-paged k/v must be (total_k, h_kv, d)");
+    TORCH_CHECK(
+        cu_seqlens_k.size(0) == batch + 1, "flash_attentionXe35: cache_seqlens must have size equal to batch + 1");
+    num_heads_kv = static_cast<int>(k.size(1));
+    page_size = 0;
+    num_pages_per_seq = 0;
+    TORCH_CHECK(k.size(2) == head_dim && v.size(2) == head_dim, "flash_attentionXe35: head_dim mismatch between q/k/v");
+    TORCH_CHECK(k.size(1) == v.size(1) && k.size(2) == v.size(2), "flash_attentionXe35: k/v shape mismatch");
+    k_pool = k;
+    v_pool = v;
+    // Dummy int tensor kept only to satisfy the dispatch signature; unused when non-paged.
+    page_table_ref = at::empty({0}, q.options().dtype(at::kInt));
+  }
 
   if (is_causal) {
     window_size_right = 0;
@@ -83,18 +130,6 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> mha_fwd(
   if (window_size_right < 0) {
     window_size_right = max_seqlen_q - 1;
   }
-
-  TORCH_CHECK(
-      q.stride(-1) == 1 && k.stride(-1) == 1 && v.stride(-1) == 1,
-      "flash_attentionXe35: last dimension must be contiguous");
-  TORCH_CHECK(q.stride(1) == head_dim, "flash_attentionXe35: q must be contiguous on [total_q, h, d]");
-  TORCH_CHECK(cu_seqlens_q.stride(0) == 1, "flash_attentionXe35: cu_seqlens_q must be contiguous");
-  TORCH_CHECK(cu_seqlens_k.stride(0) == 1, "flash_attentionXe35: cache_seqlens must be contiguous");
-  TORCH_CHECK(page_table_ref.is_contiguous(), "flash_attentionXe35: page_table must be contiguous");
-  TORCH_CHECK(k.size(3) == head_dim && v.size(3) == head_dim, "flash_attentionXe35: head_dim mismatch between q/k/v");
-  TORCH_CHECK(
-      k.size(1) == v.size(1) && k.size(2) == v.size(2), "flash_attentionXe35: k/v shape mismatch on page/head axes");
-  TORCH_CHECK(v.size(1) == page_size && v.size(2) == num_heads_kv, "flash_attentionXe35: k/v shape mismatch");
 
   const cutlass::bfloat16_t* sm_sink = nullptr;
   if (sinks_.has_value()) {
@@ -112,17 +147,22 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> mha_fwd(
 
   c10::DeviceGuard device_guard(q.device());
   auto opts = q.options();
-  auto out_dense = out_.has_value() ? out_.value() : at::empty({total_q, num_heads_q, head_dim}, opts);
-  auto k_pool = k.as_strided(
-      {static_cast<int64_t>(num_pages) * page_size, static_cast<int64_t>(num_heads_kv), static_cast<int64_t>(head_dim)},
-      {k.stride(1), k.stride(2), k.stride(3)});
-  auto v_pool = v.as_strided(
-      {static_cast<int64_t>(num_pages) * page_size, static_cast<int64_t>(num_heads_kv), static_cast<int64_t>(head_dim)},
-      {v.stride(1), v.stride(2), v.stride(3)});
+  // Zero the non-paged output: the split-decode path can leave parts unwritten
+  // and read stale memory from a prior launch, giving NaN/non-deterministic output.
+  at::Tensor out_dense;
+  if (out_.has_value()) {
+    out_dense = out_.value();
+  } else if (is_paged) {
+    out_dense = at::empty({total_q, num_heads_q, head_dim}, opts);
+  } else {
+    out_dense = at::zeros({total_q, num_heads_q, head_dim}, opts);
+  }
 
-  if (max_seqlen_q == 1) {
+  // Non-paged runs as plain attention through the prefill kernel even for q==1;
+  // the split-decode kernel is reserved for the paged KV cache.
+  if (max_seqlen_q == 1 && is_paged) {
     if (head_dim == 64) {
-      dispatch_xe35_decode_64(
+      (is_paged ? dispatch_xe35_decode_64 : dispatch_xe35_decode_nopage_64)(
           q,
           k_pool,
           v_pool,
@@ -145,7 +185,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> mha_fwd(
           sm_sink,
           sinks_.has_value());
     } else {
-      dispatch_xe35_decode_128(
+      (is_paged ? dispatch_xe35_decode_128 : dispatch_xe35_decode_nopage_128)(
           q,
           k_pool,
           v_pool,
@@ -170,7 +210,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> mha_fwd(
     }
   } else {
     if (head_dim == 64) {
-      dispatch_xe35_prefill_64(
+      (is_paged ? dispatch_xe35_prefill_64 : dispatch_xe35_prefill_nopage_64)(
           q,
           k_pool,
           v_pool,
@@ -193,7 +233,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> mha_fwd(
           sm_sink,
           sinks_.has_value());
     } else {
-      dispatch_xe35_prefill_128(
+      (is_paged ? dispatch_xe35_prefill_128 : dispatch_xe35_prefill_nopage_128)(
           q,
           k_pool,
           v_pool,

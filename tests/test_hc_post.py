@@ -24,7 +24,7 @@ def _make_inputs(T, D, device, seed=42):
     return x, residual, post, comb
 
 
-#@pytest.mark.parametrize("T", [16, 48, 128, 768, 885, 1021, 1024, 1280, 2047])
+# @pytest.mark.parametrize("T", [16, 48, 128, 768, 885, 1021, 1024, 1280, 2047])
 @pytest.mark.parametrize("T", [16])
 @pytest.mark.parametrize("D", [4096, 7168])
 def test_hc_post_kernel(T, D):

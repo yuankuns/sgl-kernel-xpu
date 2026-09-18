@@ -1005,9 +1005,7 @@ def test_flash_attn_kvcache(
 )
 @pytest.mark.parametrize("nheads_q,nheads_kv", [(1, 1), (16, 16), (16, 4)])
 @pytest.mark.parametrize("new_kv", [False])
-@pytest.mark.parametrize(
-    "causal,local", [(False, False), (False, True)]
-)
+@pytest.mark.parametrize("causal,local", [(False, False), (False, True)])
 @pytest.mark.parametrize("use_sinks", [False])
 @pytest.mark.parametrize("seqlen_new_eq_seqlen_q", [True])
 @pytest.mark.parametrize("has_rotary_seqlens", [False])
@@ -1530,7 +1528,6 @@ def _generate_block_kvcache(
     return k_cache, v_cache, page_table, k_cache_paged, v_cache_paged, num_blocks
 
 
-@pytest.mark.skip(reason="varlen is not supported on Xe3")
 @pytest.mark.skipif(
     not is_fa3_supported(),
     reason="flash_attn at sgl-kernel is only supported on sm90 and above",
@@ -1591,6 +1588,13 @@ def test_flash_attn_varlen_output(
     batch_size = 9 if seqlen_q <= 1024 else 2
     if nheads_kv > nheads_q:
         pytest.skip("Require nheads_kv <= nheads_q")
+    # Xe35 non-paged FMHA only implements head_dim 64 and 128.
+    if d not in (64, 128):
+        pytest.skip("head_dim must be 64 or 128")
+    # Xe35 non-paged batched causal varlen is not yet supported (scheduler/reduction
+    # bug for batch >= ~4); non-causal and local windows are supported.
+    if causal:
+        pytest.skip("causal is not yet supported on Xe35 non-paged varlen")
     assert nheads_q % nheads_kv == 0
 
     dtype_ref = torch.bfloat16 if dtype == torch.float8_e4m3fn else dtype
@@ -1773,6 +1777,8 @@ def test_flash_attn_varlen_output(
             out = output_pad_fn(out_unpad)
             if query_unused_mask is not None:
                 out.masked_fill_(q_zero_masking, 0.0)
+            # attention_ref runs on CPU, so bring the kernel output back to compare.
+            out = out.cpu()
             print(f"Output max diff: {(out - out_ref).abs().max().item()}")
             print(f"Output mean diff: {(out - out_ref).abs().mean().item()}")
 

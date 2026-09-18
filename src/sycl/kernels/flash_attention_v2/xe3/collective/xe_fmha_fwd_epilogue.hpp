@@ -190,8 +190,12 @@ class FMHAFwdEpilogue {
 
     /* Fused rescale + reorder*/
     CUTLASS_PRAGMA_UNROLL
-    for (int i = 0; i < rA.size(); i++)
-      tOrO(i) = static_cast<ElementO>(rA(i) * broadcast<0>(rA_sum, rA, i));
+    for (int i = 0; i < rA.size(); i++) {
+      ElementA scaled = rA(i) * broadcast<0>(rA_sum, rA, i);
+      // Fully-masked rows (no valid key, e.g. sliding-window or q>kv causal)
+      // yield 0/0 = NaN; emit 0 for them to match flash-attention semantics.
+      tOrO(i) = static_cast<ElementO>(scaled == scaled ? scaled : ElementA(0));
+    }
     copy(copy_o, tOrO, tOgO);
   }
 

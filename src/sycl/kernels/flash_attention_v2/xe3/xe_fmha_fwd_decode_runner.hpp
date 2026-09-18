@@ -4,7 +4,7 @@
 
 namespace xe35_fmha {
 
-template <int HeadDim>
+template <int HeadDim, bool Paged = true>
 inline void run_xe35_decode(
     const at::Tensor& q_dense,
     const at::Tensor& k_pool,
@@ -27,7 +27,7 @@ inline void run_xe35_decode(
     int window_size_right,
     const cutlass::bfloat16_t* sm_sink,
     bool use_sink) {
-  dispatch_xe3_kernel<HeadDim, true>(
+  dispatch_xe3_kernel<HeadDim, true, Paged>(
       q_dense,
       k_pool,
       v_pool,
