@@ -171,11 +171,12 @@ class FMHAFwdEpilogue {
 
     /* Complete softmax, dividing out sums. */
     CUTLASS_PRAGMA_UNROLL
-    for (int i = 0; i < rA_sum.size(); i++)
+    for (int i = 0; i < rA_sum.size(); i++) {
       if constexpr (CollectiveMainloop::PerTensorScale)
         rA_sum(i) = ElementA(v_scale) / rA_sum(i);
       else
         rA_sum(i) = ElementA(1) / rA_sum(i);
+    }
 
     /* Tile output */
     Tensor cO = make_identity_tensor(O.shape());       // (q,v)

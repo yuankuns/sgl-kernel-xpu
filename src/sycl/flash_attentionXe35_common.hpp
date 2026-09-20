@@ -28,14 +28,6 @@ using namespace cute;
 
 namespace xe35_fmha {
 
-inline sycl::queue& profiling_queue() {
-  static sycl::queue queue = [] {
-    sycl::queue torch_queue = at::xpu::getCurrentXPUStream().queue();
-    return sycl::queue(torch_queue.get_context(), torch_queue.get_device(), sycl::property::queue::enable_profiling{});
-  }();
-  return queue;
-}
-
 template <class Element, class OutputElement = Element>
 struct Xe3FmhaConfig {
   using ElementInput = Element;
@@ -253,7 +245,7 @@ struct Xe3FmhaConfig {
         syclex::sub_group_size<cute::intel::sg_size>, intelex::grf_size<512>};
     compat::experimental::launch_policy policy{
         compat::dim3(grid.x, grid.y, grid.z), compat::dim3(block.x, block.y, block.z), launch_props, kernel_props};
-    sycl::queue& queue = profiling_queue();
+    sycl::queue& queue = at::xpu::getCurrentXPUStream().queue();
 #if defined(CUTLASS_SYCL_PROFILING_ENABLED)
     auto event = compat::experimental::launch<cutlass::device_kernel<FMHAKernel>, FMHAKernel>(policy, queue, params);
     EventManager::getInstance().addEvent(event);
@@ -263,12 +255,7 @@ struct Xe3FmhaConfig {
   }
 };
 
-template <
-  int HeadDim,
-  bool UseDecode,
-  bool Paged,
-  class Element = cutlass::bfloat16_t,
-  class OutputElement = Element>
+template <int HeadDim, bool UseDecode, bool Paged, class Element = cutlass::bfloat16_t, class OutputElement = Element>
 void dispatch_xe3_kernel(
     const at::Tensor& q_dense,
     const at::Tensor& k_pool,
@@ -299,42 +286,42 @@ void dispatch_xe3_kernel(
 
   // Paged is a compile-time parameter so each translation unit only instantiates
   // one KV-layout variant; paged and non-paged are generated as separate .cpp.
-#define XE35_INVOKE(CAUSAL, LOCAL, SINKV, STAGES, GQA, QK, PV, OUT, SGL, SINKPTR)                              \
+#define XE35_INVOKE(CAUSAL, LOCAL, SINKV, STAGES, GQA, QK, PV, OUT, SGL, SINKPTR)                                  \
   Xe3FmhaConfig<Element, OutputElement>::template run<CAUSAL, LOCAL, SINKV, STAGES, GQA, Paged, QK, PV, OUT, SGL>( \
-      q_dense,                                                                                                   \
-      k_pool,                                                                                                    \
-      v_pool,                                                                                                    \
-      page_table,                                                                                                \
-      num_pages_per_seq,                                                                                         \
-      cu_seqlens_q,                                                                                              \
-      cu_seqlens_k_cache,                                                                                        \
-      out_dense,                                                                                                 \
-      batch,                                                                                                     \
-      num_heads_q,                                                                                               \
-      num_heads_kv,                                                                                              \
-      max_seqlen_q,                                                                                              \
-      max_seqlen_kv_cache,                                                                                       \
-      HeadDim,                                                                                                   \
-      page_size,                                                                                                 \
-      q_descale,                                                                                                 \
-      k_descale,                                                                                                 \
-      v_descale,                                                                                                 \
-      softmax_scale,                                                                                             \
-      window_size_left,                                                                                          \
-      window_size_right,                                                                                         \
+      q_dense,                                                                                                     \
+      k_pool,                                                                                                      \
+      v_pool,                                                                                                      \
+      page_table,                                                                                                  \
+      num_pages_per_seq,                                                                                           \
+      cu_seqlens_q,                                                                                                \
+      cu_seqlens_k_cache,                                                                                          \
+      out_dense,                                                                                                   \
+      batch,                                                                                                       \
+      num_heads_q,                                                                                                 \
+      num_heads_kv,                                                                                                \
+      max_seqlen_q,                                                                                                \
+      max_seqlen_kv_cache,                                                                                         \
+      HeadDim,                                                                                                     \
+      page_size,                                                                                                   \
+      q_descale,                                                                                                   \
+      k_descale,                                                                                                   \
+      v_descale,                                                                                                   \
+      softmax_scale,                                                                                               \
+      window_size_left,                                                                                            \
+      window_size_right,                                                                                           \
       SINKPTR)
 
-#define XE35_RUN(CAUSAL, LOCAL, STAGES, GQA, QK, PV, OUT, SGL)                                      \
-  do {                                                                                              \
-    if constexpr (std::is_same_v<Element, cutlass::bfloat16_t>) {                                   \
-      if (use_sink)                                                                                 \
-        XE35_INVOKE(CAUSAL, LOCAL, true, STAGES, GQA, QK, PV, OUT, SGL, sm_sink);                   \
-      else                                                                                          \
-        XE35_INVOKE(CAUSAL, LOCAL, false, STAGES, GQA, QK, PV, OUT, SGL, nullptr);                  \
-    } else {                                                                                        \
-      TORCH_CHECK(!use_sink, "flash_attentionXe35: FP8 does not support sinks");                   \
-      XE35_INVOKE(CAUSAL, LOCAL, false, STAGES, GQA, QK, PV, OUT, SGL, nullptr);                    \
-    }                                                                                               \
+#define XE35_RUN(CAUSAL, LOCAL, STAGES, GQA, QK, PV, OUT, SGL)                     \
+  do {                                                                             \
+    if constexpr (std::is_same_v<Element, cutlass::bfloat16_t>) {                  \
+      if (use_sink)                                                                \
+        XE35_INVOKE(CAUSAL, LOCAL, true, STAGES, GQA, QK, PV, OUT, SGL, sm_sink);  \
+      else                                                                         \
+        XE35_INVOKE(CAUSAL, LOCAL, false, STAGES, GQA, QK, PV, OUT, SGL, nullptr); \
+    } else {                                                                       \
+      TORCH_CHECK(!use_sink, "flash_attentionXe35: FP8 does not support sinks");   \
+      XE35_INVOKE(CAUSAL, LOCAL, false, STAGES, GQA, QK, PV, OUT, SGL, nullptr);   \
+    }                                                                              \
   } while (false)
 
   if constexpr (HeadDim == 128) {

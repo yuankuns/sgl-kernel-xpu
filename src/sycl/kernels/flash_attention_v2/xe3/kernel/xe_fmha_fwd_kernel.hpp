@@ -59,6 +59,19 @@ struct FMHAProblemShape {
 
 ///////////////////////////////////////////////////////////////////////////////
 
+// Same result as T(_,_,i2,i3), but the head/batch offset is accumulated in 64bits. The packed
+// strides are 32-bit, so i3 * stride<3> wraps once a K/V/O tensor exceeds 2^31 elements.
+template <class Tensor>
+CUTLASS_HOST_DEVICE auto slice_2d_wide(Tensor const& T, int i2, int i3) {
+  using namespace cute;
+  auto layout = T.layout();
+  int64_t const offset = static_cast<int64_t>(i2) * static_cast<int64_t>(stride<2>(layout)) +
+                         static_cast<int64_t>(i3) * static_cast<int64_t>(stride<3>(layout));
+  auto sliced =
+      make_layout(make_shape(shape<0>(layout), shape<1>(layout)), make_stride(stride<0>(layout), stride<1>(layout)));
+  return make_tensor(T.data() + offset, sliced);
+}
+
 template <class ProblemShape_, class CollectiveMainloop_, class CollectiveEpilogue_, class TileScheduler_>
 class XeFMHAFwdKernel {
  public:
@@ -279,7 +292,8 @@ class XeFMHAFwdKernel {
 
         seq_coord = cute::min(seq_len_qo, (blk_q * get<0>(TileShapeQK{}) + q_offset_sg));
         if constexpr (CollectiveMainloop::CausalMask) {
-          if (seq_coord < discard_seq_coord) continue;
+          // Skip only when the whole subgroup Q-tile lies below the causal cutoff.
+          if (seq_coord + q_sg_tile <= discard_seq_coord) continue;
         }
         if constexpr (CollectiveMainloop::CachedKV) {
           seq_len_new = 0;
@@ -436,14 +450,15 @@ class XeFMHAFwdKernel {
         }
 
         const int idx_b_l = idx_b;
-        const auto q_group_off = head_kv * g * stride<2>(Q.layout());
-        const auto o_group_off = head_kv * g * stride<2>(O.layout());
+        const int64_t q_group_off = int64_t(head_kv) * g * stride<2>(Q.layout());
+        const int64_t o_group_off = int64_t(head_kv) * g * stride<2>(O.layout());
         for (int qb = 0; qb < num_q_blocks; ++qb) {
           const int row_start = qb * int(QK_BLK_M);
           const int valid_rows = cute::min(int(QK_BLK_M), total_rows - row_start);
 
           auto make_gqa_view_q = [&, idx_b_l, row_start, valid_rows]() {
-            auto offset = idx_b_l * stride<3>(Q.layout()) + q_group_off + row_start * stride<0>(Q.layout());
+            int64_t offset =
+                int64_t(idx_b_l) * stride<3>(Q.layout()) + q_group_off + int64_t(row_start) * stride<0>(Q.layout());
             return make_tensor(
                 Q.data() + offset,
                 make_layout(
@@ -451,7 +466,8 @@ class XeFMHAFwdKernel {
                     make_stride(int(stride<0>(Q.layout())), stride<1>(Q.layout()))));
           };
           auto make_gqa_view_o = [&, idx_b_l, row_start, valid_rows]() {
-            auto offset = idx_b_l * stride<3>(O.layout()) + o_group_off + row_start * stride<0>(O.layout());
+            int64_t offset =
+                int64_t(idx_b_l) * stride<3>(O.layout()) + o_group_off + int64_t(row_start) * stride<0>(O.layout());
             return make_tensor(
                 O.data() + offset,
                 make_layout(
@@ -487,8 +503,8 @@ class XeFMHAFwdKernel {
               0,
               row_start,
               gqa_fusion_q_per_head,
-              K_cache(_, _, head, l_coord),
-              V_cache(_, _, head, l_coord),
+              slice_2d_wide(K_cache, head, l_coord),
+              slice_2d_wide(V_cache, head, l_coord),
               p.scale_q,
               p.scale_k,
               p.scale_v);
@@ -567,8 +583,8 @@ class XeFMHAFwdKernel {
             causal_k_block_start,
             0,
             0,
-            K_cache(_, _, head, l_coord),
-            V_cache(_, _, head, l_coord),
+            slice_2d_wide(K_cache, head, l_coord),
+            slice_2d_wide(V_cache, head, l_coord),
             p.scale_q,
             p.scale_k,
             p.scale_v,
@@ -596,8 +612,8 @@ class XeFMHAFwdKernel {
             causal_k_block_start,
             0,
             0,
-            K_cache(_, _, head, l_coord),
-            V_cache(_, _, head, l_coord),
+            slice_2d_wide(K_cache, head, l_coord),
+            slice_2d_wide(V_cache, head, l_coord),
             p.scale_q,
             p.scale_k,
             p.scale_v);
@@ -962,9 +978,9 @@ class XeFMHAFwdDynamicSplitKernel {
         head_kv = batch_head_id % s.num_heads_kv;
         idx_b = batch_head_id / s.num_heads_kv;
         const int total_rows_q = head_group_q * s.seq_len_qo;
-        const auto q_group_off = head_kv * head_group_q * stride<2>(Q.layout());
+        const int64_t q_group_off = int64_t(head_kv) * head_group_q * stride<2>(Q.layout());
         auto make_gqa_view_q = [&]() {
-          auto offset = idx_b * stride<3>(Q.layout()) + q_group_off;
+          int64_t offset = int64_t(idx_b) * stride<3>(Q.layout()) + q_group_off;
           return make_tensor(
               Q.data() + offset,
               make_layout(
@@ -1100,9 +1116,9 @@ class XeFMHAFwdDynamicSplitKernel {
         idx_b = wg_id / s.num_heads_kv;
 
         const int total_rows_o = head_group_q * s.seq_len_qo;
-        const auto o_group_off = head_kv * head_group_q * stride<2>(O.layout());
+        const int64_t o_group_off = int64_t(head_kv) * head_group_q * stride<2>(O.layout());
         auto make_gqa_view_o = [&]() {
-          auto offset = idx_b * stride<3>(O.layout()) + o_group_off;
+          int64_t offset = int64_t(idx_b) * stride<3>(O.layout()) + o_group_off;
           return make_tensor(
               O.data() + offset,
               make_layout(

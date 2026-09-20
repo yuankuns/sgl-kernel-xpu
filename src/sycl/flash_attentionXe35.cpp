@@ -194,8 +194,8 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> mha_fwd(
   // the split-decode kernel is reserved for the paged KV cache.
   Xe35DispatchFn* dispatch;
   if (is_paged) {
-    dispatch = max_seqlen_q == 1 ? get_xe35_decode_dispatch(head_dim, q_dtype)
-                                 : get_xe35_prefill_dispatch(head_dim, q_dtype);
+    dispatch =
+        max_seqlen_q == 1 ? get_xe35_decode_dispatch(head_dim, q_dtype) : get_xe35_prefill_dispatch(head_dim, q_dtype);
   } else {
     TORCH_CHECK(!is_fp8, "flash_attentionXe35: non-paged FP8 is not supported");
     dispatch = head_dim == 64 ? &dispatch_xe35_prefill_nopage_64 : &dispatch_xe35_prefill_nopage_128;
