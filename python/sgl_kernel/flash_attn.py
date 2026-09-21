@@ -2,6 +2,7 @@ from typing import List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
+from sgl_kernel.utils import quantize_per_tensor_fp8
 
 
 def is_fa3_supported(device=None) -> bool:
@@ -258,6 +259,12 @@ def flash_attn_with_kvcache(
     ]
     rotary_cos, rotary_sin = [maybe_contiguous(x) for x in (rotary_cos, rotary_sin)]
     rotary_seqlens = maybe_contiguous(rotary_seqlens)
+
+    if q.dtype == torch.bfloat16 and k_cache.dtype in (
+        torch.float8_e4m3fn,
+        torch.float8_e5m2,
+    ):
+        q, q_descale = quantize_per_tensor_fp8(q, k_cache.dtype)
 
     if cu_seqlens_q is None:  # !is_varlen_q
         cu_seqlens_q = torch.arange(

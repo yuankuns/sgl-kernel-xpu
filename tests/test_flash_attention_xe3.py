@@ -277,7 +277,8 @@ def test_flash_attention_xe3_fwd(
 @pytest.mark.parametrize("fp8_dtype", [torch.float8_e4m3fn, torch.float8_e5m2])
 @pytest.mark.parametrize("head_dim", [64, 128])
 @pytest.mark.parametrize("seqlen_q", [1, 16])
-def test_flash_attention_xe3_fp8_full_qkv(fp8_dtype, head_dim, seqlen_q):
+@pytest.mark.parametrize("bf16_q_input", [False, True])
+def test_flash_attention_xe3_fp8_full_qkv(fp8_dtype, head_dim, seqlen_q, bf16_q_input):
     batch = 1
     seqlen_k = 96
     page_size = 64
@@ -306,9 +307,11 @@ def test_flash_attention_xe3_fp8_full_qkv(fp8_dtype, head_dim, seqlen_q):
         device=device,
         dtype=torch.bfloat16,
     )
-    q, q_descale = quantize_per_tensor_fp8(q_bf16, fp8_dtype)
+    q_fp8, q_descale = quantize_per_tensor_fp8(q_bf16, fp8_dtype)
     k_cache, k_descale = quantize_per_tensor_fp8(k_bf16, fp8_dtype)
     v_cache, v_descale = quantize_per_tensor_fp8(v_bf16, fp8_dtype)
+    q = q_bf16 if bf16_q_input else q_fp8
+    input_q_descale = None if bf16_q_input else q_descale
 
     page_table = torch.tensor([[1, 0]], dtype=torch.int32, device=device)
     cache_seqlens = torch.full((batch,), seqlen_k, dtype=torch.int32, device=device)
@@ -326,7 +329,7 @@ def test_flash_attention_xe3_fp8_full_qkv(fp8_dtype, head_dim, seqlen_q):
         cu_seqlens_q=cu_seqlens_q,
         max_seqlen_q=seqlen_q,
         max_seqlen_k=seqlen_k,
-        q_descale=q_descale,
+        q_descale=input_q_descale,
         k_descale=k_descale,
         v_descale=v_descale,
         softmax_scale=softmax_scale,
@@ -335,7 +338,7 @@ def test_flash_attention_xe3_fp8_full_qkv(fp8_dtype, head_dim, seqlen_q):
     )
     torch.xpu.synchronize()
 
-    q_ref = (q.float().cpu() * q_descale).to(torch.bfloat16).to(device)
+    q_ref = (q_fp8.float().cpu() * q_descale).to(torch.bfloat16).to(device)
     k_ref = (k_cache.float().cpu() * k_descale).to(torch.bfloat16).to(device)
     v_ref = (v_cache.float().cpu() * v_descale).to(torch.bfloat16).to(device)
     out_ref = cpu_ref(
