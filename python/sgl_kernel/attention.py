@@ -144,3 +144,77 @@ def flash_mla_get_workspace_size(
     return torch.ops.sgl_kernel.flash_mla_get_workspace_size.default(
         max_seq_len, num_batches, num_heads, page_size, num_kv_splits
     )
+
+
+def flash_mla_with_kvcache(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    block_table: Optional[torch.Tensor] = None,
+    cache_seqlens: Optional[torch.Tensor] = None,
+    head_dim_v: int = 512,
+    tile_scheduler_metadata: Optional[torch.Tensor] = None,
+    num_splits: Optional[torch.Tensor] = None,
+    softmax_scale: Optional[float] = None,
+    causal: bool = False,
+    is_fp8_kvcache: bool = False,
+    indices: Optional[torch.Tensor] = None,
+    attn_sink: Optional[torch.Tensor] = None,
+    extra_k_cache: Optional[torch.Tensor] = None,
+    extra_indices_in_kvcache: Optional[torch.Tensor] = None,
+    topk_length: Optional[torch.Tensor] = None,
+    extra_topk_length: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    assert tile_scheduler_metadata is None
+    assert num_splits is None
+    assert not causal
+    assert q.ndim == 4 and q.shape[1] == 1
+    assert k_cache.ndim == 4
+    if softmax_scale is None:
+        softmax_scale = q.shape[-1] ** -0.5
+
+    out = q.new_empty((*q.shape[:-1], head_dim_v))
+    lse = torch.empty(
+        (q.shape[0], q.shape[2], q.shape[1]), device=q.device, dtype=torch.float32
+    )
+    if block_table is None:
+        assert indices is not None
+        torch.ops.sgl_kernel.flash_mla_sparse_decode.default(
+            out,
+            lse,
+            q,
+            k_cache,
+            indices,
+            topk_length,
+            extra_k_cache,
+            extra_indices_in_kvcache,
+            extra_topk_length,
+            attn_sink,
+            softmax_scale,
+            head_dim_v,
+            is_fp8_kvcache,
+        )
+    else:
+        assert (
+            cache_seqlens is not None
+        ), "dense block-table path is not enabled for XPU"
+    return out, lse
+
+
+def flash_mla_sparse_fwd(
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    indices: torch.Tensor,
+    sm_scale: float,
+    d_v: int = 512,
+    attn_sink: Optional[torch.Tensor] = None,
+    topk_length: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    output = torch.empty((q.shape[0], q.shape[1], d_v), device=q.device, dtype=q.dtype)
+    max_logits = torch.empty(
+        (q.shape[0], q.shape[1]), device=q.device, dtype=torch.float32
+    )
+    lse = torch.empty((q.shape[0], q.shape[1]), device=q.device, dtype=torch.float32)
+    torch.ops.sgl_kernel.flash_mla_sparse_prefill.default(
+        output, max_logits, lse, q, kv, indices, sm_scale, d_v, attn_sink, topk_length
+    )
+    return output, max_logits, lse
