@@ -1587,6 +1587,7 @@ def _generate_block_kvcache(
     "seqlen_q,seqlen_k",
     [
         (1, 1),
+        (1, 4096),
         (1, 3),
         (2, 1),
         (511, 1),
