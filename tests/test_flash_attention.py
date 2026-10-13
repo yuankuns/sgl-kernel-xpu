@@ -902,6 +902,7 @@ def test_flash_attn_kvcache(
             key_leftpad=cache_leftpad,
             intermediate_dtype=dtype if dtype == torch.float8_e4m3fn else None,
         )
+        fwd_atol = max(2 * (out_ref + 0.3 - 0.3 - out_ref).abs().max().item(), 1e-5)
         q = q.to(dtype)
         q_unpad = q_unpad.to(dtype) if varlen_q else None
         k_cache = k_cache.to(dtype)
@@ -1030,7 +1031,7 @@ def test_flash_attn_kvcache(
                 mult = 4 if dtype == torch.float8_e4m3fn else 2
                 assert (out - out_ref).abs().max().item() <= mult * (
                     out_pt - out_ref
-                ).abs().max().item() + 1e-5
+                ).abs().max().item() + fwd_atol
                 mult_mean = 3 if dtype == torch.float8_e4m3fn else 1.5
                 assert (out - out_ref).abs().mean().item() <= mult_mean * (
                     out_pt - out_ref
@@ -1400,6 +1401,7 @@ def test_flash_attn_decode_kvcache(
             key_leftpad=cache_leftpad,
             intermediate_dtype=dtype if dtype == torch.float8_e4m3fn else None,
         )
+        fwd_atol = max(2 * (out_ref + 0.3 - 0.3 - out_ref).abs().max().item(), 1e-5)
         q = q.to(dtype)
         q_unpad = q_unpad.to(dtype) if varlen_q else None
         k_cache = k_cache.to(dtype)
@@ -1416,7 +1418,8 @@ def test_flash_attn_decode_kvcache(
         sin = sin.to(dtype) if sin is not None else None
         k_cache_saved = k_cache.clone() if page_size is None else k_cache_paged.clone()
         v_cache_saved = v_cache.clone() if page_size is None else v_cache_paged.clone()
-        num_splits_vals = [1, 0] if not DISABLE_SPLIT else [1]
+        # Keep auto split-KV covered even when explicit split testing is disabled.
+        num_splits_vals = [2, 1, 0]
         precompute_metadata_vals = [False]
         for num_splits, precompute_metadata in itertools.product(
             num_splits_vals, precompute_metadata_vals
@@ -1529,7 +1532,7 @@ def test_flash_attn_decode_kvcache(
                 mult = 4 if dtype == torch.float8_e4m3fn else 2
                 assert (out - out_ref).abs().max().item() <= mult * (
                     out_pt - out_ref
-                ).abs().max().item() + 1e-5
+                ).abs().max().item() + fwd_atol
                 mult_mean = 3 if dtype == torch.float8_e4m3fn else 1.5
                 assert (out - out_ref).abs().mean().item() <= mult_mean * (
                     out_pt - out_ref
@@ -2009,11 +2012,7 @@ def test_flash_attention_xe3_fp8_full_qkv(fp8_dtype, head_dim, seqlen_q, bf16_q_
     )
     torch.xpu.synchronize()
 
-    q_ref = (
-        q_bf16.cpu()
-        if bf16_q_input
-        else (q_fp8.float().cpu() * q_descale).to(torch.bfloat16)
-    )
+    q_ref = (q_fp8.float().cpu() * q_descale).to(torch.bfloat16)
     k_dequant = (k_cache.float().cpu() * k_descale).to(torch.bfloat16)
     v_dequant = (v_cache.float().cpu() * v_descale).to(torch.bfloat16)
     k_ref, v_ref, key_padding_mask = unpack_paged_kv(

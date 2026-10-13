@@ -72,7 +72,12 @@ CUTLASS_HOST_DEVICE auto slice_2d_wide(Tensor const& T, int i2, int i3) {
   return make_tensor(T.data() + offset, sliced);
 }
 
-template <class ProblemShape_, class CollectiveMainloop_, class CollectiveEpilogue_, class TileScheduler_>
+template <
+    class ProblemShape_,
+    class CollectiveMainloop_,
+    class CollectiveEpilogue_,
+    class TileScheduler_,
+    bool SplitKV_ = false>
 class XeFMHAFwdKernel {
  public:
   //
@@ -121,6 +126,7 @@ class XeFMHAFwdKernel {
   using TileShapeO = typename CollectiveEpilogue::TileShapeO;
   using ElementO = typename CollectiveEpilogue::TensorO::element_type;
   using StrideO = decltype(stride(typename CollectiveEpilogue::TensorO{}));
+  static constexpr int max_num_kv_splits = SGPerWG::value * intel::sg_size;
 
   // Kernel level shared memory storage
   using MainloopSharedStorage = typename CollectiveMainloop::SharedStorage;
@@ -158,6 +164,12 @@ class XeFMHAFwdKernel {
     const ElementV* V_cache;
     StrideV dV_cache{};
     const ElementQ* sm_sink = nullptr;
+    ElementO* Oaccum = nullptr;
+    StrideO dOaccum{};
+    float* exp_sums = nullptr;
+    StrideO dExp_sums{};
+    float* max_logits = nullptr;
+    StrideO dMax_logits{};
   };
   using KernelParams = KernelArguments;
 
@@ -166,6 +178,7 @@ class XeFMHAFwdKernel {
     MainloopArguments mainloop{};
     EpilogueArguments epilogue{};
     KernelHardwareInfo hw_info{};
+    int num_kv_splits = -1;
   };
 
   // Kernel entry point API
@@ -185,10 +198,14 @@ class XeFMHAFwdKernel {
         args.kernel,
         CollectiveMainloop::to_underlying_arguments(args.mainloop, workspace),
         CollectiveEpilogue::to_underlying_arguments(args.epilogue, workspace),
-        TileScheduler::to_underlying_arguments(args.kernel.shape, args.hw_info, TileShapeO{})};
+        TileScheduler::to_underlying_arguments(
+            args.kernel.shape, args.hw_info, TileShapeO{}, SplitKV_ ? args.num_kv_splits : -1)};
   }
 
   static bool can_implement(Arguments const& args) {
+    if constexpr (SplitKV_) {
+      if (args.num_kv_splits < 1 || args.num_kv_splits > max_num_kv_splits) return false;
+    }
     return CollectiveMainloop::can_implement(args.mainloop) && CollectiveEpilogue::can_implement(args.epilogue);
   }
 
@@ -243,8 +260,150 @@ class XeFMHAFwdKernel {
     }
   }
 
+  CUTLASS_DEVICE void split_kv_operator(Params const& params, char* smem_buf) {
+    using namespace sycl::ext::oneapi::this_work_item;
+    auto& shared_storage = *reinterpret_cast<SharedStorage*>(smem_buf);
+    auto& p = params.kernel;
+    const int head_group_q = p.shape.num_heads_q / p.shape.num_heads_kv;
+    const int num_kv_splits = params.scheduler.num_kv_splits;
+    const int thr_id = int(ThreadIdxX());
+    TileScheduler tile_scheduler{params.scheduler};
+
+    for (; tile_scheduler.is_valid(); ++tile_scheduler) {
+      auto [blk_q, blk_v, head, idx_b, idx_kv_split] = tile_scheduler.get_block_coord();
+      if (blk_q != 0) continue;
+      auto sequence_lengths = get_sequence_length_shape(p.shape, idx_b);
+      const int seq_len_qo = get<0>(sequence_lengths);
+      const int seq_len_kv = CollectiveMainloop::CachedKV ? get<2>(sequence_lengths) : get<1>(sequence_lengths);
+      if (seq_len_qo <= 0 || seq_len_kv <= 0) continue;
+
+      const int tile_k = get<1>(TileShapeQK{});
+      const int k_blocks = cute::ceil_div(seq_len_kv, tile_k);
+      const int k_block0 =
+          CollectiveMainloop::LocalMask ? cute::max(seq_len_kv - 1 - params.mainloop.window_size_left, 0) / tile_k : 0;
+      const int windowed_k_blocks = k_blocks - k_block0;
+      constexpr int kMinBlocksForSplit = 16;
+      const bool is_single_split = num_kv_splits > 1 && windowed_k_blocks < kMinBlocksForSplit;
+      if (is_single_split && idx_kv_split > 0) continue;
+      const int blocks_per_split = cute::ceil_div(windowed_k_blocks, num_kv_splits);
+      const int split_start = is_single_split ? k_block0 : k_block0 + idx_kv_split * blocks_per_split;
+      const int split_blocks = is_single_split
+                                   ? windowed_k_blocks
+                                   : cute::min(windowed_k_blocks - idx_kv_split * blocks_per_split, blocks_per_split);
+
+      int q_offset = 0;
+      int output_offset = 0;
+      int lse_offset = 0;
+      int k_offset = 0;
+      int v_offset = 0;
+      if constexpr (is_var_len) {
+        auto q_offsets = p.shape.seq_len_qo.cumulative_length;
+        q_offset =
+            p.shape.num_heads_q * p.shape.head_size_qk * q_offsets[idx_b] + head * head_group_q * p.shape.head_size_qk;
+        output_offset = p.shape.num_heads_q * p.shape.head_size_vo * num_kv_splits * q_offsets[idx_b];
+        lse_offset = p.shape.num_heads_q * num_kv_splits * q_offsets[idx_b];
+        if constexpr (!CollectiveMainloop::PagedKV) {
+          auto kv_offsets = p.shape.seq_len_kv.cumulative_length;
+          if (kv_offsets != nullptr) {
+            k_offset = p.shape.num_heads_kv * p.shape.head_size_qk * kv_offsets[idx_b];
+            v_offset = p.shape.num_heads_kv * p.shape.head_size_vo * kv_offsets[idx_b];
+          }
+        }
+      }
+
+      const int batch_dim = is_var_len ? 1 : p.shape.batch;
+      const int l_coord = is_var_len ? 0 : idx_b;
+      auto shape_q = make_shape(head_group_q, p.shape.head_size_qk, p.shape.num_heads_kv, batch_dim);
+      const int kv_len_new = CollectiveMainloop::CachedKV ? 0 : seq_len_kv;
+      const int pool_seqlen_kv = CollectiveMainloop::CachedKV ? params.mainloop.total_seqlen_kv : 0;
+      auto shape_k = make_shape(kv_len_new, p.shape.head_size_qk, p.shape.num_heads_kv, batch_dim);
+      auto shape_v = make_shape(p.shape.head_size_vo, kv_len_new, p.shape.num_heads_kv, batch_dim);
+      auto shape_k_cache = make_shape(pool_seqlen_kv, p.shape.head_size_qk, p.shape.num_heads_kv, batch_dim);
+      auto shape_v_cache = make_shape(p.shape.head_size_vo, pool_seqlen_kv, p.shape.num_heads_kv, batch_dim);
+      auto shape_o = make_shape(head_group_q, p.shape.head_size_vo, p.shape.num_heads_kv, num_kv_splits, batch_dim);
+      auto shape_lse = make_shape(head_group_q, num_kv_splits, p.shape.num_heads_kv, batch_dim);
+
+      auto layout_q = make_ordered_layout(shape_q, Step<_1, _0, _2, _3>{});
+      auto layout_k = make_layout(shape_k, p.dK);
+      auto layout_v = make_layout(shape_v, p.dV);
+      auto layout_k_cache = make_layout(shape_k_cache, p.dK_cache);
+      auto layout_v_cache = make_layout(shape_v_cache, p.dV_cache);
+      auto layout_o = make_ordered_layout(shape_o, Step<_1, _0, _2, _3, _4>{});
+      auto layout_lse = make_ordered_layout(shape_lse, Step<_1, _0, _2, _3>{});
+
+      Tensor Q = make_tensor(make_gmem_ptr(const_cast<ElementQ*>(p.Q + q_offset)), layout_q);
+      Tensor K = make_tensor(make_gmem_ptr(const_cast<ElementK*>(p.K + k_offset)), layout_k);
+      Tensor V = make_tensor(make_gmem_ptr(const_cast<ElementV*>(p.V + v_offset)), layout_v);
+      Tensor K_cache = make_tensor(make_gmem_ptr(const_cast<ElementK*>(p.K_cache)), layout_k_cache);
+      Tensor V_cache = make_tensor(make_gmem_ptr(const_cast<ElementV*>(p.V_cache)), layout_v_cache);
+      Tensor O = make_tensor(make_gmem_ptr(p.Oaccum + output_offset), layout_o);
+      Tensor exp_sums = make_tensor(make_gmem_ptr(p.exp_sums + lse_offset), layout_lse);
+      Tensor max_logits = make_tensor(make_gmem_ptr(p.max_logits + lse_offset), layout_lse);
+
+      if (split_blocks <= 0) {
+        if (thr_id < head_group_q) {
+          exp_sums(thr_id, idx_kv_split, head, l_coord) = 0.0f;
+        }
+        continue;
+      }
+
+      FragA tArA;
+      FragARow tA_max;
+      FragSPartialRow tA_sum;
+      auto blk_qv = make_coord(blk_q, blk_v);
+      int gqa_fusion_q_per_head = 0;
+      if constexpr (CollectiveMainloop::CausalMask || CollectiveMainloop::LocalMask) {
+        gqa_fusion_q_per_head = seq_len_qo;
+      }
+      CollectiveMainloop mainloop(params.mainloop, shared_storage.mainloop);
+      mainloop.template operator()<true>(
+          Q(_, _, 0, l_coord),
+          K(_, _, head, l_coord),
+          V(_, _, head, l_coord),
+          tArA,
+          tA_max,
+          tA_sum,
+          blk_qv,
+          split_start,
+          split_start + split_blocks,
+          k_blocks,
+          thr_id,
+          seq_len_kv,
+          CollectiveMainloop::CachedKV ? seq_len_kv : 0,
+          idx_b,
+          seq_len_kv - seq_len_qo,
+          0,
+          0,
+          0,
+          gqa_fusion_q_per_head,
+          K_cache(_, _, head, l_coord),
+          V_cache(_, _, head, l_coord));
+      if constexpr (!is_empty_v<MainloopSharedStorage> && !is_empty_v<EpilogueSharedStorage>) {
+        sycl::group_barrier(get_work_group<3>());
+      }
+      CollectiveEpilogue epilogue(params.epilogue, shared_storage.epilogue);
+      epilogue(
+          O(_, _, head, idx_kv_split, l_coord),
+          tArA,
+          tA_max,
+          tA_sum,
+          blk_qv,
+          thr_id,
+          exp_sums(_, _, head, l_coord),
+          max_logits(_, _, head, l_coord),
+          idx_kv_split,
+          head_group_q,
+          num_kv_splits,
+          is_single_split);
+    }
+  }
+
   CUTLASS_DEVICE
   void operator()(Params const& params, char* smem_buf) {
+    if constexpr (SplitKV_) {
+      split_kv_operator(params, smem_buf);
+      return;
+    }
     using namespace sycl::ext::oneapi::this_work_item;
 
     SharedStorage& shared_storage = *reinterpret_cast<SharedStorage*>(smem_buf);
@@ -259,7 +418,7 @@ class XeFMHAFwdKernel {
 
     CUTLASS_PRAGMA_NO_UNROLL
     for (; tile_scheduler.is_valid(); ++tile_scheduler) {
-      auto [blk_q, blk_v, head_q, idx_b] = tile_scheduler.get_block_coord();  // (Q,V,h,b)
+      auto [blk_q, blk_v, head_q, idx_b, unused_split] = tile_scheduler.get_block_coord();  // (Q,V,h,b,split)
       auto blk_qv = make_coord(blk_q, blk_v);
       int head = tile_scheduler.divide_head_group(head_q);
 

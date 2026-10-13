@@ -42,6 +42,7 @@ def flash_attn_baseline(
             q_descale=q_descale,
             k_descale=k_descale,
             v_descale=v_descale,
+            num_splits=0,
             return_softmax_lse=True,
         )
         return out, lse
@@ -58,9 +59,32 @@ def flash_attn_baseline(
             cu_seqlens_k=cu_seqlens_k,
             max_seqlen_q=max_seqlen_q,
             max_seqlen_k=max_seqlen_k,
+            num_splits=0,
             return_softmax_lse=True,
         )
         return out, lse
+
+
+def do_bench_xpu(fn, warmup=10, rep=20, quantiles=None):
+    """Accurate benchmarking for XPU using CUDA/XPU events with warmup."""
+    for _ in range(warmup):
+        fn()
+    torch.xpu.synchronize()
+
+    start_events = [torch.xpu.Event(enable_timing=True) for _ in range(rep)]
+    end_events = [torch.xpu.Event(enable_timing=True) for _ in range(rep)]
+
+    for i in range(rep):
+        start_events[i].record()
+        fn()
+        end_events[i].record()
+    torch.xpu.synchronize()
+
+    times = [s.elapsed_time(e) for s, e in zip(start_events, end_events)]
+    times.sort()
+    if quantiles is not None:
+        return [times[int(len(times) * q)] for q in quantiles]
+    return times[len(times) // 2], times[0], times[-1]
 
 
 def get_effective_attention_pairs(
@@ -89,16 +113,20 @@ def get_effective_attention_pairs(
 
 
 # Benchmark configurations
+# Testing both no-page (page_size=0) and paged KV (page_size=128):
+#   - prefill: q_seq_length > 1, causal and non-causal
+#   - decode:  q_seq_length == 1, causal=False
 causal = [True, False]
 local = [True, False]
 use_sinks = [True, False]
-batch_size = [1, 8, 16]
-q_seq_length_range = [1, 128]
-head_dim_no_page = [72, 128]
-head_dim_paged = [64, 128, 256, 512]
+batch_size = [1, 4, 8, 16, 32, 64]
+# prefill: q_seq_length in [1024, 2048, 4096]; decode: q_seq_length == 1
+q_seq_length_range = [1, 1024, 2048, 4096]
+head_dim = [128]
 num_heads_q = [16]
-num_heads_kv = [4, 8]
-kv_seq_length_range = [4096]
+num_heads_kv = [8]
+kv_seq_length_range = [1024, 2048, 4096, 8192]
+# Test both no-page (0) and paged (128)
 page_size_range = [0, 128]
 precision_range = ["bf16"]
 if is_xe3_arch():
@@ -118,11 +146,12 @@ configs = list(
             and (cfg[9] != 0 or not cfg[2])
             # Condition 6: sink is only supported for head_size == 64
             and (not cfg[2] or cfg[5] == 64)
-            # Condition 7: Xe35 full-QKV FP8 supports paged attention without sinks,
-            # with head dimensions 64 and 128.
+            # Condition 7: Xe35 full-QKV FP8 supports paged attention without sinks, with head dims 64/128
             and (
                 cfg[10] == "bf16" or (cfg[9] > 0 and not cfg[2] and cfg[5] in (64, 128))
             )
+            # Condition 8: for prefill (q_seq_length > 1), test matching q and kv seqlen and limit batch size <= 16
+            and (cfg[4] == 1 or (cfg[4] == cfg[8] and cfg[3] <= 16))
         ),
         [
             cfg
@@ -133,7 +162,7 @@ configs = list(
                 use_sinks,
                 batch_size,
                 q_seq_length_range,
-                head_dim_no_page if page_size == 0 else head_dim_paged,
+                head_dim,
                 num_heads_q,
                 num_heads_kv,
                 kv_seq_length_range,
@@ -276,7 +305,7 @@ def benchmark(
     quantiles = [0.5, 0.2, 0.8]
 
     if provider == "flash_attn":
-        ms, min_ms, max_ms = triton.testing.do_bench(
+        ms, min_ms, max_ms = do_bench_xpu(
             lambda: flash_attn_baseline(
                 q,
                 k_cache,

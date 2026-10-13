@@ -55,18 +55,18 @@ namespace mla_sparse_decode {
 //   HAS_ATTN_SINK in {0, 1}
 #define DECLARE_MLA_SPARSE_DECODE_LAUNCH(ELEM, D_QK, B_H, SINK)   \
   void launch_mla_sparse_decode_##ELEM##_##D_QK##_##B_H##_##SINK( \
-      at::Tensor& out,                                                   \
-      at::Tensor& lse_out,                                               \
-      const at::Tensor& q,                                               \
-      const at::Tensor& k_cache,                                         \
-      const at::Tensor& indices,                                         \
-      const std::optional<at::Tensor>& topk_length,                      \
-      const std::optional<at::Tensor>& extra_k_cache,                    \
-      const std::optional<at::Tensor>& extra_indices,                    \
-      const std::optional<at::Tensor>& extra_topk_length,                \
-      const std::optional<at::Tensor>& attn_sink,                        \
-      double sm_scale,                                                   \
-      int64_t head_dim_v,                                                \
+      at::Tensor& out,                                            \
+      at::Tensor& lse_out,                                        \
+      const at::Tensor& q,                                        \
+      const at::Tensor& k_cache,                                  \
+      const at::Tensor& indices,                                  \
+      const std::optional<at::Tensor>& topk_length,               \
+      const std::optional<at::Tensor>& extra_k_cache,             \
+      const std::optional<at::Tensor>& extra_indices,             \
+      const std::optional<at::Tensor>& extra_topk_length,         \
+      const std::optional<at::Tensor>& attn_sink,                 \
+      double sm_scale,                                            \
+      int64_t head_dim_v,                                         \
       bool is_fp8_kvcache);
 
 #define DECLARE_MLA_SPARSE_DECODE_ALL_B_H(ELEM)      \

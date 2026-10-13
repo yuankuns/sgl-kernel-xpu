@@ -34,28 +34,28 @@ namespace {
 // the three must stay in lockstep or the TU fails to link.
 #define DISPATCH_MLA_SPARSE_LAUNCH(ELEM, D_QK, B_H, SINK)                       \
   mla_sparse_decode::launch_mla_sparse_decode_##ELEM##_##D_QK##_##B_H##_##SINK( \
-      out,                                                                             \
-      lse_out,                                                                         \
-      q,                                                                               \
-      k_cache,                                                                         \
-      indices,                                                                         \
-      topk_length,                                                                     \
-      extra_k_cache,                                                                   \
-      extra_indices,                                                                   \
-      extra_topk_length,                                                               \
-      attn_sink,                                                                       \
-      sm_scale,                                                                        \
-      head_dim_v,                                                                      \
+      out,                                                                      \
+      lse_out,                                                                  \
+      q,                                                                        \
+      k_cache,                                                                  \
+      indices,                                                                  \
+      topk_length,                                                              \
+      extra_k_cache,                                                            \
+      extra_indices,                                                            \
+      extra_topk_length,                                                        \
+      attn_sink,                                                                \
+      sm_scale,                                                                 \
+      head_dim_v,                                                               \
       is_fp8_kvcache)
 
 // Resolve the runtime attn_sink flag to the compile-time 0/1 launcher variant.
-#define DISPATCH_MLA_SPARSE_SINK(ELEM, D_QK, B_H)            \
-  do {                                                       \
-    if (attn_sink.has_value()) {                             \
+#define DISPATCH_MLA_SPARSE_SINK(ELEM, D_QK, B_H)     \
+  do {                                                \
+    if (attn_sink.has_value()) {                      \
       DISPATCH_MLA_SPARSE_LAUNCH(ELEM, D_QK, B_H, 1); \
-    } else {                                                 \
+    } else {                                          \
       DISPATCH_MLA_SPARSE_LAUNCH(ELEM, D_QK, B_H, 0); \
-    }                                                        \
+    }                                                 \
   } while (0)
 
 // Resolve the head-block size B_H (the number of query heads packed into one Stage-2
@@ -99,15 +99,15 @@ namespace {
 
 // bf16 only for now: the Stage-2 QK DPAS is bf16 (K/V are the gathered bf16
 // latent).
-#define DISPATCH_MLA_SPARSE_DTYPE()                                                      \
-  do {                                                                                          \
-    switch (in_dtype) {                                                                         \
-      case at::ScalarType::BFloat16:                                                            \
-        DISPATCH_MLA_SPARSE_D_QK(bf16);                                                         \
-        break;                                                                                  \
-      default:                                                                                  \
+#define DISPATCH_MLA_SPARSE_DTYPE()                                                     \
+  do {                                                                                  \
+    switch (in_dtype) {                                                                 \
+      case at::ScalarType::BFloat16:                                                    \
+        DISPATCH_MLA_SPARSE_D_QK(bf16);                                                 \
+        break;                                                                          \
+      default:                                                                          \
         TORCH_CHECK(false, "Sparse MLA decode currently supports only bfloat16 query"); \
-    }                                                                                           \
+    }                                                                                   \
   } while (0)
 
 }  // namespace

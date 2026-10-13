@@ -202,6 +202,85 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> mha_fwd(
       dispatch = head_dim == 64 ? &dispatch_xe35_prefill_nopage_64 : &dispatch_xe35_prefill_nopage_128;
     }
   }
+
+  // num_kv_splits semantics (host-side scalar, no D2H sync):
+  //   -1 or 1 -> split-KV disabled, use the non-split FMHAKernel
+  //         0 -> auto: pick a split count from the device-occupancy heuristic
+  //        >1 -> use the caller-provided split count with SplitKernel + ReduceKernel
+  if (num_kv_splits == 0 && max_seqlen_q == 1 && !is_fp8 && !sinks_.has_value()) {
+    auto get_num_splits = [](int batch_size, int num_heads_kv, int max_seqlen_k, bool is_paged) {
+      const int cur_parallel_d = batch_size * num_heads_kv;
+
+      // 1. When hardware concurrency is already saturated (BS * Hkv >= 64, e.g. BS>=8, Hkv>=8),
+      // do NOT split. Running a single kernel avoids reduction and redundant memory traffic,
+      // hitting peak bandwidth (850 GB/s ~ 1.05+ TB/s).
+      if (cur_parallel_d >= 64) {
+        return 1;
+      }
+
+      // 2. Short sequences (< 1024 tokens) have too little work to amortize split-reduction overhead.
+      if (max_seqlen_k < 1024) {
+        return 1;
+      }
+
+      const int total_blocks = (max_seqlen_k + 63) / 64;
+
+      // 3. For small batch (BS == 1):
+      // Concurrency is starved (only Hkv workgroups). Launch splits to utilize Xe-cores.
+      if (batch_size == 1) {
+        if (max_seqlen_k >= 8192) {
+          return std::min(16, total_blocks);
+        } else if (max_seqlen_k >= 4096) {
+          return std::min(8, total_blocks);
+        } else if (max_seqlen_k >= 2048) {
+          return std::min(4, total_blocks);
+        } else {
+          return is_paged ? std::min(2, total_blocks) : std::min(4, total_blocks);
+        }
+      }
+
+      // 4. For BS * Hkv <= 16 (e.g. BS=2 with Hkv=8):
+      if (cur_parallel_d <= 16) {
+        if (max_seqlen_k >= 8192) {
+          return is_paged ? std::min(4, total_blocks) : 1;
+        } else if (max_seqlen_k >= 4096) {
+          return std::min(8, total_blocks);
+        } else if (max_seqlen_k >= 2048) {
+          return is_paged ? std::min(4, total_blocks) : std::min(8, total_blocks);
+        } else {
+          return is_paged ? std::min(2, total_blocks) : std::min(4, total_blocks);
+        }
+      }
+
+      // 5. For 16 < BS * Hkv < 64 (e.g. BS=4 with Hkv=8, cur_parallel_d=32):
+      if (cur_parallel_d < 64) {
+        if (is_paged) {
+          if (max_seqlen_k >= 4096) {
+            return std::min(2, total_blocks);
+          } else if (max_seqlen_k >= 2048) {
+            return std::min(4, total_blocks);
+          } else {
+            return std::min(2, total_blocks);
+          }
+        } else {
+          // For non-paged mode, long sequences (>= 4096) have high contiguous streaming bandwidth;
+          // reduction buffer write+read reduces effective bandwidth.
+          // Short sequences (< 4096) benefit from splitting to improve compute/occupancy.
+          if (max_seqlen_k >= 4096) {
+            return 1;
+          } else {
+            return std::min(4, total_blocks);
+          }
+        }
+      }
+
+      return 1;
+    };
+    int effective_seqlen_k = max_seqlen_k > 0
+                                 ? max_seqlen_k
+                                 : (is_paged ? num_pages_per_seq * page_size : static_cast<int>(k.size(0) / batch));
+    num_kv_splits = get_num_splits(batch, num_heads_kv, effective_seqlen_k, is_paged);
+  }
   dispatch(
       q,
       k_pool,
@@ -226,7 +305,8 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> mha_fwd(
       window_size_left,
       window_size_right,
       sm_sink,
-      sinks_.has_value());
+      sinks_.has_value(),
+      num_kv_splits);
 
   auto lse = at::zeros({num_heads_q, total_q}, opts.dtype(at::kFloat));
   auto out_accum = at::Tensor();

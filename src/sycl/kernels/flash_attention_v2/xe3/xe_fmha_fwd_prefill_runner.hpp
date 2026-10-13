@@ -29,7 +29,8 @@ inline void run_xe35_prefill(
     int window_size_left,
     int window_size_right,
     const cutlass::bfloat16_t* sm_sink,
-    bool use_sink) {
+    bool use_sink,
+    int num_kv_splits = 1) {
   dispatch_xe3_kernel<HeadDim, false, Paged, Element, cutlass::bfloat16_t>(
       q_dense,
       k_pool,
@@ -54,7 +55,8 @@ inline void run_xe35_prefill(
       window_size_left,
       window_size_right,
       sm_sink,
-      use_sink);
+      use_sink,
+      num_kv_splits);
 }
 
 }  // namespace xe35_fmha

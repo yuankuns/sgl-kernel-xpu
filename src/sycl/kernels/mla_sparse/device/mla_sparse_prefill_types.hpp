@@ -373,10 +373,8 @@ inline void runMlaSparsePrefillImpl(
   // Config-level invariants (formerly checked in the deleted launch_..._policy):
   // the resolved config fixes D_QK / D_V, and the gathered tile width must equal
   // topk + extra_topk (extra_topk == 0 for prefill).
-  TORCH_CHECK(
-      params.kernel.shape.d_qk == MlaSparsePrefillXeType::D_QK, "Invalid d_qk for this kernel instantiation");
-  TORCH_CHECK(
-      params.kernel.shape.d_v == MlaSparsePrefillXeType::D_V, "d_v must match MlaSparseDecodeXe::D_V");
+  TORCH_CHECK(params.kernel.shape.d_qk == MlaSparsePrefillXeType::D_QK, "Invalid d_qk for this kernel instantiation");
+  TORCH_CHECK(params.kernel.shape.d_v == MlaSparsePrefillXeType::D_V, "d_v must match MlaSparseDecodeXe::D_V");
   TORCH_CHECK(
       params.kernel.shape.gathered_topk == params.kernel.shape.topk + params.kernel.shape.extra_topk,
       "gathered_topk must equal topk + extra_topk");
@@ -451,8 +449,7 @@ inline void runMlaSparsePrefill(
   // widens for 576. q and kv must agree on d_qk since kv is the gathered K source.
   // D_QK is a compile-time template param dispatched by the op; the query head dim must
   // match it.
-  TORCH_CHECK(
-      q.size(2) == D_QK, "sparse MLA prefill q head dim must match the dispatched D_QK, got ", q.size(2));
+  TORCH_CHECK(q.size(2) == D_QK, "sparse MLA prefill q head dim must match the dispatched D_QK, got ", q.size(2));
   TORCH_CHECK(
       kv.size(2) == q.size(2),
       "sparse MLA prefill requires kv head dim to match q head dim, got kv ",

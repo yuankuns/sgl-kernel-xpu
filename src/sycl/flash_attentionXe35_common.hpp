@@ -10,6 +10,7 @@
 #include <cute/tensor.hpp>
 #include <cutlass/kernel_hardware_info.hpp>
 #include <cutlass/util/GPU_Clock.hpp>
+#include <limits>
 #include <optional>
 #include <type_traits>
 
@@ -20,6 +21,7 @@
 #include "kernels/flash_attention_v2/xe3/collective/xe_fmha_fwd_epilogue.hpp"
 #include "kernels/flash_attention_v2/xe3/collective/xe_fmha_fwd_mainloop.hpp"
 #include "kernels/flash_attention_v2/xe3/kernel/xe_fmha_fwd_kernel.hpp"
+#include "kernels/flash_attention_v2/xe3/kernel/xe_reduce_split_k.hpp"
 #include "kernels/flash_attention_v2/xe3/kernel/xe_tile_scheduler.hpp"
 
 #define SYCL_INTEL_TARGET 35
@@ -27,6 +29,35 @@
 using namespace cute;
 
 namespace xe35_fmha {
+
+namespace detail {
+struct SplitKVCache {
+  at::Tensor temp_out;
+  at::Tensor exp_sums;
+  at::Tensor max_logits;
+
+  void
+  ensure(int64_t out_elts, int64_t lse_elts, const at::TensorOptions& out_opts, const at::TensorOptions& lse_opts) {
+    if (!temp_out.defined() || temp_out.numel() < out_elts || temp_out.dtype() != out_opts.dtype() ||
+        temp_out.device() != out_opts.device()) {
+      temp_out = at::empty({out_elts}, out_opts);
+    }
+    if (!exp_sums.defined() || exp_sums.numel() < lse_elts || exp_sums.dtype() != lse_opts.dtype() ||
+        exp_sums.device() != lse_opts.device()) {
+      exp_sums = at::empty({lse_elts}, lse_opts);
+    }
+    if (!max_logits.defined() || max_logits.numel() < lse_elts || max_logits.dtype() != lse_opts.dtype() ||
+        max_logits.device() != lse_opts.device()) {
+      max_logits = at::empty({lse_elts}, lse_opts);
+    }
+  }
+};
+
+inline SplitKVCache& get_split_kv_cache() {
+  thread_local SplitKVCache cache;
+  return cache;
+}
+}  // namespace detail
 
 template <class Element, class OutputElement = Element>
 struct Xe3FmhaConfig {
@@ -78,7 +109,8 @@ struct Xe3FmhaConfig {
       float softmax_scale,
       int window_size_left,
       int window_size_right,
-      const ElementInput* sm_sink) {
+      const ElementInput* sm_sink,
+      int num_kv_splits = 1) {
     static constexpr bool BlockScale = false;
     static constexpr bool F8kvF16mma = false;
     static constexpr bool PerTensorScale = sizeof_bits_v<ElementInput> == 8;
@@ -143,6 +175,11 @@ struct Xe3FmhaConfig {
     using Scheduler = cutlass::fmha::kernel::XeFHMAIndividualTileScheduler<false, false, Causal, GqaFusion>;
     using FMHAKernel =
         cutlass::fmha::kernel::XeFMHAFwdKernel<ProblemShape, CollectiveMainloop, CollectiveEpilogue, Scheduler>;
+    using SplitScheduler = cutlass::fmha::kernel::XeFHMAIndividualTileScheduler<false, false, Causal, true>;
+    using SplitKernel = cutlass::fmha::kernel::
+        XeFMHAFwdKernel<ProblemShape, CollectiveMainloop, CollectiveEpilogue, SplitScheduler, true>;
+    using ReduceKernel = cutlass::reduction::kernel::
+        ReduceSplitK<ProblemShape, cutlass::fmha::kernel::XeReduceSplitKTileScheduler, SplitKernel>;
 
     const int q_seq_stride = static_cast<int>(q_dense.stride(0));
     const int q_head_stride = static_cast<int>(q_dense.stride(1));
@@ -223,6 +260,101 @@ struct Xe3FmhaConfig {
         hw_info,
     };
 
+    if constexpr (std::is_same_v<ElementInput, cutlass::bfloat16_t> && !Sink) {
+      if (num_kv_splits > 1) {
+        TORCH_CHECK(
+            num_kv_splits <= SplitKernel::max_num_kv_splits,
+            "flash_attentionXe35: num_kv_splits exceeds the split-KV kernel limit");
+        const auto shape = arguments.kernel.shape;
+        const int64_t total_out_elts = static_cast<int64_t>(q_dense.size(0)) * num_heads_q * head_dim * num_kv_splits;
+        const int64_t total_lse_elts = static_cast<int64_t>(q_dense.size(0)) * num_heads_q * num_kv_splits;
+        auto& cache = detail::get_split_kv_cache();
+        cache.ensure(total_out_elts, total_lse_elts, out_dense.options(), q_dense.options().dtype(at::kFloat));
+        auto temp_out = cache.temp_out.narrow(0, 0, total_out_elts);
+        auto exp_sums = cache.exp_sums.narrow(0, 0, total_lse_elts);
+        auto max_logits = cache.max_logits.narrow(0, 0, total_lse_elts);
+
+        auto split_stride_o = cutlass::make_cute_packed_stride(
+            typename SplitKernel::StrideO{},
+            cute::make_shape(max_seqlen_q, head_dim, num_heads_q * num_kv_splits, batch));
+        auto split_stride_lse = cutlass::make_cute_packed_stride(
+            typename SplitKernel::StrideO{}, cute::make_shape(max_seqlen_q, num_kv_splits, num_heads_q, batch));
+
+        typename SplitKernel::Arguments split_arguments{
+            {shape,
+             static_cast<const ElementInput*>(q_dense.data_ptr()),  // Q
+             stride_q,                                              // dQ
+             static_cast<const ElementInput*>(k_pool.data_ptr()),   // K
+             stride_k,                                              // dK
+             static_cast<const ElementInput*>(v_pool.data_ptr()),   // V
+             stride_v,                                              // dV
+             static_cast<ElementOutput*>(temp_out.data_ptr()),      // O
+             stride_o,                                              // dO
+             nullptr,                                               // scaleQ
+             {},                                                    // dScaleQ
+             nullptr,                                               // scaleK
+             {},                                                    // dScaleK
+             nullptr,                                               // scaleV
+             {},                                                    // dScaleV
+             q_descale,                                             // scale_q
+             k_descale,                                             // scale_k
+             v_descale,                                             // scale_v
+             32,                                                    // group_size
+             static_cast<const ElementInput*>(k_pool.data_ptr()),   // K_cache
+             stride_k,                                              // dK_cache
+             static_cast<const ElementInput*>(v_pool.data_ptr()),   // V_cache
+             stride_v,                                              // dV_cache
+             nullptr,                                               // sm_sink
+             static_cast<ElementOutput*>(temp_out.data_ptr()),      // Oaccum
+             split_stride_o,                                        // dOaccum
+             exp_sums.data_ptr<float>(),                            // exp_sums
+             split_stride_lse,                                      // dExp_sums
+             max_logits.data_ptr<float>(),                          // max_logits
+             split_stride_lse},                                     // dMax_logits
+            arguments.mainloop,
+            arguments.epilogue,
+            hw_info,
+            num_kv_splits};
+        typename ReduceKernel::Arguments reduce_arguments{
+            {shape,
+             static_cast<ElementOutput*>(out_dense.data_ptr()),
+             stride_o,
+             static_cast<const ElementOutput*>(temp_out.data_ptr()),
+             stride_o,
+             exp_sums.data_ptr<float>(),
+             stride_o,
+             max_logits.data_ptr<float>(),
+             stride_o,
+             window_size_left},
+            hw_info,
+            num_kv_splits};
+
+        typename SplitKernel::Params split_params = SplitKernel::to_underlying_arguments(split_arguments, nullptr);
+        typename ReduceKernel::Params reduce_params = ReduceKernel::to_underlying_arguments(reduce_arguments, nullptr);
+        namespace syclex = sycl::ext::oneapi::experimental;
+        namespace intelex = sycl::ext::intel::experimental;
+        auto launch_split = [&](auto kernel_tag, auto params) {
+          using Kernel = decltype(kernel_tag);
+          compat::dim3 const block = Kernel::get_block_shape();
+          compat::dim3 const grid = Kernel::get_grid_shape(params);
+          compat::experimental::launch_properties launch_props{
+              syclex::work_group_scratch_size(Kernel::SharedStorageSize)};
+          compat::experimental::kernel_properties kernel_props{
+              syclex::sub_group_size<cute::intel::sg_size>, intelex::grf_size<512>};
+          compat::experimental::launch_policy policy{
+              compat::dim3(grid.x, grid.y, grid.z),
+              compat::dim3(block.x, block.y, block.z),
+              launch_props,
+              kernel_props};
+          return compat::experimental::launch<cutlass::device_kernel<Kernel>, Kernel, false>(
+              policy, at::xpu::getCurrentXPUStream().queue(), params);
+        };
+        launch_split(SplitKernel{}, split_params);
+        launch_split(ReduceKernel{}, reduce_params);
+        return;
+      }
+    }
+
     TORCH_CHECK(FMHAKernel::can_implement(arguments), "flash_attentionXe35: invalid cutlass FMHA arguments");
 
     size_t workspace_size = FMHAKernel::get_workspace_size(arguments);
@@ -280,7 +412,8 @@ void dispatch_xe3_kernel(
     int window_size_left,
     int window_size_right,
     const cutlass::bfloat16_t* sm_sink,
-    bool use_sink) {
+    bool use_sink,
+    int num_kv_splits = 1) {
   const int gqa_group = num_heads_kv > 0 ? num_heads_q / num_heads_kv : 1;
   const int total_rows = gqa_group * max_seqlen_q;
 
@@ -309,7 +442,8 @@ void dispatch_xe3_kernel(
       softmax_scale,                                                                                               \
       window_size_left,                                                                                            \
       window_size_right,                                                                                           \
-      SINKPTR)
+      SINKPTR,                                                                                                     \
+      num_kv_splits)
 
 #define XE35_RUN(CAUSAL, LOCAL, STAGES, GQA, QK, PV, OUT, SGL)                     \
   do {                                                                             \
@@ -426,7 +560,8 @@ using Xe35DispatchFn = void(
     int,
     int,
     const cutlass::bfloat16_t*,
-    bool);
+    bool,
+    int);
 #pragma once
 
 #include <ATen/ATen.h>
@@ -689,7 +824,8 @@ void dispatch_xe3_kernel(
     int window_size_left,
     int window_size_right,
     const cutlass::bfloat16_t* sm_sink,
-    bool use_sink) {
+    bool use_sink,
+    int num_kv_splits = 1) {
   const int gqa_group = num_heads_kv > 0 ? num_heads_q / num_heads_kv : 1;
   const int total_rows = gqa_group * max_seqlen_q;
   const bool use_decode = UseDecode;

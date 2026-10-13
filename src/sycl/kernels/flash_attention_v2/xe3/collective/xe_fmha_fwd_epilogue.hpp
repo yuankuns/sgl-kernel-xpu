@@ -200,6 +200,63 @@ class FMHAFwdEpilogue {
     copy(copy_o, tOrO, tOgO);
   }
 
+  template <typename QVCoord, typename FragSPRow, typename TensorLSE2D>
+  CUTLASS_DEVICE void operator()(
+      TensorO2D const& O,
+      FragA& tArA,
+      FragARow& tA_max,
+      FragSPRow& tA_sum,
+      QVCoord blk_qv,
+      int thr_id,
+      const TensorLSE2D& exp_sums,
+      const TensorLSE2D& max_logits,
+      int idx_kv_split,
+      int head_group_q,
+      int num_kv_splits,
+      bool is_single_split,
+      float v_scale = 1.0f) {
+    using namespace cute;
+    using ElementA = typename FragA::element_type;
+    auto tA_sum_full = reduce<0, ReduceMode::Horizontal>(tA_sum, sycl::plus<void>{});
+    auto [rA, rA_max, rA_sum, active] = reduce_A(tArA, tA_max, tA_sum_full, thr_id);
+    if (thr_id < head_group_q) {
+      if (is_single_split) {
+        exp_sums(thr_id, idx_kv_split) = ElementA(1);
+        max_logits(thr_id, idx_kv_split) = ElementA(0);
+        for (int s = 1; s < num_kv_splits; ++s) {
+          exp_sums(thr_id, s) = ElementA(0);
+        }
+      } else if (num_kv_splits > 1) {
+        exp_sums(thr_id, idx_kv_split) = rA_sum(0);
+        max_logits(thr_id, idx_kv_split) = rA_max(0);
+      }
+    }
+    if (!active) return;
+    if (is_single_split || num_kv_splits <= 1) {
+      CUTLASS_PRAGMA_UNROLL
+      for (int i = 0; i < rA_sum.size(); ++i) {
+        rA_sum(i) = ElementA(v_scale) / rA_sum(i);
+      }
+      CUTLASS_PRAGMA_UNROLL
+      for (int i = 0; i < rA.size(); ++i) {
+        rA(i) *= broadcast<0>(rA_sum, rA, i);
+      }
+    }
+
+    Tensor cO = make_identity_tensor(O.shape());
+    Tensor gO = local_tile(cO, TileShapeO{}, blk_qv);
+    TiledCopyO copy_o{O};
+    auto thr_copy_o = copy_o.get_slice(thr_id);
+    auto tOrO = thr_copy_o.partition_sg_fragment_S(gO);
+    auto tOgO = thr_copy_o.partition_D(gO);
+    CUTLASS_PRAGMA_UNROLL
+    for (int i = 0; i < rA.size(); ++i) {
+      ElementA value = rA(i);
+      tOrO(i) = static_cast<ElementO>(value == value ? value : ElementA(0));
+    }
+    copy(copy_o, tOrO, tOgO);
+  }
+
   // Reduce k-blocks of A and A_sum across WG, if needed.
   // Note that each k block has its own scale factor based on A_max,
   //   so A/A_sum contributions need to be rescaled to match.

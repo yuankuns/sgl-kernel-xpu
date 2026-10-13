@@ -165,14 +165,13 @@ struct MlaSparseDecodeXe {
 
   // Collective mainloop / epilogue + tile scheduler + kernel wrapper, parameterized on
   // the tile geometry above.
-  using CollectiveMainloop =
-      cutlass::flash_attention::collective::XeMlaSparseMainloop<D_QK, IS_FP8_QUERY, TileTraits>;
+  using CollectiveMainloop = cutlass::flash_attention::collective::XeMlaSparseMainloop<D_QK, IS_FP8_QUERY, TileTraits>;
   using CollectiveEpilogue = cutlass::flash_attention::collective::
       XeMlaSparseEpilogue<CollectiveMainloop, HAS_ATTN_SINK, HAS_MAX_LOGITS, IS_SPLIT_KV>;
   using TileScheduler = cutlass::flash_attention::kernel::XeMlaSparseIndividualTileScheduler<B_H_, V_SPLIT_>;
 
-  using DenseKernel = cutlass::flash_attention::kernel::
-      XeMlaSparseDenseKernel<CollectiveMainloop, CollectiveEpilogue, TileScheduler>;
+  using DenseKernel =
+      cutlass::flash_attention::kernel::XeMlaSparseDenseKernel<CollectiveMainloop, CollectiveEpilogue, TileScheduler>;
 
   // Stage-3 split-K reduction companion, present only under IS_SPLIT_KV. It derives
   // everything (geometry, element type, HAS_ATTN_SINK / HAS_MAX_LOGITS, kvMaxSplits) from

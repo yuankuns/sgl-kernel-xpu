@@ -850,7 +850,9 @@ struct FMHAFwdMainloop<
             for (int i = 0; i < tSrS.size(); ++i) {
               int row_idx = get<0>(cS_thread(i));
               int col_idx = get<1>(cS_thread(i));
-              if (col_idx > full_tile_offset + row_idx) {
+              int row_q_idx =
+                  (GqaFusion && gqa_fusion_q_per_head > 0) ? ((q_pos_base + row_idx) % gqa_fusion_q_per_head) : row_idx;
+              if (col_idx > full_tile_offset + row_q_idx) {
                 tSrS(i) = ElementS(-INFINITY);
               }
             }
