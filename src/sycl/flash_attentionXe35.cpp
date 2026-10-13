@@ -164,7 +164,9 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> mha_fwd(
     sm_sink = static_cast<const cutlass::bfloat16_t*>(sinks.data_ptr());
   }
 
-  TORCH_CHECK(head_dim == 64 || head_dim == 128, "flash_attentionXe35: only head_dim 64 and 128 are supported");
+  TORCH_CHECK(
+      head_dim == 64 || head_dim == 128 || (is_paged && head_dim == 256),
+      "flash_attentionXe35: non-paged attention supports head_dim 64 and 128; paged attention also supports 256");
 
   c10::DeviceGuard device_guard(q.device());
   auto opts = is_fp8 ? q.options().dtype(at::kBFloat16) : q.options();

@@ -459,6 +459,20 @@ void dispatch_xe3_kernel(
     }                                                                              \
   } while (false)
 
+  if constexpr (HeadDim == 256) {
+    using ShapeQK = Shape<_128, _64, _64>;
+    using ShapePV = Shape<_128, _64, _64>;
+    using ShapeOut = Shape<_128, _256>;
+    using SubgroupLayoutQK = Layout<Shape<_8, _1, _1>>;
+    if (is_local)
+      XE35_RUN(false, true, 2, false, ShapeQK, ShapePV, ShapeOut, SubgroupLayoutQK);
+    else if (is_causal)
+      XE35_RUN(true, false, 2, false, ShapeQK, ShapePV, ShapeOut, SubgroupLayoutQK);
+    else
+      XE35_RUN(false, false, 2, false, ShapeQK, ShapePV, ShapeOut, SubgroupLayoutQK);
+    return;
+  }
+
   if constexpr (HeadDim == 128) {
     if constexpr (UseDecode) {
       using ShapeQK = Shape<_128, _64, _64>;
@@ -532,7 +546,7 @@ void dispatch_xe3_kernel(
 #undef XE35_RUN
 #undef XE35_INVOKE
 
-  TORCH_CHECK(false, "flash_attentionXe35: only head_dim 64 and 128 are supported in Xe3 cutlass path");
+  TORCH_CHECK(false, "flash_attentionXe35: only head_dim 64, 128, and 256 are supported in Xe3 cutlass path");
 }
 
 }  // namespace xe35_fmha

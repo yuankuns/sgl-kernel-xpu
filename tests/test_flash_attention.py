@@ -1946,7 +1946,7 @@ def test_flash_attn_with_kvcache_out_buffer():
 )
 @pytest.mark.skipif(not is_cri_device(), reason="Requires a CRI (Xe3P) device")
 @pytest.mark.parametrize("fp8_dtype", [torch.float8_e4m3fn, torch.float8_e5m2])
-@pytest.mark.parametrize("head_dim", [64, 128])
+@pytest.mark.parametrize("head_dim", [64, 128, 256])
 @pytest.mark.parametrize("seqlen_q", [1, 16])
 @pytest.mark.parametrize("bf16_q_input", [False, True])
 def test_flash_attention_xe3_fp8_full_qkv(fp8_dtype, head_dim, seqlen_q, bf16_q_input):

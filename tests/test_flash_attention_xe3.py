@@ -161,7 +161,7 @@ def is_cri_device() -> bool:
 @pytest.mark.parametrize("nheads_q,nheads_kv", [(4, 2)])
 @pytest.mark.parametrize("causal,local", [(False, False), (False, True), (True, False)])
 @pytest.mark.parametrize("use_sinks", [False, True])
-@pytest.mark.parametrize("head_dim", [64, 128])
+@pytest.mark.parametrize("head_dim", [64, 128, 256])
 @pytest.mark.parametrize("seqlen_q", [1, 128])
 @pytest.mark.parametrize("seqlen_k", [128])
 @pytest.mark.parametrize("page_size", [128, 64])
