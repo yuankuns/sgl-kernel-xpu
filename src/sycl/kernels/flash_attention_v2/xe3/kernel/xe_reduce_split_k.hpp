@@ -36,6 +36,7 @@ class ReduceSplitK {
     const ElementLSE* max_logits;
     StrideO dMax_logits;
     int window_size_left = -1;
+    float scale_v = 1.0f;
   };
   using KernelParams = KernelArguments;
 
@@ -159,7 +160,7 @@ class ReduceSplitK {
         global_sum += local_rescale[split] * s;
         local_rescale[split] = s;
       }
-      ElementLSE inv_global_sum = global_sum > 0 ? (ElementLSE(1) / global_sum) : ElementLSE(0);
+      ElementLSE inv_global_sum = global_sum > 0 ? (ElementLSE(p.scale_v) / global_sum) : ElementLSE(0);
       for (int split = 0; split < active_splits; ++split) {
         local_rescale[split] *= inv_global_sum;
       }

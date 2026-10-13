@@ -377,7 +377,10 @@ class XeFMHAFwdKernel {
           0,
           gqa_fusion_q_per_head,
           K_cache(_, _, head, l_coord),
-          V_cache(_, _, head, l_coord));
+          V_cache(_, _, head, l_coord),
+          p.scale_q,
+          p.scale_k,
+          p.scale_v);
       if constexpr (!is_empty_v<MainloopSharedStorage> && !is_empty_v<EpilogueSharedStorage>) {
         sycl::group_barrier(get_work_group<3>());
       }

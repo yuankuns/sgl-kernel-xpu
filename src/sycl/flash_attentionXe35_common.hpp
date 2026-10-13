@@ -260,7 +260,7 @@ struct Xe3FmhaConfig {
         hw_info,
     };
 
-    if constexpr (std::is_same_v<ElementInput, cutlass::bfloat16_t> && !Sink) {
+    if constexpr (!Sink) {
       if (num_kv_splits > 1) {
         TORCH_CHECK(
             num_kv_splits <= SplitKernel::max_num_kv_splits,
@@ -325,7 +325,8 @@ struct Xe3FmhaConfig {
              stride_o,
              max_logits.data_ptr<float>(),
              stride_o,
-             window_size_left},
+             window_size_left,
+             v_descale},
             hw_info,
             num_kv_splits};
 
