@@ -11,6 +11,7 @@
 #include <sycl/sycl.hpp>
 #include <vector>
 
+#include "FusedQKNormRopeXe35.h"
 #include "MemoryAccess.h"
 #include "Norm.h"
 #include "SYCLHelpers.h"
@@ -291,6 +292,14 @@ void fused_qk_norm_rope(
   auto queue = dpcppGetCurrentQueue();
   bool interleave = !is_neox;
 
+  // The Xe35 wide-access kernel is tuned for the two 16-bit types. Preserve
+  // the existing implementation for FP8 and for small shapes where its finer
+  // one-head-per-subgroup decomposition has better occupancy.
+  const int wide_lanes_per_head = static_cast<int>(head_dim) / (32 / static_cast<int>(qkv.element_size()));
+  const bool use_xe35_wide =
+      qkv.element_size() == 2 && !fused_qk_norm_rope_xe35::prefer_baseline(
+                                     num_tokens, static_cast<int>(num_heads_q + num_heads_k), wide_lanes_per_head);
+
 // Maps at::ScalarType to the corresponding SYCL/cutlass C++ type (scalar_t)
 // and immediately invokes the callable passed as the variadic argument.
 // Float8_e4m3fn uses the cutlass type because native SYCL float8 is not yet
@@ -341,26 +350,65 @@ void fused_qk_norm_rope(
                                      queue);                                     \
                                }))
 
+#define LAUNCH_XE35_KERNEL(HD, IL)                                                      \
+  SYCL_DISPATCH_FLOATING_TYPES(qkv.scalar_type(), "fused_qk_norm_rope", ([&]() {        \
+                                 fused_qk_norm_rope_xe35::launch<scalar_t, HD, IL>(     \
+                                     static_cast<scalar_t*>(qkv.data_ptr()),            \
+                                     static_cast<int>(num_tokens),                      \
+                                     static_cast<int>(num_heads_q),                     \
+                                     static_cast<int>(num_heads_k),                     \
+                                     static_cast<int>(num_heads_v),                     \
+                                     static_cast<float>(eps),                           \
+                                     static_cast<const scalar_t*>(q_weight.data_ptr()), \
+                                     static_cast<const scalar_t*>(k_weight.data_ptr()), \
+                                     static_cast<float>(base),                          \
+                                     position_ids.data_ptr<int>(),                      \
+                                     static_cast<float>(factor),                        \
+                                     static_cast<float>(low),                           \
+                                     static_cast<float>(high),                          \
+                                     static_cast<float>(attention_factor),              \
+                                     static_cast<int>(rotary_dim),                      \
+                                     queue);                                            \
+                               }))
+
   switch (head_dim) {
     case 64:
       if (interleave) {
-        LAUNCH_KERNEL(64, true);
+        if (use_xe35_wide)
+          LAUNCH_XE35_KERNEL(64, true);
+        else
+          LAUNCH_KERNEL(64, true);
       } else {
-        LAUNCH_KERNEL(64, false);
+        if (use_xe35_wide)
+          LAUNCH_XE35_KERNEL(64, false);
+        else
+          LAUNCH_KERNEL(64, false);
       }
       break;
     case 128:
       if (interleave) {
-        LAUNCH_KERNEL(128, true);
+        if (use_xe35_wide)
+          LAUNCH_XE35_KERNEL(128, true);
+        else
+          LAUNCH_KERNEL(128, true);
       } else {
-        LAUNCH_KERNEL(128, false);
+        if (use_xe35_wide)
+          LAUNCH_XE35_KERNEL(128, false);
+        else
+          LAUNCH_KERNEL(128, false);
       }
       break;
     case 256:
       if (interleave) {
-        LAUNCH_KERNEL(256, true);
+        if (use_xe35_wide)
+          LAUNCH_XE35_KERNEL(256, true);
+        else
+          LAUNCH_KERNEL(256, true);
       } else {
-        LAUNCH_KERNEL(256, false);
+        if (use_xe35_wide)
+          LAUNCH_XE35_KERNEL(256, false);
+        else
+          LAUNCH_KERNEL(256, false);
       }
       break;
     default:
@@ -368,6 +416,7 @@ void fused_qk_norm_rope(
   }
 
 #undef LAUNCH_KERNEL
+#undef LAUNCH_XE35_KERNEL
 #undef SYCL_DISPATCH_FLOATING_TYPES
 }
 

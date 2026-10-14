@@ -1,10 +1,45 @@
 import itertools
+import json
 import os
+import statistics
+import tempfile
+from pathlib import Path
 
 import pandas as pd
 import torch
+import torch.nn.functional as F
 import triton
 from sgl_kernel import fused_qk_norm_rope
+
+
+def profile_fused_qk_norm_rope(fn, samples=16):
+    for _ in range(3):
+        fn()
+    torch.xpu.synchronize()
+    with torch.profiler.profile(
+        activities=[
+            torch.profiler.ProfilerActivity.CPU,
+            torch.profiler.ProfilerActivity.XPU,
+        ]
+    ) as profiler:
+        for _ in range(samples):
+            fn()
+        torch.xpu.synchronize()
+    with tempfile.TemporaryDirectory() as directory:
+        trace_path = Path(directory) / "trace.json"
+        profiler.export_chrome_trace(str(trace_path))
+        events = json.loads(trace_path.read_text())["traceEvents"]
+    kernels = [event for event in events if event.get("cat") == "kernel"]
+    names = sorted({event.get("name", "") for event in kernels})
+    if len(kernels) != samples:
+        raise RuntimeError(
+            f"expected {samples} QK/RoPE kernel events, "
+            f"found {len(kernels)}: {names}"
+        )
+    print(f"QK/RoPE profiler kernel names: {names}")
+    durations = [event["dur"] / 1000 for event in kernels]
+    return statistics.median(durations), min(durations), max(durations)
+
 
 # Supported dtypes and their properties
 DTYPE_MAP = {
@@ -196,29 +231,68 @@ for batch_size, seq_len, (nq, nk, nv, hd), is_neox, dtype in itertools.product(
 ):
     configs.append((batch_size, seq_len, nq, nk, nv, hd, is_neox, dtype))
 
+muse_spark_mode = os.environ.get("MUSE_SPARK", "0") == "1"
+if muse_spark_mode:
+    for name, required in (
+        ("BATCHES", "8"),
+        ("ISL", "4096"),
+        ("OSL", "16"),
+        ("TP", "1"),
+        ("EP", "1"),
+    ):
+        if os.environ.get(name, required) != required:
+            raise ValueError(f"Muse-Spark serving workload requires {name}={required}")
+    configs = [
+        (batch_size, seq_len, 128, 16, 16, 64, False, "bf16")
+        for batch_size, seq_len in itertools.product([8], [4096])
+    ]
+default_providers = "muse_spark_unfused,sglang" if muse_spark_mode else "torch,sglang"
 all_results = []
+providers = [
+    p.strip()
+    for p in os.environ.get("PROVIDERS", default_providers).split(",")
+    if p.strip()
+]
+
 
 # Support running the benchmark in "chunked" mode by setting environment variables:
 # - NUM_CHUNKS: total number of chunks
 # - CHUNK_IDX: index of this chunk (0-based)
 num_chunks = int(os.environ.get("NUM_CHUNKS", "1"))
 chunk_idx = int(os.environ.get("CHUNK_IDX", "0"))
-# Support selecting a single config via env var SINGLE_CONFIG with CSV:
+# Support selecting explicit configs via env var SINGLE_CONFIG with CSV:
 # "batch_size,seq_len,nq,nk,nv,head_dim,is_neox,dtype"
+# Multiple configs may be given, separated by ";".
 single_cfg = os.environ.get("SINGLE_CONFIG", "")
 if single_cfg:
-    parts = [p.strip() for p in single_cfg.split(",")]
-    if len(parts) != 8:
-        raise RuntimeError("SINGLE_CONFIG must have 8 comma-separated fields")
-    bsz = int(parts[0])
-    sl = int(parts[1])
-    nq = int(parts[2])
-    nk = int(parts[3])
-    nv = int(parts[4])
-    hd = int(parts[5])
-    is_neox_val = parts[6].lower() in ("1", "true", "yes")
-    dtype_val = parts[7]
-    configs = [(bsz, sl, nq, nk, nv, hd, is_neox_val, dtype_val)]
+    selected = []
+    for entry in single_cfg.split(";"):
+        entry = entry.strip()
+        if not entry:
+            continue
+        parts = [p.strip() for p in entry.split(",")]
+        if len(parts) != 8:
+            raise RuntimeError(
+                "SINGLE_CONFIG entries must have 8 comma-separated fields"
+            )
+        bsz = int(parts[0])
+
+        sl = int(parts[1])
+        nq = int(parts[2])
+        nk = int(parts[3])
+        nv = int(parts[4])
+        hd = int(parts[5])
+        is_neox_val = parts[6].lower() in ("1", "true", "yes")
+        dtype_val = parts[7]
+        config = (bsz, sl, nq, nk, nv, hd, is_neox_val, dtype_val)
+        if muse_spark_mode and config != (8, 4096, 128, 16, 16, 64, False, "bf16"):
+            raise ValueError(
+                "Muse-Spark requires B8 ISL4096 OSL16 TP1 EP1 BF16 QK configuration"
+            )
+        selected.append(config)
+    if not selected:
+        raise RuntimeError("SINGLE_CONFIG was set but contained no config")
+    configs = selected
     num_chunks = 1
     chunk_idx = 0
 if num_chunks > 1:
@@ -272,16 +346,14 @@ def calculate_effective_bandwidth(
     Memory: read/write QKV tensor + read weights
     """
     num_tokens = batch_size * seq_len
-    num_heads = num_heads_q + num_heads_k + num_heads_v
-
-    # Input/output QKV tensor
-    qkv_bytes = num_tokens * num_heads * head_dim * bytes_per_elem
+    # The V/tail portion determines the row stride but is not read or written.
+    qk_bytes = num_tokens * (num_heads_q + num_heads_k) * head_dim * bytes_per_elem
 
     # Weight tensors
     weight_bytes = 2 * head_dim * bytes_per_elem  # q_weight + k_weight
 
-    # Total bytes (read QKV + write QKV + read weights)
-    total_bytes = 2 * qkv_bytes + weight_bytes
+    # Total bytes (read Q/K + write Q/K + read weights)
+    total_bytes = 2 * qk_bytes + weight_bytes
 
     time_s = time_ms / 1000.0
     bandwidth_gbs = (total_bytes / 1e9) / time_s
@@ -314,9 +386,11 @@ def calculate_effective_bandwidth(
         ],
         x_vals=configs,
         line_arg="provider",
-        line_vals=["torch", "sglang"],
-        line_names=["PyTorch", "SGL Kernel"],
-        styles=[("blue", "-"), ("green", "-")],
+        line_vals=providers,
+        line_names=providers,
+        styles=[("blue", "-"), ("green", "-"), ("red", "-"), ("orange", "-")][
+            : len(providers)
+        ],
         ylabel="us",
         plot_name="fused-qk-norm-rope-performance",
         args={},
@@ -365,22 +439,102 @@ def benchmark(
         q_weight = torch.randn(head_dim, device=device, dtype=torch_dtype)
         k_weight = torch.randn(head_dim, device=device, dtype=torch_dtype)
 
-    position_ids = torch.arange(num_tokens, device=device, dtype=torch.int32)
+    position_ids = (
+        torch.arange(seq_len, device=device, dtype=torch.int32).repeat(batch_size)
+        if muse_spark_mode
+        else torch.arange(num_tokens, device=device, dtype=torch.int32)
+    )
 
-    eps = 1e-6
-    base = 10000.0
+    if muse_spark_mode:
+        if dtype != "bf16" or head_dim != 64 or is_neox:
+            raise RuntimeError(
+                "MUSE_SPARK=1 requires bf16, head_dim=64, and is_neox=False"
+            )
+        eps = 1e-5
+        base = 500000.0
+        scale_query_by = 43.7840518911 / (head_dim**0.5)
+        q_weight.fill_(scale_query_by)
+        k_weight.fill_(1.0)
+    else:
+        eps = 1e-6
+        base = 10000.0
     rotary_dim = head_dim
 
     quantiles = [0.5, 0.2, 0.8]
 
-    if provider == "torch":
+    if provider == "muse_spark_unfused":
+        if not muse_spark_mode:
+            raise RuntimeError("provider=muse_spark_unfused requires MUSE_SPARK=1")
+
+        # Exact pre-fusion Muse Spark path:
+        #   _per_head_norm(Q/K) -> Q scalar scale
+        #   -> RotaryEmbedding.forward_xpu()
+        # head_dim=64 dispatches RoPE to torch.ops.sgl_kernel.rotary_embedding.
+        inv_freq = 1.0 / (
+            base ** (torch.arange(0, rotary_dim, 2, dtype=torch.float32) / rotary_dim)
+        )
+        positions = torch.arange(32768, dtype=torch.float32)
+        freqs = torch.outer(positions, inv_freq)
+        cos_sin_cache = torch.cat((freqs.cos(), freqs.sin()), dim=-1).to(
+            device=device, dtype=torch_dtype
+        )
+        rope_positions = position_ids.to(torch.long)
+
+        def muse_spark_unfused():
+            q_size = num_heads_q * head_dim
+            k_size = num_heads_k * head_dim
+            q = qkv[:, :q_size]
+            k = qkv[:, q_size : q_size + k_size]
+            q = (
+                F.rms_norm(q.reshape(-1, head_dim), (head_dim,), None, eps)
+                .reshape_as(q)
+                .to(torch_dtype)
+                * scale_query_by
+            )
+            k = (
+                F.rms_norm(k.reshape(-1, head_dim), (head_dim,), None, eps)
+                .reshape_as(k)
+                .to(torch_dtype)
+            )
+            torch.ops.sgl_kernel.rotary_embedding(
+                rope_positions,
+                q,
+                k,
+                head_dim,
+                cos_sin_cache,
+                is_neox,
+            )
+
+        fn = muse_spark_unfused
+    elif provider == "torch_cached":
+        inv_freq = compute_inv_freq_yarn(
+            head_dim, rotary_dim, base, 1.0, 1.0, 1.0, device
+        )
+        freqs = torch.outer(position_ids.to(torch.float32), inv_freq)
+        cos_cache = freqs.cos()
+        sin_cache = freqs.sin()
+
+        def torch_cached():
+            view = qkv.view(num_tokens, num_heads, head_dim)
+            q = view[:, :num_heads_q, :]
+            k = view[:, num_heads_q : num_heads_q + num_heads_k, :]
+            q = apply_rotary_emb_native(
+                llama_rms_norm(q, q_weight, eps), cos_cache, sin_cache, is_neox
+            )
+            k = apply_rotary_emb_native(
+                llama_rms_norm(k, k_weight, eps), cos_cache, sin_cache, is_neox
+            )
+            view[:, :num_heads_q, :] = q
+            view[:, num_heads_q : num_heads_q + num_heads_k, :] = k
+
+        fn = torch_cached
+    elif provider == "torch":
         if is_fp8:
-            # PyTorch has no native FP8 compute; upcast to float32 for reference
             qkv_ref = qkv.to(torch.float32)
             q_weight_ref = q_weight.to(torch.float32)
             k_weight_ref = k_weight.to(torch.float32)
             fn = lambda: fused_qk_norm_rope_reference(
-                qkv_ref.clone(),
+                qkv_ref,
                 num_heads_q,
                 num_heads_k,
                 num_heads_v,
@@ -391,15 +545,11 @@ def benchmark(
                 base,
                 is_neox,
                 position_ids,
-                factor=1.0,
-                low=1.0,
-                high=1.0,
-                attention_factor=1.0,
                 rotary_dim=rotary_dim,
             ).to(torch_dtype)
         else:
             fn = lambda: fused_qk_norm_rope_reference(
-                qkv.clone(),
+                qkv,
                 num_heads_q,
                 num_heads_k,
                 num_heads_v,
@@ -410,15 +560,11 @@ def benchmark(
                 base,
                 is_neox,
                 position_ids,
-                factor=1.0,
-                low=1.0,
-                high=1.0,
-                attention_factor=1.0,
                 rotary_dim=rotary_dim,
             )
     elif provider == "sglang":
         fn = lambda: fused_qk_norm_rope(
-            qkv.clone(),
+            qkv,
             num_heads_q,
             num_heads_k,
             num_heads_v,
@@ -436,7 +582,10 @@ def benchmark(
             rotary_dim=rotary_dim,
         )
 
-    ms, min_ms, max_ms = triton.testing.do_bench(fn, quantiles=quantiles)
+    if os.environ.get("MUSE_SPARK_PROFILE") == "1" and provider == "sglang":
+        ms, min_ms, max_ms = profile_fused_qk_norm_rope(fn)
+    else:
+        ms, min_ms, max_ms = triton.testing.do_bench(fn, quantiles=quantiles)
 
     # Calculate effective bandwidth using the correct bytes-per-element for this dtype
     bw_metrics = calculate_effective_bandwidth(
@@ -534,19 +683,24 @@ if __name__ == "__main__":
         values="time_us",
     )
 
-    if "torch" in pivot.columns and "sglang" in pivot.columns:
-        pivot["speedup"] = pivot["torch"] / pivot["sglang"]
-        print(f"\nOverall average speedup: {pivot['speedup'].mean():.2f}x")
-        print(f"Overall max speedup:     {pivot['speedup'].max():.2f}x")
-        print(f"Overall min speedup:     {pivot['speedup'].min():.2f}x")
+    for baseline in ("torch", "torch_cached", "muse_spark_unfused"):
+        if baseline not in pivot.columns or "sglang" not in pivot.columns:
+            continue
+        col = f"speedup_vs_{baseline}"
+        pivot[col] = pivot[baseline] / pivot["sglang"]
+        print(f"\nSpeedup vs {baseline}:")
+        print(f"  overall average: {pivot[col].mean():.2f}x")
+        print(f"  overall max:     {pivot[col].max():.2f}x")
+        print(f"  overall min:     {pivot[col].min():.2f}x")
 
         # Per-dtype speedup breakdown
-        print("\nSpeedup by dtype:")
         for dt in df["dtype"].unique():
             mask = pivot.index.get_level_values("dtype") == dt
-            sp = pivot.loc[mask, "speedup"]
+            sp = pivot.loc[mask, col]
             if not sp.empty:
                 print(
                     f"  {dt:>12s}: avg={sp.mean():.2f}x  max={sp.max():.2f}x  min={sp.min():.2f}x"
                 )
+    print()
+    print(pivot.to_markdown())
     print(f"Wrote results CSV: {out_csv}")

@@ -256,6 +256,125 @@ def test_fused_qk_norm_rope_basic(
     )
 
 
+@pytest.mark.parametrize("num_tokens", [1, 8, 64, 129, 1024, 2048, 4096])
+@pytest.mark.parametrize("is_neox", [True, False])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_fused_qk_norm_rope_muse_spark(num_tokens, is_neox, dtype):
+    """Test the decode and prefill shapes used by MUSE Spark."""
+    torch.random.manual_seed(42)
+    num_heads_q = 128
+    num_heads_k = 16
+    num_heads_v = 16
+    head_dim = 64
+    eps = 1e-6
+    base = 500000.0
+    factor = 1.0
+    low = 1.0
+    high = 1.0
+    attention_factor = 1.0
+    rotary_dim = head_dim
+    total_heads = num_heads_q + num_heads_k + num_heads_v
+
+    qkv = torch.randn(num_tokens, total_heads * head_dim, dtype=dtype, device=device)
+    q_weight = torch.randn(head_dim, dtype=dtype, device=device)
+    k_weight = torch.randn(head_dim, dtype=dtype, device=device)
+    position_ids = torch.arange(num_tokens, dtype=torch.int32, device=device)
+
+    output_ref = fused_qk_norm_rope_reference(
+        qkv.float().cpu(),
+        num_heads_q,
+        num_heads_k,
+        num_heads_v,
+        head_dim,
+        eps,
+        q_weight.float().cpu(),
+        k_weight.float().cpu(),
+        base,
+        is_neox,
+        position_ids.cpu(),
+        factor,
+        low,
+        high,
+        attention_factor,
+        rotary_dim,
+    ).to(dtype)
+
+    sgl_kernel.fused_qk_norm_rope(
+        qkv,
+        num_heads_q,
+        num_heads_k,
+        num_heads_v,
+        head_dim,
+        eps,
+        q_weight,
+        k_weight,
+        base,
+        is_neox,
+        position_ids,
+        factor,
+        low,
+        high,
+        attention_factor,
+        rotary_dim,
+    )
+
+    torch.testing.assert_close(qkv.cpu(), output_ref, rtol=8e-3, atol=4e-3)
+
+
+def test_fused_qk_norm_rope_muse_spark_gated_stride():
+    """Cover the DRAM-sized, two-chunk interleaved launch with a large untouched tail."""
+    torch.random.manual_seed(42)
+    num_tokens = 4096
+    num_heads_q = 128
+    num_heads_k = 16
+    num_heads_v = 144
+    head_dim = 64
+    dtype = torch.bfloat16
+    eps = 1e-6
+    base = 500000.0
+    position_ids = torch.arange(num_tokens, dtype=torch.int32, device=device)
+    q_weight = torch.randn(head_dim, dtype=dtype, device=device)
+    k_weight = torch.randn(head_dim, dtype=dtype, device=device)
+    qkv = torch.randn(
+        num_tokens,
+        (num_heads_q + num_heads_k + num_heads_v) * head_dim,
+        dtype=dtype,
+        device=device,
+    )
+
+    output_ref = fused_qk_norm_rope_reference(
+        qkv.float().cpu(),
+        num_heads_q,
+        num_heads_k,
+        num_heads_v,
+        head_dim,
+        eps,
+        q_weight.float().cpu(),
+        k_weight.float().cpu(),
+        base,
+        False,
+        position_ids.cpu(),
+        rotary_dim=head_dim,
+    ).to(dtype)
+
+    sgl_kernel.fused_qk_norm_rope(
+        qkv,
+        num_heads_q,
+        num_heads_k,
+        num_heads_v,
+        head_dim,
+        eps,
+        q_weight,
+        k_weight,
+        base,
+        False,
+        position_ids,
+        rotary_dim=head_dim,
+    )
+
+    torch.testing.assert_close(qkv.cpu(), output_ref, rtol=8e-3, atol=4e-3)
+
+
 @pytest.mark.parametrize("num_tokens", [32, 128])
 @pytest.mark.parametrize("head_dim", [128, 256])
 @pytest.mark.parametrize("is_neox", [True, False])
