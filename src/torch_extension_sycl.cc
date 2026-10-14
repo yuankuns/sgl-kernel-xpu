@@ -55,6 +55,12 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "correction_bias) -> ()");
   m.impl("topk_sigmoid", torch::kXPU, &at::native::xpu::topk_sigmoid);
 
+  m.def(
+      "muse_spark_moe_routing(Tensor! topk_weights, Tensor! topk_ids, Tensor gating_output, Tensor? correction_bias, "
+      "float router_output_multiplier, float route_scale, float division_eps, Tensor? local_expert_mapping, Tensor? "
+      "num_valid_tokens) -> ()");
+  m.impl("muse_spark_moe_routing", torch::kXPU, &at::native::xpu::muse_spark_moe_routing);
+
   m.def("top_k_renorm_probs(Tensor probs, Tensor! renorm_probs, Tensor? maybe_top_k_arr, int top_k_val) -> ()");
   m.impl("top_k_renorm_probs", torch::kXPU, &top_k_renorm_probs);
 
@@ -168,6 +174,8 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.impl("prepare_moe_input", torch::kXPU, &prepare_moe_input);
   m.def("scatter_tokens_to_experts(Tensor input, Tensor src2dst_map, Tensor! output) -> ()");
   m.impl("scatter_tokens_to_experts", torch::kXPU, &scatter_tokens_to_experts);
+  m.def("mxfp4_moe_scale_to_mn_major(Tensor! out, Tensor input, Tensor rows_per_expert) -> ()");
+  m.impl("mxfp4_moe_scale_to_mn_major", torch::kXPU, &mxfp4_moe_scale_to_mn_major);
   m.def(
       "apply_shuffle_mul_sum(Tensor input, Tensor! output, Tensor permutation, float routed_scaling_factor, Tensor? "
       "factors) -> ()");
@@ -266,8 +274,15 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.impl("sgl_per_token_group_quant_8bit_v2", torch::kXPU, &at::native::xpu::sgl_per_token_group_quant_8bit_v2);
   m.def(
       "sgl_per_token_group_quant_fp4(Tensor input, Tensor output_q, Tensor output_s, int group_size,"
-      " float eps) -> ()");
+      " float eps, bool fuse_silu_and_mul, Tensor? scale_map=None) -> ()");
   m.impl("sgl_per_token_group_quant_fp4", torch::kXPU, &at::native::xpu::sgl_per_token_group_quant_fp4);
+  m.def(
+      "sgl_padded_gather_per_token_group_quant_fp4(Tensor input, Tensor row_map, Tensor output_q,"
+      " Tensor output_s, int group_size, float eps, Tensor? scale_map=None) -> ()");
+  m.impl(
+      "sgl_padded_gather_per_token_group_quant_fp4",
+      torch::kXPU,
+      &at::native::xpu::sgl_padded_gather_per_token_group_quant_fp4);
   m.def("sgl_per_tensor_quant_fp8(Tensor input, Tensor output_q, Tensor output_s, bool is_static) -> ()");
   m.impl("sgl_per_tensor_quant_fp8", torch::kXPU, &sgl_per_tensor_quant_fp8);
 

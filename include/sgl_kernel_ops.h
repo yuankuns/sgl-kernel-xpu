@@ -122,6 +122,16 @@ void topk_sigmoid(
     at::Tensor& gating_output,
     bool renormalize,
     const c10::optional<at::Tensor>& correction_bias);
+void muse_spark_moe_routing(
+    at::Tensor& topk_weights,
+    at::Tensor& topk_ids,
+    at::Tensor& gating_output,
+    const c10::optional<at::Tensor>& correction_bias,
+    double router_output_multiplier,
+    double route_scale,
+    double division_eps,
+    const c10::optional<at::Tensor>& local_expert_mapping,
+    const c10::optional<at::Tensor>& num_valid_tokens);
 
 std::tuple<at::Tensor, at::Tensor> rotary_embedding(
     at::Tensor& positions,
@@ -203,7 +213,21 @@ void multimodal_rotary_embedding(
     bool is_neox_style,
     const std::optional<at::Tensor>& axis_map);
 void sgl_per_token_group_quant_fp4(
-    at::Tensor input, at::Tensor output_q, at::Tensor output_s, int64_t group_size, double eps);
+    at::Tensor input,
+    at::Tensor output_q,
+    at::Tensor output_s,
+    int64_t group_size,
+    double eps,
+    bool fuse_silu_and_mul,
+    const std::optional<at::Tensor>& scale_map);
+void sgl_padded_gather_per_token_group_quant_fp4(
+    at::Tensor input,
+    at::Tensor row_map,
+    at::Tensor output_q,
+    at::Tensor output_s,
+    int64_t group_size,
+    double eps,
+    const std::optional<at::Tensor>& scale_map);
 void store_cache(at::Tensor& k, at::Tensor& v, at::Tensor& k_cache, at::Tensor& v_cache, at::Tensor& indices);
 }  // namespace at::native::xpu
 void silu_and_mul(torch::Tensor& out, torch::Tensor& input);
@@ -362,6 +386,13 @@ void ep_moe_post_reorder(
 
 void scatter_tokens_to_experts(
     const torch::Tensor& input_tensor, const torch::Tensor& src2dst_map, torch::Tensor& output_tensor);
+
+// Relayouts row-major [M, ceil(K/32)] MXFP4 activation scales into the per-expert
+// MN-major, M-padded-to-4 surface that moe_grouped_mm_nt_xe35_mxfp4_w4a4 reads. The
+// source rows must already be grouped by expert; row counts stay on the device.
+// `out` needs `sum(round_up(rows_i, 4))` rows and must be zeroed if any row count is
+// not a multiple of 4 (the padding rows are read by the GEMM but never written here).
+void mxfp4_moe_scale_to_mn_major(torch::Tensor& out, const torch::Tensor& in, const torch::Tensor& rows_per_expert);
 
 void apply_shuffle_mul_sum(
     const torch::Tensor& input,

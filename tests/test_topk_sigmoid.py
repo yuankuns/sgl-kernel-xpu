@@ -105,5 +105,68 @@ def test_topk_sigmoid(
     torch.testing.assert_close(res, ref, atol=atol, rtol=rtol)
 
 
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("n_token", [1, 7, 9, 17, 33, 129, 512, 2048, 4096])
+@pytest.mark.parametrize("n_expert", [128, 256])
+def test_muse_spark_topk8_fast_path(dtype, n_token, n_expert):
+    """Exercise every production fast-path specialization and tail group."""
+    torch.manual_seed(20260916 + n_token + n_expert)
+    gating_output = torch.empty(n_token, n_expert, dtype=dtype, device=device).uniform_(
+        -7.0, 7.0
+    )
+    correction_bias = torch.empty(
+        n_expert, dtype=torch.float32, device=device
+    ).uniform_(-0.15, 0.15)
+
+    expected_scores = torch.sigmoid(gating_output.float())
+    expected_ids = torch.topk(
+        expected_scores + correction_bias.unsqueeze(0),
+        k=8,
+        dim=-1,
+        sorted=True,
+    ).indices
+    expected_weights = expected_scores.gather(1, expected_ids)
+    expected_weights /= expected_weights.sum(dim=-1, keepdim=True)
+
+    actual_weights = torch.empty(n_token, 8, dtype=torch.float32, device=device)
+    actual_ids = torch.empty(n_token, 8, dtype=torch.int32, device=device)
+    sgl_kernel.topk_sigmoid(
+        actual_weights,
+        actual_ids,
+        gating_output,
+        True,
+        correction_bias,
+    )
+
+    torch.testing.assert_close(actual_ids, expected_ids.to(torch.int32))
+    torch.testing.assert_close(actual_weights, expected_weights, atol=2.5e-4, rtol=0)
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("n_expert", [128, 256])
+def test_muse_spark_topk8_ties_choose_lowest_expert(dtype, n_expert):
+    gating_output = torch.zeros(9, n_expert, dtype=dtype, device=device)
+    correction_bias = torch.zeros(n_expert, dtype=torch.float32, device=device)
+    actual_weights = torch.empty(9, 8, dtype=torch.float32, device=device)
+    actual_ids = torch.empty(9, 8, dtype=torch.int32, device=device)
+
+    sgl_kernel.topk_sigmoid(
+        actual_weights,
+        actual_ids,
+        gating_output,
+        True,
+        correction_bias,
+    )
+
+    expected_ids = torch.arange(8, dtype=torch.int32, device=device).expand(9, 8)
+    torch.testing.assert_close(actual_ids, expected_ids)
+    torch.testing.assert_close(
+        actual_weights,
+        torch.full_like(actual_weights, 0.125),
+        atol=0,
+        rtol=0,
+    )
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__]))

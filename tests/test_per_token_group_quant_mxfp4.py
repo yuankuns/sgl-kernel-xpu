@@ -289,6 +289,29 @@ def dequantize_mxfp4(
 
 
 class TestMXFP4ReferenceQuantization:
+    @pytest.mark.parametrize(
+        "dtype,gate,up",
+        [
+            (torch.bfloat16, 0.5, 2.40625),
+            (torch.float16, 0.004001617431640625, 374.0),
+        ],
+    )
+    def test_swiglu_output_rounding_changes_fp4(self, dtype, gate, up):
+        """The separate silu_and_mul writes dtype before MXFP4 quantization."""
+        x = torch.zeros(1, 64, dtype=dtype)
+        x[0, 0], x[0, 32] = gate, up
+        x[0, 1], x[0, 33] = 4.0, 1.25  # Keep the block scale at 1.
+        activated_fp32 = torch.nn.functional.silu(x[:, :32].float()) * x[:, 32:].float()
+        separate = activated_fp32.to(dtype).float()
+        assert activated_fp32[0, 0] < 0.75
+        assert separate[0, 0] == 0.75
+        rounded_q, rounded_s = quantize_to_mxfp4(separate)
+        direct_q, direct_s = quantize_to_mxfp4(activated_fp32)
+        assert torch.equal(rounded_s, direct_s)
+        assert rounded_s[0, 0] == 127
+        assert unpack_fp4(rounded_q)[0, 0] == 2  # 0.75 ties to 1.0.
+        assert unpack_fp4(direct_q)[0, 0] == 1  # Below 0.75 gives 0.5.
+
     def test_e2m1_roundtrip(self):
         device = torch.device("cpu")
         test_values = torch.tensor(
@@ -398,6 +421,32 @@ class TestPerTokenGroupQuantFP4XPU:
         except ImportError:
             pytest.skip("sgl_per_token_group_quant_fp4 kernel not available")
 
+    @pytest.mark.parametrize(
+        "dtype,gate,up",
+        [
+            (torch.bfloat16, 0.5, 2.40625),
+            (torch.float16, 0.004001617431640625, 374.0),
+        ],
+    )
+    def test_fused_swiglu_matches_separate_dtype_surface(self, dtype, gate, up):
+        from sgl_kernel import silu_and_mul
+
+        x = torch.zeros(1, 64, dtype=dtype, device=self.device)
+        x[0, 0], x[0, 32] = gate, up
+        x[0, 1], x[0, 33] = 4.0, 1.25
+        activated = torch.empty(1, 32, dtype=dtype, device=self.device)
+        silu_and_mul(x, out=activated)
+        quant = self._import_kernel()
+        expected_q, expected_s = quant(activated)
+        actual_q, actual_s = quant(x, fuse_silu_and_mul=True)
+        torch.testing.assert_close(actual_s, expected_s, rtol=0, atol=0)
+        torch.testing.assert_close(
+            _normalize_packed_fp4_signed_zero(actual_q),
+            _normalize_packed_fp4_signed_zero(expected_q),
+            rtol=0,
+            atol=0,
+        )
+
     def _test_against_reference(
         self,
         num_tokens: int,
@@ -467,6 +516,8 @@ class TestPerTokenGroupQuantFP4XPU:
             (64, 128, torch.float16),
             (64, 128, torch.float32),
             (256, 2048, torch.bfloat16),
+            # Past the small-surface cutoff: one lane per group.
+            (4096, 4096, torch.bfloat16),
         ],
     )
     def test_quantization_vs_reference(self, num_tokens, hidden_dim, src_dtype):
@@ -493,6 +544,91 @@ class TestPerTokenGroupQuantFP4XPU:
             torch.stack([x_dq.flatten(), x_cpu.float().flatten()])
         )[0, 1]
         assert correlation > 0.9, f"Correlation too low: {correlation}"
+
+    @pytest.mark.parametrize("src_dtype", [torch.bfloat16, torch.float16])
+    @pytest.mark.parametrize("map_dtype", [torch.int32, torch.int64])
+    def test_padded_gather_matches_index_select_then_quantize(
+        self, src_dtype, map_dtype
+    ):
+        from sgl_kernel import (
+            sgl_padded_gather_per_token_group_quant_fp4,
+            sgl_per_token_group_quant_fp4,
+        )
+
+        torch.manual_seed(123)
+        source = torch.randn(7, 256, dtype=src_dtype, device=self.device)
+        # Repeated source row 0 represents padding; the remaining entries cover
+        # a nontrivial permutation with further repeated routed rows.
+        row_map = torch.tensor(
+            [3, 1, 0, 0, 6, 2, 0, 5, 4, 0, 3],
+            dtype=map_dtype,
+            device=self.device,
+        )
+
+        expected_q, expected_s = sgl_per_token_group_quant_fp4(
+            source.index_select(0, row_map.to(torch.int64))
+        )
+        actual_q, actual_s = sgl_padded_gather_per_token_group_quant_fp4(
+            source, row_map
+        )
+
+        assert torch.equal(actual_q.cpu(), expected_q.cpu())
+        assert torch.equal(actual_s.cpu(), expected_s.cpu())
+
+    def test_padded_gather_empty_map(self):
+        from sgl_kernel import sgl_padded_gather_per_token_group_quant_fp4
+
+        source = torch.empty(2, 64, dtype=torch.bfloat16, device=self.device)
+        row_map = torch.empty(0, dtype=torch.int32, device=self.device)
+        output_q, output_s = sgl_padded_gather_per_token_group_quant_fp4(
+            source, row_map
+        )
+        assert output_q.shape == (0, 32)
+        assert output_s.shape == (0, 2)
+
+    @pytest.mark.parametrize("fuse_silu_and_mul", [False, True])
+    def test_scale_map_writes_mn_major_blocks(self, fuse_silu_and_mul):
+        """`scale_map` rows (start, rows) store MN-major per-block scales,
+        (start, -rows) pad rows store only a zero scale, (r, 0) slack nothing."""
+        from sgl_kernel import (
+            sgl_padded_gather_per_token_group_quant_fp4,
+            sgl_per_token_group_quant_fp4,
+        )
+
+        torch.manual_seed(7)
+        groups = 8
+        # Two 4-row blocks, the first with two pad rows, the second with one,
+        # followed by three slack rows.
+        scale_map = torch.tensor(
+            [[0, 4], [0, 4], [0, -4], [0, -4], [4, 4], [4, 4], [4, 4], [4, -4]]
+            + [[8, 0], [9, 0], [10, 0]],
+            dtype=torch.int32,
+            device=self.device,
+        )
+        routed = (scale_map[:, 1] > 0).cpu()
+        if fuse_silu_and_mul:
+            x = torch.randn(
+                11, 2 * groups * 32, dtype=torch.bfloat16, device=self.device
+            )
+            ref_q, ref_s = sgl_per_token_group_quant_fp4(x, fuse_silu_and_mul=True)
+            q, s = sgl_per_token_group_quant_fp4(
+                x, fuse_silu_and_mul=True, scale_map=scale_map
+            )
+        else:
+            x = torch.randn(5, groups * 32, dtype=torch.bfloat16, device=self.device)
+            row_map = torch.tensor(
+                [3, 1, 0, 0, 4, 2, 0, 0, 0, 0, 0], dtype=torch.int32, device=self.device
+            )
+            ref_q, ref_s = sgl_padded_gather_per_token_group_quant_fp4(x, row_map)
+            q, s = sgl_padded_gather_per_token_group_quant_fp4(
+                x, row_map, scale_map=scale_map
+            )
+
+        ref_s = ref_s.cpu()
+        ref_s[scale_map[:, 1].cpu() < 0] = 0
+        want = torch.cat([ref_s[0:4].t().flatten(), ref_s[4:8].t().flatten()])
+        assert torch.equal(q.cpu()[routed], ref_q.cpu()[routed])
+        assert torch.equal(s.cpu().flatten()[: 8 * groups], want)
 
     def test_round_ties_to_even_on_xpu(self):
         """Test that the kernel implements roundTiesToEven at midpoints."""

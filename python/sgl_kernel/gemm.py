@@ -141,6 +141,8 @@ def sgl_per_token_group_quant_fp4(
     x: torch.Tensor,
     group_size: int = 32,
     eps: float = 1e-10,
+    fuse_silu_and_mul: bool = False,
+    scale_map: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Quantize input tensor to MXFP4 (E2M1) format with per-token group scaling.
@@ -155,12 +157,26 @@ def sgl_per_token_group_quant_fp4(
            Must be contiguous and dtype float16, bfloat16, or float32.
         group_size: Number of elements per quantization group. Must be 32 for MXFP4.
         eps: Small epsilon to avoid division by zero. Default is 1e-10.
+        fuse_silu_and_mul: Quantize ``silu(x[..., :K // 2]) * x[..., K // 2:]``
+            instead of ``x``, i.e. fold SwiGLU into this kernel. ``x`` must then
+            be 2D with an even ``K``, and the outputs describe ``K // 2``
+            values per row. Same halving convention as ``silu_and_mul``.
+        scale_map: Optional contiguous int32 ``[M, 2]`` table giving, per
+            row ``r``, the ``(start, rows)`` of the row block it belongs to.
+            Its scale for group ``g`` is then stored at flat byte
+            ``start * G + g * rows + (r - start)`` of ``output_s`` instead of
+            ``r * G + g`` (with ``abs(rows)`` as the block size). This emits the
+            per-expert MN-major surface of ``mxfp4_moe_scale_to_mn_major``
+            directly. ``rows < 0`` marks a padding row whose GEMM output is
+            discarded: it stores scale 0 (2^-127) and leaves its ``output_q``
+            bytes unwritten. ``rows == 0`` marks slack: nothing is written.
 
     Returns:
-        Tuple[torch.Tensor, torch.Tensor]:
-            - output_q: Packed FP4 tensor with shape (..., K // 2) and dtype uint8.
+        Tuple[torch.Tensor, torch.Tensor]: with ``KOUT = K // 2`` when
+        ``fuse_silu_and_mul`` and ``KOUT = K`` otherwise,
+            - output_q: Packed FP4 tensor with shape (..., KOUT // 2) and dtype uint8.
                         Two E2M1 values are packed into each byte.
-            - output_s: Scale tensor with shape (..., K // group_size) and dtype uint8.
+            - output_s: Scale tensor with shape (..., KOUT // group_size) and dtype uint8.
                         Scales are stored in UE8M0 format (exponent + 127 bias).
     """
     assert (
@@ -177,6 +193,11 @@ def sgl_per_token_group_quant_fp4(
         x = x.view(-1, x.shape[-1])
 
     m, k = x.shape
+    if fuse_silu_and_mul:
+        assert (
+            k % (2 * group_size) == 0
+        ), f"with `fuse_silu_and_mul` the last dimension of `x` ({k}) must be divisible by 2 x {group_size}"
+        k //= 2
     num_groups_per_row = k // group_size
 
     # Output is packed FP4 (2 values per byte)
@@ -188,14 +209,71 @@ def sgl_per_token_group_quant_fp4(
 
     if x.shape[0] > 0:
         torch.ops.sgl_kernel.sgl_per_token_group_quant_fp4.default(
-            x, output_q, output_s, group_size, eps
+            x, output_q, output_s, group_size, eps, fuse_silu_and_mul, scale_map
         )
 
-    # Reshape output to match input shape
-    output_shape_q = original_shape[:-1] + (original_shape[-1] // 2,)
-    output_shape_s = original_shape[:-1] + (original_shape[-1] // group_size,)
+    # Reshape output to match input shape, in the activated width
+    out_k = original_shape[-1] // 2 if fuse_silu_and_mul else original_shape[-1]
+    output_shape_q = original_shape[:-1] + (out_k // 2,)
+    output_shape_s = original_shape[:-1] + (out_k // group_size,)
 
     return output_q.view(output_shape_q), output_s.view(output_shape_s)
+
+
+def sgl_padded_gather_per_token_group_quant_fp4(
+    x: torch.Tensor,
+    row_map: torch.Tensor,
+    group_size: int = 32,
+    eps: float = 1e-10,
+    scale_map: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Gather source rows and quantize them directly to MXFP4.
+
+    ``row_map[d]`` selects the source row written to padded destination row
+    ``d``. This is equivalent to
+    ``sgl_per_token_group_quant_fp4(x.index_select(0, row_map))`` without
+    materializing the FP16/BF16 gathered tensor.
+
+    Args:
+        x: Contiguous 2D FP16 or BF16 tensor with shape ``[M, K]``. ``K`` must
+            be divisible by 32.
+        row_map: Contiguous 1D int32 or int64 XPU tensor. Every entry must be in
+            ``[0, M)``; repeated entries are allowed and provide padding rows.
+        group_size: MXFP4 group size. Only 32 is supported.
+        eps: Positive lower bound for each group's absolute maximum.
+        scale_map: Optional ``(start, rows)`` scale redirection table, as in
+            ``sgl_per_token_group_quant_fp4``, with one row per ``row_map``
+            entry.
+
+    Returns:
+        Packed E2M1 bytes with shape ``[row_map.numel(), K // 2]`` and row-major
+        UE8M0 scales with shape ``[row_map.numel(), K // 32]``.
+    """
+    assert x.dim() == 2, f"`x` must be 2D, got {x.dim()} dimensions"
+    assert x.dtype in (
+        torch.float16,
+        torch.bfloat16,
+    ), f"`x` must be float16 or bfloat16, got {x.dtype}"
+    assert x.is_contiguous(), "`x` is not contiguous"
+    assert row_map.dim() == 1, f"`row_map` must be 1D, got {row_map.dim()} dimensions"
+    assert row_map.dtype in (
+        torch.int32,
+        torch.int64,
+    ), f"`row_map` must be int32 or int64, got {row_map.dtype}"
+    assert row_map.is_contiguous(), "`row_map` is not contiguous"
+    assert group_size == 32, f"group_size must be 32 for MXFP4, got {group_size}"
+    assert (
+        x.shape[1] % group_size == 0
+    ), f"the last dimension of `x` ({x.shape[1]}) must be divisible by `group_size` ({group_size})"
+
+    rows, k = row_map.numel(), x.shape[1]
+    output_q = torch.empty((rows, k // 2), device=x.device, dtype=torch.uint8)
+    output_s = torch.empty((rows, k // group_size), device=x.device, dtype=torch.uint8)
+    if rows > 0:
+        torch.ops.sgl_kernel.sgl_padded_gather_per_token_group_quant_fp4.default(
+            x, row_map, output_q, output_s, group_size, eps, scale_map
+        )
+    return output_q, output_s
 
 
 def sgl_per_token_quant_fp8(
