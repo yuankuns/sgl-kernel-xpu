@@ -24,6 +24,8 @@ from sgl_kernel.attention import (
 from sgl_kernel.cutlass_moe import (
     cutlass_fused_experts_fp8,
     cutlass_fused_experts_mxfp4,
+    cutlass_fused_experts_nvfp4_woq,
+    nvfp4_woq_prepare_weights,
 )
 from sgl_kernel.elementwise import (
     apply_rope_with_cos_sin_cache_inplace,
@@ -81,11 +83,17 @@ from sgl_kernel.moe import (
     moe_sum,
     moe_sum_reduce,
     mxfp4_blockwise_scaled_grouped_mm,
+    mxfp4_moe_scale_to_mn_major,
     prepare_moe_input,
     scatter_tokens_to_experts,
     swiglu_gpt_oss_sigmoid_alpha,
     topk_sigmoid,
     topk_softmax,
+)
+from sgl_kernel.nvfp4 import (
+    nvfp4_woq_bf16_grouped_mm,
+    nvfp4_woq_mxfp8_scaled_grouped_mm,
+    nvfp4_woq_prep,
 )
 from sgl_kernel.sampling import (
     min_p_sampling_from_probs,

@@ -741,3 +741,19 @@ def fused_experts(
     )
 
     return out_hidden_states
+
+
+def mxfp4_moe_scale_to_mn_major(out, input, rows_per_expert):
+    """Relayout per-token MXFP4 scales for moe_grouped_mm_nt_xe35_mxfp4_w4a4.
+
+    `input` is the [M, k // 32] row-major surface `sgl_per_token_group_quant_fp4`
+    emits, with rows already grouped by expert; `out` is the per-expert MN-major,
+    M-padded-to-4 surface the grouped GEMM reads, and needs
+    `sum(round_up(rows_i, 4))` rows (zero it first if any row count is not a
+    multiple of 4). `rows_per_expert` must be contiguous int32 on device.
+    Exact row-count validation is opt-in with
+    `SGL_KERNEL_MXFP4_CHECK_ROW_COUNTS=1`; it synchronizes device to host.
+    """
+    torch.ops.sgl_kernel.mxfp4_moe_scale_to_mn_major.default(
+        out, input, rows_per_expert
+    )

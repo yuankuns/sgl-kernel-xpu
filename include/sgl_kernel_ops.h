@@ -205,6 +205,8 @@ void multimodal_rotary_embedding(
 void sgl_per_token_group_quant_fp4(
     at::Tensor input, at::Tensor output_q, at::Tensor output_s, int64_t group_size, double eps);
 void store_cache(at::Tensor& k, at::Tensor& v, at::Tensor& k_cache, at::Tensor& v_cache, at::Tensor& indices);
+// NVFP4 weight-only-quantization support (see src/sycl/nvfp4_woq.cpp).
+void nvfp4_woq_prep(torch::Tensor& out_c, torch::Tensor& out_sfmx, const torch::Tensor& w_s, const torch::Tensor& w_gs);
 }  // namespace at::native::xpu
 void silu_and_mul(torch::Tensor& out, torch::Tensor& input);
 void gelu_tanh_and_mul(torch::Tensor& out, torch::Tensor& input);
@@ -362,6 +364,13 @@ void ep_moe_post_reorder(
 
 void scatter_tokens_to_experts(
     const torch::Tensor& input_tensor, const torch::Tensor& src2dst_map, torch::Tensor& output_tensor);
+
+// Relayouts row-major [M, ceil(K/32)] MXFP4 activation scales into the per-expert
+// MN-major, M-padded-to-4 surface that moe_grouped_mm_nt_xe35_mxfp4_w4a4 reads. The
+// source rows must already be grouped by expert; row counts stay on the device.
+// `out` needs `sum(round_up(rows_i, 4))` rows and must be zeroed if any row count is
+// not a multiple of 4 (the padding rows are read by the GEMM but never written here).
+void mxfp4_moe_scale_to_mn_major(torch::Tensor& out, const torch::Tensor& in, const torch::Tensor& rows_per_expert);
 
 void apply_shuffle_mul_sum(
     const torch::Tensor& input,
@@ -795,6 +804,30 @@ int64_t gdn_attention_workspace_bytes_needed(
     const int64_t head_v_dim,
     const int64_t tp_size,
     const torch::ScalarType dtype);
+// Fused NVFP4 weight-only-quantized MXFP8 grouped GEMM (see
+// src/sycl/xe35/blockwise_moe_nvfp4_woq.cpp). B stays NVFP4 in memory and is
+// requantized to MXFP8 inside the mainloop.
+void nvfp4_woq_mxfp8_scaled_grouped_mm(
+    torch::Tensor& output,
+    const torch::Tensor& a,
+    const torch::Tensor& b,
+    const torch::Tensor& scales_a,
+    const torch::Tensor& sfmx_b,
+    const torch::Tensor& c_b,
+    const torch::Tensor& problem_sizes,
+    const torch::Tensor& expert_offsets,
+    const torch::Tensor& workspace);
+// Direct BF16 compute variant. A stays BF16 and packed NVFP4 B is dequantized
+// to the BF16 MMA fragment inside the mainloop.
+void nvfp4_woq_bf16_grouped_mm(
+    torch::Tensor& output,
+    const torch::Tensor& a,
+    const torch::Tensor& b,
+    const torch::Tensor& sfmx_b,
+    const torch::Tensor& c_b,
+    const torch::Tensor& problem_sizes,
+    const torch::Tensor& expert_offsets,
+    const torch::Tensor& workspace);
 #endif
 
 // Xe40 only kernels
