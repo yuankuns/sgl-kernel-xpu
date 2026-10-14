@@ -146,6 +146,10 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "Tensor problem_sizes, Tensor expert_offsets, Tensor workspace) -> ()");
   m.impl("mxfp4_blockwise_scaled_grouped_mm", torch::kXPU, &mxfp4_blockwise_scaled_grouped_mm);
   m.def(
+      "moe_grouped_mm_nt_xe35_mxfp4_w4a4(Tensor! output, Tensor a, Tensor a_scale, Tensor b, Tensor b_scale, "
+      "Tensor? bias, Tensor rows_per_expert, int n, int k, int num_experts) -> ()");
+  m.impl("moe_grouped_mm_nt_xe35_mxfp4_w4a4", torch::kXPU, &moe_grouped_mm_nt_xe35_mxfp4_w4a4);
+  m.def(
       "fp8_blockwise_scaled_grouped_mm(Tensor! output, Tensor! a_ptrs, Tensor! b_ptrs, Tensor! out_ptrs, "
       "Tensor! a_scales_ptrs, Tensor! b_scales_ptrs, Tensor a, Tensor b, Tensor scales_a, Tensor scales_b, "
       "Tensor stride_a, Tensor stride_b, Tensor stride_c, Tensor layout_sfa, Tensor layout_sfb, "
@@ -168,6 +172,8 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.impl("prepare_moe_input", torch::kXPU, &prepare_moe_input);
   m.def("scatter_tokens_to_experts(Tensor input, Tensor src2dst_map, Tensor! output) -> ()");
   m.impl("scatter_tokens_to_experts", torch::kXPU, &scatter_tokens_to_experts);
+  m.def("mxfp4_moe_scale_to_mn_major(Tensor! out, Tensor input, Tensor rows_per_expert) -> ()");
+  m.impl("mxfp4_moe_scale_to_mn_major", torch::kXPU, &mxfp4_moe_scale_to_mn_major);
   m.def(
       "apply_shuffle_mul_sum(Tensor input, Tensor! output, Tensor permutation, float routed_scaling_factor, Tensor? "
       "factors) -> ()");

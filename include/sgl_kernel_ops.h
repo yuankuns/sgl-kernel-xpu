@@ -363,6 +363,13 @@ void ep_moe_post_reorder(
 void scatter_tokens_to_experts(
     const torch::Tensor& input_tensor, const torch::Tensor& src2dst_map, torch::Tensor& output_tensor);
 
+// Relayouts row-major [M, ceil(K/32)] MXFP4 activation scales into the per-expert
+// MN-major, M-padded-to-4 surface that moe_grouped_mm_nt_xe35_mxfp4_w4a4 reads. The
+// source rows must already be grouped by expert; row counts stay on the device.
+// `out` needs `sum(round_up(rows_i, 4))` rows and must be zeroed if any row count is
+// not a multiple of 4 (the padding rows are read by the GEMM but never written here).
+void mxfp4_moe_scale_to_mn_major(torch::Tensor& out, const torch::Tensor& in, const torch::Tensor& rows_per_expert);
+
 void apply_shuffle_mul_sum(
     const torch::Tensor& input,
     torch::Tensor& output,
@@ -795,6 +802,24 @@ int64_t gdn_attention_workspace_bytes_needed(
     const int64_t head_v_dim,
     const int64_t tp_size,
     const torch::ScalarType dtype);
+// MXFP4-A x MXFP4-B (W4A4) MoE grouped GEMM using the vLLM Xe3 collective
+// (src/sycl/kernels/moe/xe35/), which carries a per-shape tile family and
+// wave-quantization dispatch instead of a single fixed tile. Takes the problem shape as
+// scalars plus a device-side rows_per_expert, so no ptr tables or host-visible
+// problem_sizes are needed.
+//   a [total_M, K/2], a_scale [padded_M, K/32] (each expert's M padded up to 4),
+//   b [E, N, K/2], b_scale [E, N, K/32] (N-dense), output [total_M, N] bf16.
+void moe_grouped_mm_nt_xe35_mxfp4_w4a4(
+    torch::Tensor& output,
+    const torch::Tensor& a,
+    const torch::Tensor& a_scale,
+    const torch::Tensor& b,
+    const torch::Tensor& b_scale,
+    const std::optional<at::Tensor>& bias,
+    const torch::Tensor& rows_per_expert,
+    const int64_t n,
+    const int64_t k,
+    const int64_t num_experts);
 #endif
 
 // Xe40 only kernels
