@@ -48,9 +48,9 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.impl("gemma_fused_add_rmsnorm", torch::kXPU, &at::native::xpu::gemma_fused_add_rmsnorm);
 
   m.def(
-      "muse_vocab_mask(Tensor input, int org_start, int org_end, int num_org_padding, int added_start, "
+      "vocab_mask(Tensor input, int org_start, int org_end, int num_org_padding, int added_start, "
       "int added_end) -> (Tensor, Tensor)");
-  m.impl("muse_vocab_mask", torch::kXPU, &at::native::xpu::muse_vocab_mask);
+  m.impl("vocab_mask", torch::kXPU, &at::native::xpu::vocab_mask);
 
   m.def(
       "muse_vocab_parallel_embedding(Tensor input, Tensor weight, Tensor! output, int org_start, "

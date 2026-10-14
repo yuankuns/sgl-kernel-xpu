@@ -34,7 +34,7 @@ def main():
         return get_masked_input_and_mask(ids, *mask_args)
 
     def run_sycl():
-        return torch.ops.sgl_kernel.muse_vocab_mask(ids, *mask_args)
+        return torch.ops.sgl_kernel.vocab_mask(ids, *mask_args)
 
     for _ in range(10):
         run_triton()
@@ -66,7 +66,7 @@ def main():
     new = [
         event["dur"]
         for event in events
-        if event.get("cat") == "kernel" and "MuseVocabMaskKernel" in event["name"]
+        if event.get("cat") == "kernel" and "VocabMaskKernel" in event["name"]
     ]
     assert len(old) == len(new) == args.samples, (len(old), len(new))
     old_us, new_us = median(old), median(new)

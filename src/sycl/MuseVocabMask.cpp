@@ -11,7 +11,7 @@ namespace at::native::xpu {
 namespace {
 
 template <typename Scalar>
-struct MuseVocabMaskKernel {
+struct VocabMaskKernel {
   const Scalar* __restrict__ input;
   int64_t* __restrict__ mapped;
   bool* __restrict__ invalid;
@@ -39,7 +39,7 @@ struct MuseVocabMaskKernel {
 
 }  // namespace
 
-std::tuple<torch::Tensor, torch::Tensor> muse_vocab_mask(
+std::tuple<torch::Tensor, torch::Tensor> vocab_mask(
     torch::Tensor input,
     int64_t org_start,
     int64_t org_end,
@@ -60,7 +60,7 @@ std::tuple<torch::Tensor, torch::Tensor> muse_vocab_mask(
   const auto added_offset = added_start - (org_end - org_start) - num_org_padding;
   auto queue = at::xpu::getCurrentXPUStream().queue();
   if (input.scalar_type() == at::kInt) {
-    MuseVocabMaskKernel<int32_t> kernel{
+    VocabMaskKernel<int32_t> kernel{
         input.data_ptr<int32_t>(),
         mapped.data_ptr<int64_t>(),
         invalid.data_ptr<bool>(),
@@ -72,7 +72,7 @@ std::tuple<torch::Tensor, torch::Tensor> muse_vocab_mask(
         added_offset};
     sycl_kernel_submit(sycl::range<1>(global_size), sycl::range<1>(Workgroup), queue, kernel);
   } else {
-    MuseVocabMaskKernel<int64_t> kernel{
+    VocabMaskKernel<int64_t> kernel{
         input.data_ptr<int64_t>(),
         mapped.data_ptr<int64_t>(),
         invalid.data_ptr<bool>(),
