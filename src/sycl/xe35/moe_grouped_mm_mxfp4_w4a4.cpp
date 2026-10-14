@@ -9,7 +9,8 @@
     Uses vLLM's MainloopMXFPXGroup plus its per-shape tile family and wave-quantization
     dispatch (see sycl/kernels/moe/xe35/collective/) instead of CUTLASS's in-tree
     MainloopIntelXeXMX16BlockScaledGroup with its single fixed 512x512x64 tile. On the
-    muse_spark L3 MoE shapes (256 experts, K=4096) the vLLM collective is ~20-40x faster.
+    larger expert groups, the array scheduler permits smaller tiles than the
+    single fixed 512x512x64 tile in the in-tree blockwise collective.
 
     Layout contract (identical to vLLM's cutlass_grouped_gemm_interface, because the
     strides are rebuilt from {N, K, groups} and the tensors' own strides are never read):
@@ -32,10 +33,9 @@
 
 namespace gpu::cutlass_kernel::grouped_gemm {
 
-// Small 256-expert MXFP4 projections benefit from a wider N tile and a
-// two-stage pipeline while their average rows per expert remain in the decode
-// regime.
-class Mxfp4DecodeN256K64Stages2Policy : public moe_mxfp4_policy {
+// A wider N tile reduces scheduler work for sufficiently populated expert
+// groups in the decode regime.
+class Mxfp4WideDecodePolicy : public moe_mxfp4_policy {
  public:
   using TileShape = Shape<_8, _256, _64>;
   using SGLayout = Layout<Shape<_1, _8, _1>, Stride<_8, _1, _0>>;
@@ -126,11 +126,25 @@ bool use_256x256_prefill_tile(int64_t M_total, int64_t N, int64_t groups) {
   return util_256 >= kMinUtil;
 }
 
-bool use_muse_spark_small_row_tile(int64_t M_total, int64_t N, int64_t K, int64_t groups) {
-  // CRI operator sweeps with three routing histograms found a reliable
-  // advantage through these allocated-row bounds. Down was near a tie at
-  // 2944 rows for one histogram; gate/up became inconsistent at 3848.
-  return groups == 256 && K == 4096 && ((N == 4096 && M_total <= 2880) || (N == 8192 && M_total <= 3840));
+bool use_wide_decode_tile(int64_t avg_rows_per_expert, int64_t N) {
+  // Device-event sweeps show two crossovers: mid wins at 2-8 rows, and
+  // wide wins again at 9-16. At larger row counts, tail-wave utilization
+  // depends on the number of N tiles. Favor mid where the wide tile's
+  // p20-p80 variation overlaps or exceeds its median advantage.
+  if (avg_rows_per_expert == 1) {
+    return true;
+  }
+  if (avg_rows_per_expert <= 8) {
+    return false;
+  }
+  if (avg_rows_per_expert <= 16) {
+    return true;
+  }
+  const int64_t wide_n_tiles = (N + 255) / 256;
+  if (wide_n_tiles <= 16) {
+    return avg_rows_per_expert <= 18 || avg_rows_per_expert >= 25;
+  }
+  return avg_rows_per_expert >= 26;
 }
 
 }  // namespace
@@ -261,8 +275,12 @@ void moe_grouped_mm_nt_xe35_mxfp4_w4a4(
         SGL_GG_CALL(policies::moe_mxfp4_128x256_policy);
       }
     }
-  } else if (use_muse_spark_small_row_tile(total_m, N, K, groups)) {
-    SGL_GG_CALL(policies::Mxfp4DecodeN256K64Stages2Policy);
+  } else if (groups >= 32 && K >= 2048 && N >= 4096 && avg_tokens_cnt > 0) {
+    if (use_wide_decode_tile(avg_tokens_cnt, N)) {
+      SGL_GG_CALL(policies::Mxfp4WideDecodePolicy);
+    } else {
+      SGL_GG_CALL(policies::moe_mxfp4_mid_policy);
+    }
   } else if (avg_tokens_cnt > 4) {
     SGL_GG_CALL(policies::moe_mxfp4_mid_policy);
   } else {

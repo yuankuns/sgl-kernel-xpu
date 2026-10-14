@@ -2,6 +2,7 @@
 """Benchmark Muse Spark B=8 MXFP4 MoE GEMMs through the production op."""
 
 import argparse
+import json
 import os
 import statistics
 import time
@@ -41,6 +42,17 @@ def make_padded_counts(seed: int, active_experts: int | None) -> torch.Tensor:
     )
 
 
+def make_sweep_counts(total_rows: int, experts: int = EXPERTS) -> torch.Tensor:
+    if total_rows <= 0 or total_rows % ALIGNMENT:
+        raise ValueError("sweep rows must be a positive multiple of 4")
+    if experts <= 0:
+        raise ValueError("experts must be positive")
+    quads = total_rows // ALIGNMENT
+    counts = torch.full((experts,), quads // experts, dtype=torch.int32)
+    counts[: quads % experts] += 1
+    return counts * ALIGNMENT
+
+
 def event_samples(launch, warmup: int, iterations: int) -> list[float]:
     for _ in range(warmup):
         launch()
@@ -69,25 +81,27 @@ def benchmark_projection(
     counts: torch.Tensor,
     warmup: int,
     iterations: int,
+    allocated_rows: int,
 ) -> None:
     device = "xpu"
+    experts = counts.numel()
     active_experts = int((counts != 0).sum())
     padded_rows = int(counts.sum())
     rows = counts.to(device)
 
     a = torch.randint(
-        0, 256, (UPPER_BOUND_ROWS, k // 2), dtype=torch.uint8, device=device
+        0, 256, (allocated_rows, k // 2), dtype=torch.uint8, device=device
     )
     a_scale = torch.randint(
-        112, 143, (UPPER_BOUND_ROWS, k // 32), dtype=torch.uint8, device=device
+        112, 143, (allocated_rows, k // 32), dtype=torch.uint8, device=device
     )
     weights = torch.randint(
-        0, 256, (EXPERTS, n, k // 2), dtype=torch.uint8, device=device
+        0, 256, (experts, n, k // 2), dtype=torch.uint8, device=device
     )
     weight_scales = torch.randint(
-        112, 143, (EXPERTS, k // 32, n), dtype=torch.uint8, device=device
+        112, 143, (experts, k // 32, n), dtype=torch.uint8, device=device
     )
-    output = torch.empty((UPPER_BOUND_ROWS, n), dtype=torch.bfloat16, device=device)
+    output = torch.empty((allocated_rows, n), dtype=torch.bfloat16, device=device)
 
     def launch():
         moe_grouped_mm_nt_xe35_mxfp4_w4a4(
@@ -99,7 +113,7 @@ def benchmark_projection(
             rows,
             n,
             k,
-            EXPERTS,
+            experts,
         )
 
     bytes_per_call = logical_bytes(active_experts, padded_rows, n, k)
@@ -107,9 +121,25 @@ def benchmark_projection(
     median_ms = statistics.median(samples)
     bandwidth = bytes_per_call / (median_ms * 1e6)
     print(
-        f"{name} active={active_experts} padded_rows={padded_rows} "
-        f"median={median_ms:.4f} ms min={min(samples):.4f} ms "
-        f"max={max(samples):.4f} ms logical={bandwidth:.1f} GB/s",
+        json.dumps(
+            {
+                "projection": name,
+                "policy": "auto",
+                "active_experts": active_experts,
+                "experts": experts,
+                "padded_rows": padded_rows,
+                "allocated_rows": allocated_rows,
+                "n": n,
+                "k": k,
+                "median_ms": median_ms,
+                "min_ms": min(samples),
+                "max_ms": max(samples),
+                "p20_ms": sorted(samples)[int(0.2 * (len(samples) - 1))],
+                "p80_ms": sorted(samples)[int(0.8 * (len(samples) - 1))],
+                "logical_GBs": bandwidth,
+                "samples_ms": samples,
+            }
+        ),
         flush=True,
     )
 
@@ -120,6 +150,8 @@ def benchmark_projection(
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--allocated-rows", type=int, default=UPPER_BOUND_ROWS)
+    parser.add_argument("--sweep-rows", type=int)
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--iterations", type=int, default=50)
     parser.add_argument(
@@ -136,7 +168,15 @@ def main() -> None:
         parser.error("Muse-Spark serving workload requires BATCHES=8")
     if not torch.xpu.is_available() or not is_xe3_arch():
         raise RuntimeError("Muse MXFP4 decode benchmark requires a CRI XPU")
-    counts = make_padded_counts(args.seed, args.active_experts)
+    counts = (
+        make_sweep_counts(args.sweep_rows)
+        if args.sweep_rows is not None
+        else make_padded_counts(args.seed, args.active_experts)
+    )
+    if args.allocated_rows < int(counts.sum()):
+        parser.error("allocated rows must cover all routed rows")
+    if args.allocated_rows % ALIGNMENT:
+        parser.error("allocated rows must be a multiple of 4")
     projections = []
     if args.projection in ("gate_up", "both"):
         projections.append(("gate_up", 2 * INTERMEDIATE, HIDDEN))
@@ -144,7 +184,9 @@ def main() -> None:
         projections.append(("down", HIDDEN, INTERMEDIATE))
 
     for index, projection in enumerate(projections):
-        benchmark_projection(*projection, counts, args.warmup, args.iterations)
+        benchmark_projection(
+            *projection, counts, args.warmup, args.iterations, args.allocated_rows
+        )
         if index + 1 < len(projections):
             time.sleep(2)
 
