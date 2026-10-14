@@ -131,7 +131,7 @@ void muse_vocab_parallel_embedding(
     int64_t num_org_padding,
     int64_t added_start,
     int64_t added_end);
-void muse_softcap_logits(torch::Tensor logits, double cap);
+void softcap_logits(torch::Tensor logits, double cap);
 void topk_softmax(at::Tensor& topk_weights, at::Tensor& topk_indices, at::Tensor& gating_output, bool renormalize);
 void topk_sigmoid(
     at::Tensor& topk_weights,

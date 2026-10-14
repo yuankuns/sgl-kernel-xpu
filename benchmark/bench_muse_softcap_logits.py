@@ -34,7 +34,7 @@ def main() -> None:
         )
 
     def run_sycl() -> None:
-        torch.ops.sgl_kernel.muse_softcap_logits(sycl_logits, cap)
+        torch.ops.sgl_kernel.softcap_logits(sycl_logits, cap)
 
     run_triton()
     run_sycl()
@@ -69,7 +69,7 @@ def main() -> None:
         "sycl": [
             event["dur"]
             for event in events
-            if event.get("cat") == "kernel" and "MuseSoftcapLogits" in event["name"]
+            if event.get("cat") == "kernel" and "SoftcapLogits" in event["name"]
         ],
     }
     logical_bytes = 2 * source.numel() * source.element_size()

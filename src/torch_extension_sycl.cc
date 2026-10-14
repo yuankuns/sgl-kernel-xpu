@@ -57,8 +57,8 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "int org_end, int num_org_padding, int added_start, int added_end) -> ()");
   m.impl("muse_vocab_parallel_embedding", torch::kXPU, &at::native::xpu::muse_vocab_parallel_embedding);
 
-  m.def("muse_softcap_logits(Tensor(a!) logits, float cap) -> ()");
-  m.impl("muse_softcap_logits", torch::kXPU, &at::native::xpu::muse_softcap_logits);
+  m.def("softcap_logits(Tensor(a!) logits, float cap) -> ()");
+  m.impl("softcap_logits", torch::kXPU, &at::native::xpu::softcap_logits);
 
   m.def("topk_softmax(Tensor! topk_weights, Tensor! topk_indices, Tensor gating_output, bool renormalize) -> ()");
   m.impl("topk_softmax", torch::kXPU, &at::native::xpu::topk_softmax);

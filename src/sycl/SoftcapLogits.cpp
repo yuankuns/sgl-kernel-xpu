@@ -14,7 +14,7 @@ namespace {
 constexpr int kSoftcapWorkgroup = 128;
 
 template <typename Scalar, bool Contiguous>
-struct MuseSoftcapLogitsKernel {
+struct SoftcapLogitsKernel {
   Scalar* __restrict__ logits;
   int64_t nrows;
   int64_t ncols;
@@ -39,7 +39,7 @@ struct MuseSoftcapLogitsKernel {
   }
 };
 
-struct MuseSoftcapLogitsFloat4Kernel {
+struct SoftcapLogitsFloat4Kernel {
   float* __restrict__ logits;
   int64_t numel;
   float cap;
@@ -61,7 +61,7 @@ struct MuseSoftcapLogitsFloat4Kernel {
 
 }  // namespace
 
-void muse_softcap_logits(torch::Tensor logits, double cap) {
+void softcap_logits(torch::Tensor logits, double cap) {
   TORCH_CHECK(logits.is_xpu(), "logits must be on XPU");
   TORCH_CHECK(
       logits.scalar_type() == at::kFloat || logits.scalar_type() == at::kBFloat16 || logits.scalar_type() == at::kHalf,
@@ -82,35 +82,35 @@ void muse_softcap_logits(torch::Tensor logits, double cap) {
   if (logits.scalar_type() == at::kFloat) {
     if (contiguous && logits.numel() % 4 == 0 && reinterpret_cast<uintptr_t>(logits.data_ptr()) % 16 == 0) {
       const auto vector_groups = (logits.numel() / 4 + kSoftcapWorkgroup - 1) / kSoftcapWorkgroup;
-      MuseSoftcapLogitsFloat4Kernel kernel{logits.data_ptr<float>(), logits.numel(), static_cast<float>(cap)};
+      SoftcapLogitsFloat4Kernel kernel{logits.data_ptr<float>(), logits.numel(), static_cast<float>(cap)};
       sycl_kernel_submit(
           sycl::range<1>(vector_groups * kSoftcapWorkgroup), sycl::range<1>(kSoftcapWorkgroup), queue, kernel);
     } else if (contiguous) {
-      MuseSoftcapLogitsKernel<float, true> kernel{
+      SoftcapLogitsKernel<float, true> kernel{
           logits.data_ptr<float>(), nrows, ncols, row_stride, static_cast<float>(cap)};
       sycl_kernel_submit(sycl::range<1>(global_size), sycl::range<1>(kSoftcapWorkgroup), queue, kernel);
     } else {
-      MuseSoftcapLogitsKernel<float, false> kernel{
+      SoftcapLogitsKernel<float, false> kernel{
           logits.data_ptr<float>(), nrows, ncols, row_stride, static_cast<float>(cap)};
       sycl_kernel_submit(sycl::range<1>(global_size), sycl::range<1>(kSoftcapWorkgroup), queue, kernel);
     }
   } else if (logits.scalar_type() == at::kBFloat16) {
     if (contiguous) {
-      MuseSoftcapLogitsKernel<at::BFloat16, true> kernel{
+      SoftcapLogitsKernel<at::BFloat16, true> kernel{
           logits.data_ptr<at::BFloat16>(), nrows, ncols, row_stride, static_cast<float>(cap)};
       sycl_kernel_submit(sycl::range<1>(global_size), sycl::range<1>(kSoftcapWorkgroup), queue, kernel);
     } else {
-      MuseSoftcapLogitsKernel<at::BFloat16, false> kernel{
+      SoftcapLogitsKernel<at::BFloat16, false> kernel{
           logits.data_ptr<at::BFloat16>(), nrows, ncols, row_stride, static_cast<float>(cap)};
       sycl_kernel_submit(sycl::range<1>(global_size), sycl::range<1>(kSoftcapWorkgroup), queue, kernel);
     }
   } else {
     if (contiguous) {
-      MuseSoftcapLogitsKernel<at::Half, true> kernel{
+      SoftcapLogitsKernel<at::Half, true> kernel{
           logits.data_ptr<at::Half>(), nrows, ncols, row_stride, static_cast<float>(cap)};
       sycl_kernel_submit(sycl::range<1>(global_size), sycl::range<1>(kSoftcapWorkgroup), queue, kernel);
     } else {
-      MuseSoftcapLogitsKernel<at::Half, false> kernel{
+      SoftcapLogitsKernel<at::Half, false> kernel{
           logits.data_ptr<at::Half>(), nrows, ncols, row_stride, static_cast<float>(cap)};
       sycl_kernel_submit(sycl::range<1>(global_size), sycl::range<1>(kSoftcapWorkgroup), queue, kernel);
     }
