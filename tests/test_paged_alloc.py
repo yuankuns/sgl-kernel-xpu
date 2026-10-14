@@ -1,13 +1,8 @@
-import os
 import time
 
 import pytest
 import torch
-
-if library := os.environ.get("MUSE_MEMORY_TEST_LIBRARY"):
-    torch.ops.load_library(library)
-else:
-    import sgl_kernel  # noqa: F401
+import sgl_kernel  # noqa: F401
 
 
 @pytest.fixture(autouse=True)
