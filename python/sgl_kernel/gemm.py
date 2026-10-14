@@ -42,6 +42,73 @@ def fp8_scaled_mm(mat_a, mat_b, scales_a, scales_b, out_dtype, bias=None):
     )
 
 
+def bf16_gemm_nt(
+    mat_a: torch.Tensor, mat_b: torch.Tensor, *, packed_weight: bool = False
+) -> torch.Tensor:
+    """Compute an XPU BF16 GEMM with a model-native or prepacked weight.
+
+    ``mat_b`` is ``[N, K]`` by default. When ``packed_weight`` is true it is
+    a contiguous ``[K, padded_N]`` tensor produced by
+    :func:`pack_bf16_gemm_weight`. The caller crops padded output columns.
+    """
+    assert mat_a.ndim == 2 and mat_b.ndim == 2
+    k = mat_b.shape[0] if packed_weight else mat_b.shape[1]
+    n = mat_b.shape[1] if packed_weight else mat_b.shape[0]
+    assert mat_a.shape[1] == k
+    # These are kernel-vs-packed-oneDNN boundaries for the three measured
+    # Muse-Spark projections. The model separately decides whether packing
+    # beats its original-weight path. O switches at M=16/17; its CuTe path
+    # was 0.171 ms at M=96 versus 0.125 ms for packed oneDNN. The lm_head
+    # N is padded from 202048. Its CuTe path wins at sampled M=65..79;
+    # packed oneDNN wins strongly by M=95/96, with a near tie at M=80/81.
+    use_packed_kernel = not packed_weight or (
+        (
+            n == 202240
+            and k == 8192
+            and (mat_a.shape[0] <= 16 or 33 <= mat_a.shape[0] <= 79)
+        )
+        or (
+            n == 18432
+            and k == 8192
+            and (mat_a.shape[0] <= 8 or 33 <= mat_a.shape[0] <= 96)
+        )
+        or (n == 8192 and k == 8192 and mat_a.shape[0] <= 16)
+    )
+    if (
+        mat_a.device.type != "xpu"
+        or mat_a.dtype != torch.bfloat16
+        or mat_b.dtype != torch.bfloat16
+        or not mat_a.is_contiguous()
+        or not mat_b.is_contiguous()
+        or k % 16 != 0
+        or n % 16 != 0
+        or not use_packed_kernel
+    ):
+        return torch.mm(mat_a, mat_b if packed_weight else mat_b.T)
+    out = torch.empty((mat_a.shape[0], n), dtype=torch.bfloat16, device=mat_a.device)
+    torch.ops.sgl_kernel.bf16_gemm_nt.default(
+        out, mat_a, mat_b, 2 if packed_weight else 0
+    )
+    return out
+
+
+def pack_bf16_gemm_weight(weight: torch.Tensor) -> torch.Tensor:
+    """Pack a contiguous ``[N, K]`` BF16 weight as padded ``[K, N]``."""
+    assert weight.ndim == 2
+    assert weight.dtype == torch.bfloat16
+    assert weight.is_contiguous()
+    n, k = weight.shape
+    padded_n = (n + 255) // 256 * 256
+    # Materialize the transpose before writing into a padded slice. XPU
+    # copy_ from a transposed source can leave isolated columns unwritten.
+    transposed = weight.T.contiguous()
+    if padded_n == n:
+        return transposed
+    packed = torch.zeros((k, padded_n), dtype=weight.dtype, device=weight.device)
+    packed[:, :n].copy_(transposed)
+    return packed
+
+
 def _bmm_fp8_internal(
     workspace_buffer: torch.Tensor,
     A: torch.Tensor,
