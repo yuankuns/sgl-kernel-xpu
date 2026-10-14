@@ -66,7 +66,7 @@ inline int64_t page_offset(int64_t position, int64_t page_size) {
 }
 
 template <typename LastScalar, int TilesPerReq, int PageShift>
-struct MuseAllocExtendKernel {
+struct PagedAllocExtendKernel {
   const int64_t* __restrict__ prefix_lens;
   const int64_t* __restrict__ seq_lens;
   const LastScalar* __restrict__ last_loc;
@@ -110,7 +110,7 @@ struct MuseAllocExtendKernel {
 
 // One launch produces the paged locations and writes the request table.
 template <typename LastScalar, int TilesPerReq, int PageShift>
-struct MuseAllocExtendAndWriteKernel {
+struct PagedAllocExtendAndWriteKernel {
   const int64_t* __restrict__ prefix_lens;
   const int64_t* __restrict__ seq_lens;
   const LastScalar* __restrict__ last_loc;
@@ -170,7 +170,7 @@ struct MuseAllocExtendAndWriteKernel {
 };
 
 template <typename LastScalar, int PageShift>
-struct MuseAllocDecodeKernel {
+struct PagedAllocDecodeKernel {
   const int64_t* __restrict__ seq_lens;
   const LastScalar* __restrict__ last_loc;
   const int64_t* __restrict__ free_pages;
@@ -220,7 +220,7 @@ void launch_extend(
     int64_t page_size,
     sycl::queue& queue) {
   const int64_t batch = prefix_lens.numel();
-  MuseAllocExtendKernel<LastScalar, TilesPerReq, PageShift> kernel{
+  PagedAllocExtendKernel<LastScalar, TilesPerReq, PageShift> kernel{
       prefix_lens.data_ptr<int64_t>(),
       seq_lens.data_ptr<int64_t>(),
       last_loc.data_ptr<LastScalar>(),
@@ -264,7 +264,7 @@ void launch_extend_and_write(
     int64_t page_size,
     sycl::queue& queue) {
   const int64_t batch = prefix_lens.numel();
-  MuseAllocExtendAndWriteKernel<LastScalar, TilesPerReq, PageShift> kernel{
+  PagedAllocExtendAndWriteKernel<LastScalar, TilesPerReq, PageShift> kernel{
       prefix_lens.data_ptr<int64_t>(),
       seq_lens.data_ptr<int64_t>(),
       last_loc.data_ptr<LastScalar>(),
@@ -341,7 +341,7 @@ void launch_decode(
     int64_t page_size,
     sycl::queue& queue) {
   const int64_t batch = seq_lens.numel();
-  MuseAllocDecodeKernel<LastScalar, PageShift> kernel{
+  PagedAllocDecodeKernel<LastScalar, PageShift> kernel{
       seq_lens.data_ptr<int64_t>(),
       last_loc.data_ptr<LastScalar>(),
       free_pages.data_ptr<int64_t>(),
@@ -378,7 +378,7 @@ void dispatch_page_family(int64_t page_size, Launch&& launch) {
 
 }  // namespace
 
-void muse_alloc_extend(
+void paged_alloc_extend(
     torch::Tensor prefix_lens,
     torch::Tensor seq_lens,
     torch::Tensor last_loc,
@@ -412,7 +412,7 @@ void muse_alloc_extend(
   }
 }
 
-void muse_alloc_extend_and_write(
+void paged_alloc_extend_and_write(
     torch::Tensor prefix_lens,
     torch::Tensor seq_lens,
     torch::Tensor last_loc,
@@ -474,7 +474,7 @@ void muse_alloc_extend_and_write(
   }
 }
 
-void muse_alloc_decode(
+void paged_alloc_decode(
     torch::Tensor seq_lens,
     torch::Tensor last_loc,
     torch::Tensor free_pages,

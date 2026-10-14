@@ -16,7 +16,7 @@ def cool_between_device_shapes():
 
 
 @pytest.mark.parametrize("last_dtype", [torch.int32, torch.int64])
-def test_muse_alloc_extend_crosses_page_boundaries(last_dtype):
+def test_paged_alloc_extend_crosses_page_boundaries(last_dtype):
     if not torch.xpu.is_available():
         pytest.skip("XPU unavailable")
     device = "xpu"
@@ -25,7 +25,7 @@ def test_muse_alloc_extend_crosses_page_boundaries(last_dtype):
     last = torch.tensor([101, -1, 202, 400], device=device, dtype=last_dtype)
     free_pages = torch.tensor([10, 20, 30], device=device, dtype=torch.int64)
     out = torch.empty(10, device=device, dtype=torch.int64)
-    torch.ops.sgl_kernel.muse_alloc_extend(pre, seq, last, free_pages, out, 4)
+    torch.ops.sgl_kernel.paged_alloc_extend(pre, seq, last, free_pages, out, 4)
     expected = torch.tensor(
         [102, 103, 40, 80, 81, 203, 120, 121, 401, 402],
         device=device,
@@ -37,7 +37,7 @@ def test_muse_alloc_extend_crosses_page_boundaries(last_dtype):
 
 @pytest.mark.parametrize("last_dtype", [torch.int32, torch.int64])
 @pytest.mark.parametrize("page_size", [4, 32, 64, 128])
-def test_muse_alloc_decode_reuses_or_opens_page(last_dtype, page_size):
+def test_paged_alloc_decode_reuses_or_opens_page(last_dtype, page_size):
     if not torch.xpu.is_available():
         pytest.skip("XPU unavailable")
     device = "xpu"
@@ -49,7 +49,7 @@ def test_muse_alloc_decode_reuses_or_opens_page(last_dtype, page_size):
     last = torch.tensor([23, 31, 39, 47], device=device, dtype=last_dtype)
     free_pages = torch.tensor([11, 12], device=device, dtype=torch.int64)
     out = torch.empty_like(seq)
-    torch.ops.sgl_kernel.muse_alloc_decode(seq, last, free_pages, out, page_size)
+    torch.ops.sgl_kernel.paged_alloc_decode(seq, last, free_pages, out, page_size)
     expected = torch.tensor(
         [24, 11 * page_size, 40, 12 * page_size], device=device, dtype=torch.int64
     )
@@ -58,7 +58,7 @@ def test_muse_alloc_decode_reuses_or_opens_page(last_dtype, page_size):
 
 
 @pytest.mark.parametrize("last_dtype", [torch.int32, torch.int64])
-def test_muse_alloc_extend_page64_partial_and_new_pages(last_dtype):
+def test_paged_alloc_extend_page64_partial_and_new_pages(last_dtype):
     if not torch.xpu.is_available():
         pytest.skip("XPU unavailable")
     pre = torch.tensor([62, 64, 127], device="xpu", dtype=torch.int64)
@@ -66,7 +66,7 @@ def test_muse_alloc_extend_page64_partial_and_new_pages(last_dtype):
     last = torch.tensor([300, -1, 511], device="xpu", dtype=last_dtype)
     free_pages = torch.tensor([10, 20, 30, 40], device="xpu", dtype=torch.int64)
     out = torch.empty(73, device="xpu", dtype=torch.int64)
-    torch.ops.sgl_kernel.muse_alloc_extend(pre, seq, last, free_pages, out, 64)
+    torch.ops.sgl_kernel.paged_alloc_extend(pre, seq, last, free_pages, out, 64)
     expected = torch.tensor(
         [301, 302, 640, 641] + list(range(1280, 1344)) + [1920, 1921, 512, 2560, 2561],
         device="xpu",
@@ -78,7 +78,7 @@ def test_muse_alloc_extend_page64_partial_and_new_pages(last_dtype):
 
 @pytest.mark.parametrize("page_size", [7, 32, 64, 128])
 @pytest.mark.parametrize("last_dtype", [torch.int32, torch.int64])
-def test_muse_alloc_extend_and_write_matches_split_with_prefix(page_size, last_dtype):
+def test_paged_alloc_extend_and_write_matches_split_with_prefix(page_size, last_dtype):
     if not torch.xpu.is_available():
         pytest.skip("XPU unavailable")
     prefix_lens = torch.tensor(
@@ -104,13 +104,13 @@ def test_muse_alloc_extend_and_write_matches_split_with_prefix(page_size, last_d
     pointers = torch.tensor(
         [tensor.data_ptr() for tensor in prefixes], device="xpu", dtype=torch.uint64
     )
-    torch.ops.sgl_kernel.muse_alloc_extend(
+    torch.ops.sgl_kernel.paged_alloc_extend(
         prefix_lens, seq_lens, last, free_pages, split_out, page_size
     )
-    torch.ops.sgl_kernel.muse_write_req_to_token_pool(
+    torch.ops.sgl_kernel.write_req_to_token_pool(
         split_pool, req_indices, pointers, prefix_lens, seq_lens, extend_lens, split_out
     )
-    torch.ops.sgl_kernel.muse_alloc_extend_and_write(
+    torch.ops.sgl_kernel.paged_alloc_extend_and_write(
         prefix_lens,
         seq_lens,
         last,

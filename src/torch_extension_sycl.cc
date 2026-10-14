@@ -48,25 +48,25 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.impl("gemma_fused_add_rmsnorm", torch::kXPU, &at::native::xpu::gemma_fused_add_rmsnorm);
 
   m.def(
-      "muse_write_req_to_token_pool(Tensor(a!) req_to_token, Tensor req_pool_indices, Tensor prefix_pointers, "
+      "write_req_to_token_pool(Tensor(a!) req_to_token, Tensor req_pool_indices, Tensor prefix_pointers, "
       "Tensor prefix_lens, Tensor seq_lens, Tensor extend_lens, Tensor out_cache_loc) -> ()");
-  m.impl("muse_write_req_to_token_pool", torch::kXPU, &at::native::xpu::muse_write_req_to_token_pool);
+  m.impl("write_req_to_token_pool", torch::kXPU, &at::native::xpu::write_req_to_token_pool);
 
   m.def(
-      "muse_alloc_extend(Tensor prefix_lens, Tensor seq_lens, Tensor last_loc, Tensor free_pages, Tensor! "
+      "paged_alloc_extend(Tensor prefix_lens, Tensor seq_lens, Tensor last_loc, Tensor free_pages, Tensor! "
       "out_indices, int page_size) -> ()");
-  m.impl("muse_alloc_extend", torch::kXPU, &at::native::xpu::muse_alloc_extend);
+  m.impl("paged_alloc_extend", torch::kXPU, &at::native::xpu::paged_alloc_extend);
 
   m.def(
-      "muse_alloc_extend_and_write(Tensor prefix_lens, Tensor seq_lens, Tensor last_loc, Tensor free_pages, "
+      "paged_alloc_extend_and_write(Tensor prefix_lens, Tensor seq_lens, Tensor last_loc, Tensor free_pages, "
       "Tensor(a!) out_indices, Tensor(b!) req_to_token, Tensor req_pool_indices, Tensor prefix_pointers, int "
       "page_size) -> ()");
-  m.impl("muse_alloc_extend_and_write", torch::kXPU, &at::native::xpu::muse_alloc_extend_and_write);
+  m.impl("paged_alloc_extend_and_write", torch::kXPU, &at::native::xpu::paged_alloc_extend_and_write);
 
   m.def(
-      "muse_alloc_decode(Tensor seq_lens, Tensor last_loc, Tensor free_pages, Tensor! out_indices, int page_size) -> "
+      "paged_alloc_decode(Tensor seq_lens, Tensor last_loc, Tensor free_pages, Tensor! out_indices, int page_size) -> "
       "()");
-  m.impl("muse_alloc_decode", torch::kXPU, &at::native::xpu::muse_alloc_decode);
+  m.impl("paged_alloc_decode", torch::kXPU, &at::native::xpu::paged_alloc_decode);
 
   m.def("topk_softmax(Tensor! topk_weights, Tensor! topk_indices, Tensor gating_output, bool renormalize) -> ()");
   m.impl("topk_softmax", torch::kXPU, &at::native::xpu::topk_softmax);

@@ -12,7 +12,7 @@ namespace {
 
 constexpr int kWorkgroup = 256;
 
-struct MuseWriteReqToTokenPoolKernel {
+struct WriteReqToTokenPoolKernel {
   int32_t* __restrict__ req_to_token;
   const int64_t* __restrict__ req_pool_indices;
   const uint64_t* __restrict__ prefix_pointers;
@@ -58,7 +58,7 @@ void check_xpu_vector(const torch::Tensor& tensor, const char* name, at::ScalarT
 
 }  // namespace
 
-void muse_write_req_to_token_pool(
+void write_req_to_token_pool(
     torch::Tensor req_to_token,
     torch::Tensor req_pool_indices,
     torch::Tensor prefix_pointers,
@@ -88,7 +88,7 @@ void muse_write_req_to_token_pool(
   // The cache-location vector estimates extension length without reading XPU metadata on the host.
   const int64_t groups_per_request =
       std::min<int64_t>(8, std::max<int64_t>(1, (out_cache_loc.numel() + num_reqs * 512 - 1) / (num_reqs * 512)));
-  MuseWriteReqToTokenPoolKernel kernel{
+  WriteReqToTokenPoolKernel kernel{
       req_to_token.data_ptr<int32_t>(),
       req_pool_indices.data_ptr<int64_t>(),
       prefix_pointers.data_ptr<uint64_t>(),
