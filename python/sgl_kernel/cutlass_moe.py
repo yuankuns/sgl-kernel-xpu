@@ -28,25 +28,16 @@ _FP8_E4M3_MAX = 448.0
 
 _MXFP8_BLOCK_SIZE = 32
 _NVFP4_WOQ_COMPUTE_ENV = "SGLANG_NVFP4_WOQ_COMPUTE"
-_NVFP4_WOQ_DECODE_ROWS_PER_EXPERT = 4
 
 
-def _nvfp4_woq_compute_mode(
-    total_routed_rows: Optional[int] = None, num_experts: Optional[int] = None
-) -> str:
+def _nvfp4_woq_compute_mode() -> str:
     mode = os.getenv(_NVFP4_WOQ_COMPUTE_ENV, "auto").strip().lower()
     if mode not in ("auto", "mxfp8", "bf16"):
         raise ValueError(
             f"{_NVFP4_WOQ_COMPUTE_ENV} must be 'auto', 'mxfp8', or 'bf16', "
             f"got {mode!r}"
         )
-    if mode == "auto" and total_routed_rows is not None:
-        assert num_experts is not None and num_experts > 0
-        rows_per_expert = (total_routed_rows + num_experts - 1) // num_experts
-        return (
-            "bf16" if rows_per_expert <= _NVFP4_WOQ_DECODE_ROWS_PER_EXPERT else "mxfp8"
-        )
-    return mode
+    return "bf16" if mode == "auto" else mode
 
 
 def _per_token_group_quant_fp8(x: torch.Tensor, group_size: int = 128):
@@ -513,10 +504,8 @@ def cutlass_fused_experts_nvfp4_woq(
 ) -> torch.Tensor:
     """Fused MoE with NVFP4 weights and MXFP8 or BF16 computation.
 
-    The weights stay 4-bit in memory. By default, decode shapes with at most
-    four average routed rows per expert use BF16, while larger prefill shapes
-    use in-register MXFP8 requantization. ``SGLANG_NVFP4_WOQ_COMPUTE`` can
-    force ``auto``, ``mxfp8``, or ``bf16``.
+    The weights stay 4-bit in memory. Auto mode uses BF16 computation.
+    ``SGLANG_NVFP4_WOQ_COMPUTE`` can select ``auto``, ``mxfp8``, or ``bf16``.
     For MXFP8, each 32-wide MMA-K slice is converted immediately before BDPAS.
     Setting ``SGLANG_NVFP4_WOQ_QUANTIZE_IN_K_LOOP=0`` instead converts the
     complete 64-wide K tile first.
@@ -557,7 +546,7 @@ def cutlass_fused_experts_nvfp4_woq(
     n = w2_q.size(2) * 2  # w2_q is (E, k, n/2)
     topk = topk_ids.size(1)
     device = a.device
-    compute_mode = _nvfp4_woq_compute_mode(m * topk, num_experts)
+    compute_mode = _nvfp4_woq_compute_mode()
 
     assert (
         w1_q.size(2) * 2 == k

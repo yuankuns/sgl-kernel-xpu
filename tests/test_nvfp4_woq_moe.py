@@ -41,11 +41,11 @@ def test_compute_mode_environment(monkeypatch):
     from sgl_kernel.cutlass_moe import _nvfp4_woq_compute_mode
 
     monkeypatch.delenv("SGLANG_NVFP4_WOQ_COMPUTE", raising=False)
-    assert _nvfp4_woq_compute_mode() == "auto"
-    assert _nvfp4_woq_compute_mode(256 * 4, 256) == "bf16"
-    assert _nvfp4_woq_compute_mode(256 * 16, 256) == "mxfp8"
+    assert _nvfp4_woq_compute_mode() == "bf16"
     monkeypatch.setenv("SGLANG_NVFP4_WOQ_COMPUTE", " BF16 ")
     assert _nvfp4_woq_compute_mode() == "bf16"
+    monkeypatch.setenv("SGLANG_NVFP4_WOQ_COMPUTE", " MXFP8 ")
+    assert _nvfp4_woq_compute_mode() == "mxfp8"
     monkeypatch.setenv("SGLANG_NVFP4_WOQ_COMPUTE", "invalid")
     with pytest.raises(ValueError, match="must be 'auto', 'mxfp8', or 'bf16'"):
         _nvfp4_woq_compute_mode()
