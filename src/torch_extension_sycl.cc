@@ -47,6 +47,19 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.def("gemma_fused_add_rmsnorm(Tensor! input, Tensor! residual, Tensor weight, float eps) -> ()");
   m.impl("gemma_fused_add_rmsnorm", torch::kXPU, &at::native::xpu::gemma_fused_add_rmsnorm);
 
+  m.def(
+      "muse_vocab_mask(Tensor input, int org_start, int org_end, int num_org_padding, int added_start, "
+      "int added_end) -> (Tensor, Tensor)");
+  m.impl("muse_vocab_mask", torch::kXPU, &at::native::xpu::muse_vocab_mask);
+
+  m.def(
+      "muse_vocab_parallel_embedding(Tensor input, Tensor weight, Tensor! output, int org_start, "
+      "int org_end, int num_org_padding, int added_start, int added_end) -> ()");
+  m.impl("muse_vocab_parallel_embedding", torch::kXPU, &at::native::xpu::muse_vocab_parallel_embedding);
+
+  m.def("muse_softcap_logits(Tensor(a!) logits, float cap) -> ()");
+  m.impl("muse_softcap_logits", torch::kXPU, &at::native::xpu::muse_softcap_logits);
+
   m.def("topk_softmax(Tensor! topk_weights, Tensor! topk_indices, Tensor gating_output, bool renormalize) -> ()");
   m.impl("topk_softmax", torch::kXPU, &at::native::xpu::topk_softmax);
 

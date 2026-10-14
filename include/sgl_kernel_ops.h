@@ -115,6 +115,23 @@ void rmsnorm(torch::Tensor& output, torch::Tensor& input, torch::Tensor& weight,
 void fused_add_rmsnorm(torch::Tensor input, torch::Tensor residual, torch::Tensor weight, double eps);
 void gemma_rmsnorm(torch::Tensor& output, torch::Tensor& input, torch::Tensor& weight, double eps);
 void gemma_fused_add_rmsnorm(torch::Tensor& input, torch::Tensor& residual, torch::Tensor& weight, double eps);
+std::tuple<torch::Tensor, torch::Tensor> muse_vocab_mask(
+    torch::Tensor input,
+    int64_t org_start,
+    int64_t org_end,
+    int64_t num_org_padding,
+    int64_t added_start,
+    int64_t added_end);
+void muse_vocab_parallel_embedding(
+    torch::Tensor input,
+    torch::Tensor weight,
+    torch::Tensor output,
+    int64_t org_start,
+    int64_t org_end,
+    int64_t num_org_padding,
+    int64_t added_start,
+    int64_t added_end);
+void muse_softcap_logits(torch::Tensor logits, double cap);
 void topk_softmax(at::Tensor& topk_weights, at::Tensor& topk_indices, at::Tensor& gating_output, bool renormalize);
 void topk_sigmoid(
     at::Tensor& topk_weights,
