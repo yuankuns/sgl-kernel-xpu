@@ -722,6 +722,7 @@ void moe_grouped_mm_nt_xe35_mxfp4_w4a16(
     double gemm1_limit = 7.0);
 void dsv3_router_gemm_xpu(torch::Tensor& output, const torch::Tensor& mat_a, const torch::Tensor& mat_b);
 void dsv3_fused_a_gemm_xpu(torch::Tensor& output, const torch::Tensor& mat_a, const torch::Tensor& mat_b);
+void bf16_gemm_nt_xpu(torch::Tensor& output, const torch::Tensor& mat_a, const torch::Tensor& mat_b, int64_t config);
 torch::Tensor fp8_scaled_mm_xpu(
     const torch::Tensor& mat_a,
     const torch::Tensor& mat_b,

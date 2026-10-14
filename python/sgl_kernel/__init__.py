@@ -43,6 +43,7 @@ from sgl_kernel.elementwise import (
 from sgl_kernel.gdn_attn import gdn_attention
 from sgl_kernel.gemm import (
     awq_dequantize,
+    bf16_gemm_nt,
     bmm_fp8,
     cutlass_scaled_fp4_mm,
     dsv3_fused_a_gemm,
@@ -50,6 +51,7 @@ from sgl_kernel.gemm import (
     fp8_blockwise_scaled_mm,
     fp8_scaled_mm,
     int8_scaled_mm,
+    pack_bf16_gemm_weight,
     qserve_w4a8_per_chn_gemm,
     qserve_w4a8_per_group_gemm,
     scaled_fp4_experts_quant,
