@@ -291,19 +291,14 @@ struct PerTokenGroupQuantFP4Kernel : public __SYCL_KER_CONFIG_CONVENTION__ {
   float eps;
 };
 
-// CRI BF16 graph timing at 128 groups per row brackets the first near-tie or
-// crossover at 255/256 rows for gather, 368/369 for fused SwiGLU, and
-// 372/373 for plain quantization. Use one lane for other group widths until
-// their crossover is measured, and for FP16/FP32 inputs until those dtype
-// paths are timed. Lanes stay within a row for scale_map masking.
-static int fp4_quant_lanes_per_group(
-    int64_t num_groups, int64_t row_groups, bool bf16_input, bool padded_gather, bool fused_swiglu) {
-  constexpr int64_t kMaxGatherGroups4Lanes = 255 * 128;
-  constexpr int64_t kMaxFusedGroups4Lanes = 368 * 128;
-  constexpr int64_t kMaxPlainGroups4Lanes = 372 * 128;
-  const int64_t max_groups =
-      padded_gather ? kMaxGatherGroups4Lanes : (fused_swiglu ? kMaxFusedGroups4Lanes : kMaxPlainGroups4Lanes);
-  return bf16_input && row_groups == 128 && num_groups <= max_groups ? 4 : 1;
+// GPU graph timing shows four lanes are useful for small fused BF16 surfaces
+// across output widths 2048, 4096 and 8192. The first crossover is near
+// 48 Ki groups, independent of how those groups are divided into rows.
+// Plain quantization and padded gather have no stable four-lane advantage.
+// One lane is the default for input dtypes without a measured crossover.
+static int fp4_quant_lanes_per_group(int64_t num_groups, bool bf16_input, bool fused_swiglu) {
+  constexpr int64_t kFourLaneFusedGroupLimit = 48 * 1024;
+  return bf16_input && fused_swiglu && num_groups <= kFourLaneFusedGroupLimit ? 4 : 1;
 }
 
 // `scale_map` is an optional [rows, 2] int32 (block start, block rows) table
@@ -399,8 +394,8 @@ void sgl_per_token_group_quant_fp4(
   }
 
   auto queue = dpcppGetCurrentQueue();
-  const int lanes = fp4_quant_lanes_per_group(
-      num_groups, row_groups, input.scalar_type() == at::ScalarType::BFloat16, false, fuse_silu_and_mul);
+  const int lanes =
+      fp4_quant_lanes_per_group(num_groups, input.scalar_type() == at::ScalarType::BFloat16, fuse_silu_and_mul);
 
 // A block holds a whole number of quantization groups, so the sub-group
 // butterfly in `QuantGroupReduceMaxFP4` stays inside one group (a no-op at the
@@ -546,12 +541,9 @@ void sgl_padded_gather_per_token_group_quant_fp4(
   if (eps_f <= 0.0f) eps_f = 1e-10f;
 
   auto queue = dpcppGetCurrentQueue();
-  const int lanes =
-      fp4_quant_lanes_per_group(num_groups, row_groups, input.scalar_type() == at::ScalarType::BFloat16, true, false);
-
-#define LAUNCH_PADDED_GATHER_FP4_L(T, INDEX_T, LANES)                                                               \
+#define LAUNCH_PADDED_GATHER_FP4(T, INDEX_T)                                                                       \
   do {                                                                                                              \
-    using Kernel = PerTokenGroupQuantFP4Kernel<T, 32, false, LANES, true, INDEX_T>;                                 \
+    using Kernel = PerTokenGroupQuantFP4Kernel<T, 32, false, 1, true, INDEX_T>;                                     \
     constexpr int kTargetThreads = 256;                                                                             \
     int groups_per_block = kTargetThreads / Kernel::THREADS_PER_GROUP;                                              \
     while (groups_per_block > 1 && num_groups % groups_per_block != 0) {                                            \
@@ -573,15 +565,6 @@ void sgl_padded_gather_per_token_group_quant_fp4(
         sycl::range<1>(static_cast<size_t>(num_blocks) * num_threads), sycl::range<1>(num_threads), queue, kernel); \
   } while (0)
 
-#define LAUNCH_PADDED_GATHER_FP4(T, INDEX_T)     \
-  do {                                           \
-    if (lanes == 4) {                            \
-      LAUNCH_PADDED_GATHER_FP4_L(T, INDEX_T, 4); \
-    } else {                                     \
-      LAUNCH_PADDED_GATHER_FP4_L(T, INDEX_T, 1); \
-    }                                            \
-  } while (0)
-
 #define DISPATCH_PADDED_GATHER_INDEX(T)                 \
   do {                                                  \
     if (row_map.scalar_type() == at::ScalarType::Int) { \
@@ -599,7 +582,6 @@ void sgl_padded_gather_per_token_group_quant_fp4(
 
 #undef DISPATCH_PADDED_GATHER_INDEX
 #undef LAUNCH_PADDED_GATHER_FP4
-#undef LAUNCH_PADDED_GATHER_FP4_L
 }
 
 }  // namespace at::native::xpu

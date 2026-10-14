@@ -107,9 +107,9 @@ def test_topk_sigmoid(
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("n_token", [1, 7, 9, 17, 33, 129, 512, 2048, 4096])
-@pytest.mark.parametrize("n_expert", [128, 256])
+@pytest.mark.parametrize("n_expert", [32, 64, 128, 256])
 def test_muse_spark_topk8_fast_path(dtype, n_token, n_expert):
-    """Exercise every production fast-path specialization and tail group."""
+    """Check all full subgroup vector tiles, allowing equal-score ID ties."""
     torch.manual_seed(20260916 + n_token + n_expert)
     gating_output = torch.empty(n_token, n_expert, dtype=dtype, device=device).uniform_(
         -7.0, 7.0
@@ -119,14 +119,13 @@ def test_muse_spark_topk8_fast_path(dtype, n_token, n_expert):
     ).uniform_(-0.15, 0.15)
 
     expected_scores = torch.sigmoid(gating_output.float())
-    expected_ids = torch.topk(
-        expected_scores + correction_bias.unsqueeze(0),
+    ranking_scores = expected_scores + correction_bias.unsqueeze(0)
+    expected_rank_scores = torch.topk(
+        ranking_scores,
         k=8,
         dim=-1,
         sorted=True,
-    ).indices
-    expected_weights = expected_scores.gather(1, expected_ids)
-    expected_weights /= expected_weights.sum(dim=-1, keepdim=True)
+    ).values
 
     actual_weights = torch.empty(n_token, 8, dtype=torch.float32, device=device)
     actual_ids = torch.empty(n_token, 8, dtype=torch.int32, device=device)
@@ -138,12 +137,21 @@ def test_muse_spark_topk8_fast_path(dtype, n_token, n_expert):
         correction_bias,
     )
 
-    torch.testing.assert_close(actual_ids, expected_ids.to(torch.int32))
+    assert bool(((actual_ids >= 0) & (actual_ids < n_expert)).all())
+    assert bool((torch.diff(torch.sort(actual_ids, dim=-1).values, dim=-1) != 0).all())
+    torch.testing.assert_close(
+        ranking_scores.gather(1, actual_ids.long()),
+        expected_rank_scores,
+        atol=0,
+        rtol=0,
+    )
+    selected_scores = expected_scores.gather(1, actual_ids.long())
+    expected_weights = selected_scores / selected_scores.sum(dim=-1, keepdim=True)
     torch.testing.assert_close(actual_weights, expected_weights, atol=2.5e-4, rtol=0)
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-@pytest.mark.parametrize("n_expert", [128, 256])
+@pytest.mark.parametrize("n_expert", [32, 64, 128, 256])
 def test_muse_spark_topk8_ties_choose_lowest_expert(dtype, n_expert):
     gating_output = torch.zeros(9, n_expert, dtype=dtype, device=device)
     correction_bias = torch.zeros(n_expert, dtype=torch.float32, device=device)
@@ -166,6 +174,31 @@ def test_muse_spark_topk8_ties_choose_lowest_expert(dtype, n_expert):
         atol=0,
         rtol=0,
     )
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("n_expert", [32, 64, 128, 256])
+@pytest.mark.parametrize("n_token", [1, 129])
+@pytest.mark.parametrize("renormalize", [False, True])
+@pytest.mark.parametrize("with_bias", [False, True])
+def test_full_tile_topk8_options(dtype, n_expert, n_token, renormalize, with_bias):
+    torch.manual_seed(31000 + n_expert + n_token)
+    logits = torch.randn(n_token, n_expert, dtype=dtype, device=device)
+    bias = torch.randn(n_expert, dtype=torch.float32, device=device) if with_bias else None
+    weights = torch.empty(n_token, 8, dtype=torch.float32, device=device)
+    ids = torch.empty(n_token, 8, dtype=torch.int32, device=device)
+    sgl_kernel.topk_sigmoid(weights, ids, logits, renormalize, bias)
+
+    scores = torch.sigmoid(logits.float())
+    rank = scores if bias is None else scores + bias
+    torch.testing.assert_close(
+        rank.gather(1, ids.long()),
+        torch.topk(rank, 8, dim=-1, sorted=True).values,
+        rtol=0, atol=0,
+    )
+    selected = scores.gather(1, ids.long())
+    expected = selected / selected.sum(-1, keepdim=True) if renormalize else selected
+    torch.testing.assert_close(weights, expected, rtol=0, atol=2.5e-4)
 
 
 if __name__ == "__main__":

@@ -14,10 +14,6 @@ namespace at::native::xpu {
 
 namespace TopKSigmoidImpl {
 
-// The logits arrive as a plain vector load of `Raw`, the integer or float unit
-// that has T's layout: `sycl::vec` has no bf16 element type, and reading fp16
-// through it would make a lane slice's alignment depend on the SYCL vector
-// class rather than on the row.
 template <typename T>
 struct LogitBits {
   using Raw = uint16_t;
@@ -25,8 +21,7 @@ struct LogitBits {
     return static_cast<float>(sycl::bit_cast<T>(bits));
   }
 };
-// Muse Spark's router runs in fp32 (`moe_router_in_fp32`), so fp32 logits are a
-// production dtype for this kernel and not just a reference convenience.
+
 template <>
 struct LogitBits<float> {
   using Raw = float;
@@ -35,10 +30,7 @@ struct LogitBits<float> {
   }
 };
 
-// Every parameter the model's routing carries.  `topk_sigmoid` leaves the Muse
-// Spark specific ones neutral (multiplier and scale 1, epsilon 0, no expert
-// table, every row valid) and gets exactly the arithmetic it had before they
-// existed; `muse_spark_moe_routing` fills them in.
+// Runtime routing parameters shared by every supported expert count and top-k.
 struct RoutingArguments {
   float* weights;
   int* ids;
@@ -65,24 +57,19 @@ inline bool row_is_padding(RoutingArguments const& args, int row) {
   return args.num_valid_tokens != nullptr && row >= *args.num_valid_tokens;
 }
 
-// Muse Spark's production routing shape is 256 experts and top-k 8 (128
-// experts is also used by the same model family).  Keep that path fully
-// compile-time specialized: one subgroup owns a token, loads one vector per
-// lane, and lets the eight result lanes recompute and normalize their selected
-// sigmoid values in parallel.  The generic kernels below remain authoritative
-// for every other shape.
-template <typename T, int kExperts, int kSubgroupsPerGroup>
-struct MuseSparkTopkSigmoid {
+// A full 32-lane tile can load its logits and bias as vectors. This selection
+// algorithm applies to every supported full tile width when top-k is eight;
+// the tail-safe kernel below handles all other expert counts and top-k values.
+template <typename T, int kValuesPerLane>
+struct FullTileTopk8 {
   static constexpr int kSubgroup = 32;
   static constexpr int kTopK = 8;
-  static constexpr int kValuesPerLane = kExperts / kSubgroup;
-  static_assert(kExperts % kSubgroup == 0, "fast path needs full subgroups");
-
+  static constexpr int kSubgroupsPerGroup = 8;
+  static constexpr int kExperts = kSubgroup * kValuesPerLane;
   using Raw = typename LogitBits<T>::Raw;
-  static_assert(sizeof(T) == sizeof(Raw), "raw unit must have T's layout");
-
   using LogitVec = sycl::vec<Raw, kValuesPerLane>;
   using BiasVec = sycl::vec<float, kValuesPerLane>;
+  static_assert(sizeof(T) == sizeof(Raw));
 
   T const* input;
   RoutingArguments args;
@@ -94,9 +81,7 @@ struct MuseSparkTopkSigmoid {
     int lane = static_cast<int>(subgroup.get_local_linear_id());
     int row =
         static_cast<int>(item.get_group(0)) * kSubgroupsPerGroup + static_cast<int>(subgroup.get_group_linear_id());
-    if (row >= args.tokens) {
-      return;
-    }
+    if (row >= args.tokens) return;
     int out = row * kTopK + lane;
     if (row_is_padding(args, row)) {
       if (lane < kTopK) {
@@ -108,7 +93,6 @@ struct MuseSparkTopkSigmoid {
 
     auto const* row_ptr = reinterpret_cast<Raw const*>(input) + static_cast<size_t>(row) * kExperts;
     LogitVec raw = *reinterpret_cast<LogitVec const*>(row_ptr + lane * kValuesPerLane);
-
     float bias[kValuesPerLane];
     if (args.correction_bias != nullptr) {
       BiasVec bias_vec = *reinterpret_cast<BiasVec const*>(args.correction_bias + lane * kValuesPerLane);
@@ -123,9 +107,6 @@ struct MuseSparkTopkSigmoid {
       }
     }
 
-    // The native router multiplies in the logit's dtype, then converts to
-    // float32 for sigmoid and adds the fp32 bias. Keep ranking and emitted
-    // weights on that same arithmetic path.
     float values[kValuesPerLane];
 #pragma unroll
     for (int i = 0; i < kValuesPerLane; ++i) {
@@ -146,19 +127,15 @@ struct MuseSparkTopkSigmoid {
         lane_slot = greater ? i : lane_slot;
       }
       float group_value = sycl::reduce_over_group(subgroup, lane_value, sycl::maximum<float>());
-      uint32_t holders = 0;
+      std::uint32_t holders = 0;
       sycl::ext::oneapi::group_ballot(subgroup, lane_value == group_value).extract_bits(holders);
       int winner_lane = __builtin_ctz(holders);
       int winner_slot = sycl::select_from_group(subgroup, lane_slot, winner_lane);
-      if (lane == k) {
-        selected_id = winner_lane * kValuesPerLane + winner_slot;
-      }
+      if (lane == k) selected_id = winner_lane * kValuesPerLane + winner_slot;
       if (lane == winner_lane) {
 #pragma unroll
         for (int i = 0; i < kValuesPerLane; ++i) {
-          if (i == winner_slot) {
-            values[i] = -kInfinity;
-          }
+          if (i == winner_slot) values[i] = -kInfinity;
         }
       }
     }
@@ -177,13 +154,19 @@ struct MuseSparkTopkSigmoid {
   }
 };
 
-// One subgroup per token for the shapes the specialization above does not
-// cover: any expert count up to 256 and any top-k up to 8.
-template <typename T>
+// Each lane owns a fixed-capacity slice of the experts. Four vector widths
+// cover every expert count up to 256; partially filled slices use masked
+// scalar loads. The tile width is a subgroup memory-layout choice, independent
+// of routing top-k or a model's expert count.
+template <typename T, int kValuesPerLane, bool kFullTile>
 struct MuseSparkRouting {
   static constexpr int kSubgroup = 32;
-  static constexpr int kMaxValuesPerLane = 8;
+  static constexpr int kSubgroupsPerGroup = 8;
   static constexpr int kMaxTopK = 8;
+  using Raw = typename LogitBits<T>::Raw;
+  using LogitVec = sycl::vec<Raw, kValuesPerLane>;
+  using BiasVec = sycl::vec<float, kValuesPerLane>;
+  static_assert(sizeof(T) == sizeof(Raw));
 
   T const* input;
   RoutingArguments args;
@@ -191,9 +174,10 @@ struct MuseSparkRouting {
   [[sycl::reqd_sub_group_size(kSubgroup)]]
   void operator()(sycl::nd_item<1> item) const {
     constexpr float kInfinity = std::numeric_limits<float>::infinity();
-    constexpr int kNoExpert = std::numeric_limits<int>::max();
-    int row = static_cast<int>(item.get_group(0));
-    int lane = static_cast<int>(item.get_local_id(0));
+    sycl::sub_group subgroup = item.get_sub_group();
+    int row =
+        static_cast<int>(item.get_group(0)) * kSubgroupsPerGroup + static_cast<int>(subgroup.get_group_linear_id());
+    int lane = static_cast<int>(subgroup.get_local_linear_id());
     if (row >= args.tokens) {
       return;
     }
@@ -205,29 +189,35 @@ struct MuseSparkRouting {
       return;
     }
 
-    sycl::sub_group subgroup = item.get_sub_group();
-    int values_per_lane = div_up(args.experts, kSubgroup);
-    float rank_values[kMaxValuesPerLane];
-    int rank_ids[kMaxValuesPerLane];
+    const size_t row_start = static_cast<size_t>(row) * (kFullTile ? kValuesPerLane * kSubgroup : args.experts);
+    LogitVec logits{};
+    BiasVec biases{};
+    if constexpr (kFullTile) {
+      auto const* bits = reinterpret_cast<Raw const*>(input) + row_start + lane * kValuesPerLane;
+      logits = *reinterpret_cast<LogitVec const*>(bits);
+      if (args.correction_bias != nullptr) {
+        biases = *reinterpret_cast<BiasVec const*>(args.correction_bias + lane * kValuesPerLane);
+      }
+    }
+    float rank_values[kValuesPerLane];
 
 #pragma unroll
-    for (int i = 0; i < kMaxValuesPerLane; ++i) {
-      int expert = lane * values_per_lane + i;
-      if (i < values_per_lane && expert < args.experts) {
-        float logit = static_cast<float>(input[static_cast<size_t>(row) * args.experts + expert]);
+    for (int i = 0; i < kValuesPerLane; ++i) {
+      int expert = lane * kValuesPerLane + i;
+      if (kFullTile || expert < args.experts) {
+        float logit = kFullTile ? LogitBits<T>::to_float(logits[i]) : static_cast<float>(input[row_start + expert]);
         float scaled = static_cast<float>(static_cast<T>(logit * args.router_multiplier));
         float score = 1.0f / (1.0f + sycl::exp(-scaled));
-        rank_values[i] = args.correction_bias == nullptr ? score : score + args.correction_bias[expert];
-        rank_ids[i] = expert;
+        rank_values[i] =
+            args.correction_bias == nullptr ? score : score + (kFullTile ? biases[i] : args.correction_bias[expert]);
       } else {
         rank_values[i] = -kInfinity;
-        rank_ids[i] = kNoExpert;
       }
     }
 
-    float selected_weights[kMaxTopK];
-    int selected_ids[kMaxTopK];
-    float selected_sum = 0.0f;
+    // Result lane k owns selected expert k. Keep selection shared across the
+    // subgroup, then compute the unbiased weights in parallel.
+    int selected_id = -1;
 
 #pragma unroll
     for (int k = 0; k < kMaxTopK; ++k) {
@@ -235,86 +225,93 @@ struct MuseSparkRouting {
         break;
       }
       float lane_value = -kInfinity;
-      int lane_id = kNoExpert;
       int lane_slot = -1;
 #pragma unroll
-      for (int i = 0; i < kMaxValuesPerLane; ++i) {
-        if (i < values_per_lane &&
-            (rank_values[i] > lane_value || (rank_values[i] == lane_value && rank_ids[i] < lane_id))) {
+      for (int i = 0; i < kValuesPerLane; ++i) {
+        const int expert = lane * kValuesPerLane + i;
+        if ((kFullTile || expert < args.experts) &&
+            (lane_slot < 0 || rank_values[i] > lane_value)) {
           lane_value = rank_values[i];
-          lane_id = rank_ids[i];
           lane_slot = i;
         }
       }
 
-      // Butterfly argmax on the (value, id) pair, so ties resolve to the
-      // lowest expert id in every lane at once.
+      // Select the maximum with one subgroup reduction and a ballot. The
+      // local search visits increasing expert IDs and keeps the first equal
+      // score. The lowest holder lane therefore has the lowest expert ID
+      // across lanes. This also works for partially filled lanes.
+      const float group_value = sycl::reduce_over_group(subgroup, lane_value, sycl::maximum<float>());
+      std::uint32_t holders = 0;
+      sycl::ext::oneapi::group_ballot(subgroup, lane_slot >= 0 && lane_value == group_value).extract_bits(holders);
+      const int winner_lane = __builtin_ctz(holders);
+      const int winner_slot = sycl::select_from_group(subgroup, lane_slot, winner_lane);
+      const int winner_id = winner_lane * kValuesPerLane + winner_slot;
+      if (lane == winner_lane && lane_slot >= 0) {
 #pragma unroll
-      for (int offset = kSubgroup / 2; offset > 0; offset /= 2) {
-        float other_value = sycl::permute_group_by_xor(subgroup, lane_value, offset);
-        int other_id = sycl::permute_group_by_xor(subgroup, lane_id, offset);
-        if (other_value > lane_value || (other_value == lane_value && other_id < lane_id)) {
-          lane_value = other_value;
-          lane_id = other_id;
+        for (int i = 0; i < kValuesPerLane; ++i) {
+          if (i == lane_slot) rank_values[i] = -kInfinity;
         }
       }
 
-      if (lane_slot >= 0 && rank_ids[lane_slot] == lane_id) {
-        rank_values[lane_slot] = -kInfinity;
-        rank_ids[lane_slot] = kNoExpert;
-      }
-
-      if (lane == 0) {
-        float logit = static_cast<float>(input[static_cast<size_t>(row) * args.experts + lane_id]);
-        float scaled = static_cast<float>(static_cast<T>(logit * args.router_multiplier));
-        float unbiased = 1.0f / (1.0f + sycl::exp(-scaled));
-        selected_ids[k] = lane_id;
-        selected_weights[k] = unbiased;
-        selected_sum += unbiased;
-      }
+      if (lane == k) selected_id = winner_id;
     }
 
-    if (lane == 0) {
-      float factor = args.renormalize ? args.route_scale / (selected_sum + args.division_eps) : 1.0f;
-#pragma unroll
-      for (int k = 0; k < kMaxTopK; ++k) {
-        if (k < args.topk) {
-          args.ids[row * args.topk + k] = map_expert(args, selected_ids[k]);
-          args.weights[row * args.topk + k] = selected_weights[k] * factor;
-        }
-      }
+    float weight = 0.0f;
+    if (lane < args.topk) {
+      float logit = static_cast<float>(input[static_cast<size_t>(row) * args.experts + selected_id]);
+      float scaled = static_cast<float>(static_cast<T>(logit * args.router_multiplier));
+      weight = 1.0f / (1.0f + sycl::exp(-scaled));
+    }
+    const float sum = sycl::reduce_over_group(subgroup, weight, sycl::plus<float>());
+    if (lane < args.topk) {
+      const float factor = args.renormalize ? args.route_scale / (sum + args.division_eps) : 1.0f;
+      args.ids[row * args.topk + lane] = map_expert(args, selected_id);
+      args.weights[row * args.topk + lane] = weight * factor;
     }
   }
 };
 
-template <typename T, int kExperts, int kSubgroupsPerGroup = 8>
-void launch_muse_spark_topk_sigmoid(sycl::queue& queue, T const* input, RoutingArguments const& args) {
-  using Kernel = MuseSparkTopkSigmoid<T, kExperts, kSubgroupsPerGroup>;
-  int groups = div_up(args.tokens, kSubgroupsPerGroup);
-  sycl::range<1> local(kSubgroupsPerGroup * Kernel::kSubgroup);
-  sycl::range<1> global(groups * local[0]);
+template <typename T, int kValuesPerLane, bool kFullTile>
+void launch_muse_spark_routing_tile(sycl::queue& queue, T const* input, RoutingArguments const& args) {
+  using Kernel = MuseSparkRouting<T, kValuesPerLane, kFullTile>;
+  sycl::range<1> local(Kernel::kSubgroupsPerGroup * Kernel::kSubgroup);
+  sycl::range<1> global(static_cast<size_t>(div_up(args.tokens, Kernel::kSubgroupsPerGroup)) * local[0]);
   sycl_kernel_submit(global, local, queue, Kernel{input, args});
 }
 
-// Muse Spark's own shapes take the specialization; everything else up to 256
-// experts and top-k 8 takes the generic kernel, so the op is never unreachable
-// for a shape it accepts.
+template <typename T, int kValuesPerLane>
+void launch_full_tile_topk8(sycl::queue& queue, T const* input, RoutingArguments const& args) {
+  using Kernel = FullTileTopk8<T, kValuesPerLane>;
+  sycl::range<1> local(Kernel::kSubgroupsPerGroup * Kernel::kSubgroup);
+  sycl::range<1> global(static_cast<size_t>(div_up(args.tokens, Kernel::kSubgroupsPerGroup)) * local[0]);
+  sycl_kernel_submit(global, local, queue, Kernel{input, args});
+}
+
+template <typename T, int kValuesPerLane>
+void launch_muse_spark_routing_bucket(sycl::queue& queue, T const* input, RoutingArguments const& args) {
+  if (args.experts == kValuesPerLane * 32) {
+    if (args.topk == 8) {
+      launch_full_tile_topk8<T, kValuesPerLane>(queue, input, args);
+    } else {
+      launch_muse_spark_routing_tile<T, kValuesPerLane, true>(queue, input, args);
+    }
+  } else {
+    launch_muse_spark_routing_tile<T, kValuesPerLane, false>(queue, input, args);
+  }
+}
+
 template <typename T>
 void launch_muse_spark_routing(sycl::queue& queue, T const* input, RoutingArguments const& args) {
-  if (args.topk == MuseSparkTopkSigmoid<T, 256, 8>::kTopK) {
-    if (args.experts == 256) {
-      launch_muse_spark_topk_sigmoid<T, 256>(queue, input, args);
-      return;
-    }
-    if (args.experts == 128) {
-      launch_muse_spark_topk_sigmoid<T, 128>(queue, input, args);
-      return;
-    }
+  const int values_per_lane = div_up(args.experts, 32);
+  if (values_per_lane <= 1) {
+    launch_muse_spark_routing_bucket<T, 1>(queue, input, args);
+  } else if (values_per_lane <= 2) {
+    launch_muse_spark_routing_bucket<T, 2>(queue, input, args);
+  } else if (values_per_lane <= 4) {
+    launch_muse_spark_routing_bucket<T, 4>(queue, input, args);
+  } else {
+    launch_muse_spark_routing_bucket<T, 8>(queue, input, args);
   }
-  using Kernel = MuseSparkRouting<T>;
-  sycl::range<1> local(Kernel::kSubgroup);
-  sycl::range<1> global(static_cast<size_t>(args.tokens) * Kernel::kSubgroup);
-  sycl_kernel_submit(global, local, queue, Kernel{input, args});
 }
 
 template <typename T>
@@ -780,22 +777,32 @@ void fused_topk_sigmoid(
   auto queue = at::xpu::getCurrentXPUStream().queue();
   constexpr int WARPS_PER_TB = 4;
 
-  // The specialization is shared with `muse_spark_moe_routing`; this op has no
-  // router multiplier, route scale, epsilon, expert table or padded rows, so
-  // those parameters stay neutral and the arithmetic is unchanged.
-  RoutingArguments args{
-      topk_weights,
-      topk_indices,
-      correction_bias,
-      /*local_expert_mapping=*/nullptr,
-      /*num_valid_tokens=*/nullptr,
-      num_tokens,
-      num_experts,
-      topk,
-      /*router_multiplier=*/1.0f,
-      /*route_scale=*/1.0f,
-      /*division_eps=*/0.0f,
-      renormalize};
+  // Reuse the full subgroup vector algorithm for reduced-precision top-k8.
+  // This is determined by the lane tile layout, for every supported full
+  // tile width, rather than by a model's expert count.
+  if constexpr (sizeof(T) == 2) {
+    const int values_per_lane = div_up(num_experts, 32);
+    const bool full_tile = num_experts == values_per_lane * 32;
+    const bool vector_width = values_per_lane == 1 || values_per_lane == 2 || values_per_lane == 4 ||
+                              values_per_lane == 8;
+    if (topk == 8 && full_tile && vector_width) {
+      RoutingArguments args{
+          topk_weights,
+          topk_indices,
+          correction_bias,
+          /*local_expert_mapping=*/nullptr,
+          /*num_valid_tokens=*/nullptr,
+          num_tokens,
+          num_experts,
+          topk,
+          /*router_multiplier=*/1.0f,
+          /*route_scale=*/1.0f,
+          /*division_eps=*/0.0f,
+          renormalize};
+      launch_muse_spark_routing(queue, gating_output, args);
+      return;
+    }
+  }
 
 #define LAUNCH_GATING_SIGMOID(TYPE, NUM_EXPERTS, WARPS_PER_TB) \
   launch_topk_gating_sigmoid<TYPE, NUM_EXPERTS, WARPS_PER_TB>( \
@@ -834,21 +841,9 @@ void fused_topk_sigmoid(
       LAUNCH_GATING_SIGMOID(T, 64, WARPS_PER_TB);
       break;
     case 128:
-      if constexpr (sizeof(T) == 2) {
-        if (topk == 8) {
-          launch_muse_spark_topk_sigmoid<T, 128>(queue, gating_output, args);
-          break;
-        }
-      }
       LAUNCH_GATING_SIGMOID(T, 128, WARPS_PER_TB);
       break;
     case 256:
-      if constexpr (sizeof(T) == 2) {
-        if (topk == 8) {
-          launch_muse_spark_topk_sigmoid<T, 256>(queue, gating_output, args);
-          break;
-        }
-      }
       LAUNCH_GATING_SIGMOID(T, 256, WARPS_PER_TB);
       break;
     default:

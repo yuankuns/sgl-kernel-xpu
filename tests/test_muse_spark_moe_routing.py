@@ -71,11 +71,12 @@ def check_routing(
         num_valid_tensor,
     )
 
-    _, ref_ids, scores, _ = muse_spark_routing_torch_native(
+    _, ref_ids, scores, rank_keys = muse_spark_routing_torch_native(
         gating_output, bias, topk, route_scale, router_output_multiplier, division_eps
     )
     scores = scores.cpu()
     ref_ids = ref_ids.cpu()
+    rank_keys = rank_keys.cpu()
     got_ids = topk_ids.cpu()
     got_weights = topk_weights.cpu()
 
@@ -105,9 +106,10 @@ def check_routing(
             assert expert not in selected, f"token {token} rank {k}: duplicate {expert}"
             selected.append(expert)
 
-        assert (
-            selected == ref_ids[token].tolist()
-        ), f"token {token}: ids {selected} vs {ref_ids[token].tolist()}"
+        assert torch.equal(
+            rank_keys[token, selected],
+            rank_keys[token, ref_ids[token]],
+        ), f"token {token}: rank scores differ for {selected} vs {ref_ids[token].tolist()}"
 
         total = sum(float(scores[token, e]) for e in selected)
         for k in range(topk):
@@ -143,7 +145,7 @@ def test_muse_spark_moe_routing_production_shape(dtype, num_tokens, num_experts)
 @pytest.mark.parametrize("num_experts", [2, 8, 33, 96, 255])
 @pytest.mark.parametrize("topk", [1, 4, 8])
 def test_muse_spark_moe_routing_generic_shapes(dtype, num_experts, topk):
-    """Shapes outside the specialization must still route, not raise."""
+    """Cover partial subgroup tiles, different top-k values and dtypes."""
     if topk > num_experts:
         pytest.skip("topk must not exceed the expert count")
     torch.manual_seed(7)
@@ -229,6 +231,39 @@ def test_muse_spark_moe_routing_zero_multiplier():
     expected = torch.topk(bias, k=8, dim=-1, sorted=True)[1].to(torch.int32)
     for token in range(5):
         assert torch.equal(topk_ids[token].cpu(), expected.cpu())
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("num_experts", [32, 63, 64, 65, 127, 128, 129, 255, 256])
+@pytest.mark.parametrize("topk", [7, 8])
+def test_muse_spark_moe_routing_equal_scores_choose_lowest(dtype, num_experts, topk):
+    """Equal scores select lowest IDs across vector tiles and masked tails."""
+    logits = torch.zeros(3, num_experts, dtype=dtype, device=device)
+    bias = torch.zeros(num_experts, dtype=torch.float32, device=device)
+    valid = torch.tensor([2], dtype=torch.int32, device=device)
+    weights = torch.empty(3, topk, dtype=torch.float32, device=device)
+    ids = torch.empty(3, topk, dtype=torch.int32, device=device)
+    sgl_kernel.muse_spark_moe_routing(
+        weights, ids, logits, bias, 1.0, 1.0, 1e-15, None, valid
+    )
+    expected_ids = torch.arange(topk, dtype=torch.int32, device=device)
+    for row in range(2):
+        torch.testing.assert_close(ids[row], expected_ids, rtol=0, atol=0)
+        torch.testing.assert_close(
+            weights[row], torch.full_like(weights[row], 1.0 / topk), rtol=0, atol=1e-6
+        )
+    torch.testing.assert_close(ids[2], torch.full_like(ids[2], -1), rtol=0, atol=0)
+    torch.testing.assert_close(weights[2], torch.zeros_like(weights[2]), rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("num_experts", [63, 64, 65, 127, 128, 129, 255, 256])
+@pytest.mark.parametrize("topk", [7, 8])
+def test_muse_spark_moe_routing_full_tile_neighbors(dtype, num_experts, topk):
+    torch.manual_seed(30000 + num_experts + topk)
+    logits = torch.randn(17, num_experts, dtype=dtype, device=device)
+    bias = torch.randn(num_experts, dtype=torch.float32, device=device)
+    check_routing(logits, bias, topk, 1.0, 0.3535533905932738, 1e-15)
 
 
 @pytest.mark.parametrize("num_experts", [128, 256])
