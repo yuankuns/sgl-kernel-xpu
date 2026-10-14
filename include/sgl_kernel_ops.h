@@ -115,6 +115,37 @@ void rmsnorm(torch::Tensor& output, torch::Tensor& input, torch::Tensor& weight,
 void fused_add_rmsnorm(torch::Tensor input, torch::Tensor residual, torch::Tensor weight, double eps);
 void gemma_rmsnorm(torch::Tensor& output, torch::Tensor& input, torch::Tensor& weight, double eps);
 void gemma_fused_add_rmsnorm(torch::Tensor& input, torch::Tensor& residual, torch::Tensor& weight, double eps);
+void muse_write_req_to_token_pool(
+    torch::Tensor req_to_token,
+    torch::Tensor req_pool_indices,
+    torch::Tensor prefix_pointers,
+    torch::Tensor prefix_lens,
+    torch::Tensor seq_lens,
+    torch::Tensor extend_lens,
+    torch::Tensor out_cache_loc);
+void muse_alloc_extend(
+    torch::Tensor prefix_lens,
+    torch::Tensor seq_lens,
+    torch::Tensor last_loc,
+    torch::Tensor free_pages,
+    torch::Tensor out_indices,
+    int64_t page_size);
+void muse_alloc_extend_and_write(
+    torch::Tensor prefix_lens,
+    torch::Tensor seq_lens,
+    torch::Tensor last_loc,
+    torch::Tensor free_pages,
+    torch::Tensor out_indices,
+    torch::Tensor req_to_token,
+    torch::Tensor req_pool_indices,
+    torch::Tensor prefix_pointers,
+    int64_t page_size);
+void muse_alloc_decode(
+    torch::Tensor seq_lens,
+    torch::Tensor last_loc,
+    torch::Tensor free_pages,
+    torch::Tensor out_indices,
+    int64_t page_size);
 void topk_softmax(at::Tensor& topk_weights, at::Tensor& topk_indices, at::Tensor& gating_output, bool renormalize);
 void topk_sigmoid(
     at::Tensor& topk_weights,
