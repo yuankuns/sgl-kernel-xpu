@@ -47,6 +47,15 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.def("gemma_fused_add_rmsnorm(Tensor! input, Tensor! residual, Tensor weight, float eps) -> ()");
   m.impl("gemma_fused_add_rmsnorm", torch::kXPU, &at::native::xpu::gemma_fused_add_rmsnorm);
 
+  m.def(
+      "muse_compute_position(Tensor! positions, Tensor! extend_start_loc, Tensor prefix_lens, Tensor seq_lens) -> ()");
+  m.impl("muse_compute_position", torch::kXPU, &at::native::xpu::muse_compute_position);
+
+  m.def(
+      "muse_compute_position_with_hint(Tensor! positions, Tensor! extend_start_loc, "
+      "Tensor prefix_lens, Tensor seq_lens, int max_seq_len_hint) -> ()");
+  m.impl("muse_compute_position_with_hint", torch::kXPU, &at::native::xpu::muse_compute_position_with_hint);
+
   m.def("topk_softmax(Tensor! topk_weights, Tensor! topk_indices, Tensor gating_output, bool renormalize) -> ()");
   m.impl("topk_softmax", torch::kXPU, &at::native::xpu::topk_softmax);
 

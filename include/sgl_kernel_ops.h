@@ -115,6 +115,14 @@ void rmsnorm(torch::Tensor& output, torch::Tensor& input, torch::Tensor& weight,
 void fused_add_rmsnorm(torch::Tensor input, torch::Tensor residual, torch::Tensor weight, double eps);
 void gemma_rmsnorm(torch::Tensor& output, torch::Tensor& input, torch::Tensor& weight, double eps);
 void gemma_fused_add_rmsnorm(torch::Tensor& input, torch::Tensor& residual, torch::Tensor& weight, double eps);
+void muse_compute_position(
+    torch::Tensor positions, torch::Tensor extend_start_loc, torch::Tensor prefix_lens, torch::Tensor seq_lens);
+void muse_compute_position_with_hint(
+    torch::Tensor positions,
+    torch::Tensor extend_start_loc,
+    torch::Tensor prefix_lens,
+    torch::Tensor seq_lens,
+    int64_t max_seq_len_hint);
 void topk_softmax(at::Tensor& topk_weights, at::Tensor& topk_indices, at::Tensor& gating_output, bool renormalize);
 void topk_sigmoid(
     at::Tensor& topk_weights,
