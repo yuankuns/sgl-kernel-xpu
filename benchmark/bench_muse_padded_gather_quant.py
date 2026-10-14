@@ -1,5 +1,4 @@
 import argparse
-import os
 import statistics
 import time
 
@@ -107,8 +106,7 @@ def main():
         "--tokens",
         type=int,
         nargs="+",
-        choices=[8, 4096, 28672, 32768],
-        default=[8, 8 * 4096],
+        default=None,
         help="unrouted token counts; rows are tokens*topk plus alignment slack",
     )
     parser.add_argument("--serving-batch", type=int, default=8)
@@ -124,19 +122,23 @@ def main():
     parser.add_argument("--repeat", type=int, default=10)
     parser.add_argument("--cooldown", type=float, default=2.0)
     args = parser.parse_args()
-    if (args.serving_batch, args.isl, args.osl, args.tp, args.ep) != (
-        8,
-        4096,
-        16,
-        1,
-        1,
-    ) or os.environ.get("BATCHES", "8") != "8":
-        parser.error("Muse-Spark serving scope requires B=8, ISL=4096, OSL=16, TP1/EP1")
+    if any(
+        value <= 0
+        for value in (args.serving_batch, args.isl, args.osl, args.tp, args.ep)
+    ):
+        parser.error("serving batch, ISL, OSL, TP and EP must be positive")
+    if args.tokens is None:
+        args.tokens = [args.serving_batch, args.serving_batch * args.isl]
 
     if any(token_count <= 0 for token_count in args.tokens):
         parser.error("--tokens values must be positive")
-    if args.topk <= 0 or args.experts <= 0 or args.alignment <= 0:
-        parser.error("--topk, --experts and --alignment must be positive")
+    if (
+        args.topk <= 0
+        or args.experts <= 0
+        or args.alignment <= 0
+        or args.topk > args.experts
+    ):
+        parser.error("--topk and --alignment must be positive, with topk <= experts")
     if args.hidden <= 0 or args.hidden % 32:
         parser.error("--hidden must be positive and divisible by 32")
     if args.warmup < 0 or args.repeat <= 0:
@@ -152,7 +154,10 @@ def main():
             "this benchmark requires the CRI 0x674f device, "
             f"but XPU 0 is 0x{device.device_id:04x}"
         )
-    print(f"device={device.name} device_id=0x{device.device_id:04x}")
+    print(
+        f"device={device.name} device_id=0x{device.device_id:04x} "
+        f"B={args.serving_batch} ISL={args.isl} OSL={args.osl} TP={args.tp} EP={args.ep}"
+    )
 
     for index, token_count in enumerate(args.tokens):
         routed_rows = token_count * args.topk
@@ -171,9 +176,7 @@ def main():
             hidden_states.device,
         )
         row_map_i32 = torch.arange(rows, dtype=torch.int32, device="xpu") % token_count
-        row_map_i64 = row_map_i32.to(torch.int64)
-
-        expected_q, expected_s = baseline(hidden_states, row_map_i64, padded_counts)
+        expected_q, expected_s = baseline(hidden_states, row_map_i32, padded_counts)
         gather_q, gather_s = gather_quant_relayout(
             hidden_states, row_map_i32, padded_counts
         )
@@ -189,7 +192,7 @@ def main():
         torch.xpu.synchronize()
 
         baseline_ms = measure(
-            lambda: baseline(hidden_states, row_map_i64, padded_counts),
+            lambda: baseline(hidden_states, row_map_i32, padded_counts),
             args.warmup,
             args.repeat,
         )
@@ -242,7 +245,7 @@ def main():
             f"{swiglu_relayout_gbps:.1f} logical GB/s"
         )
 
-        del gate_up, hidden_states, row_map_i32, row_map_i64, scales_rm
+        del gate_up, hidden_states, row_map_i32, scales_rm
         del padded_counts
         torch.xpu.synchronize()
         if index + 1 < len(args.tokens):
