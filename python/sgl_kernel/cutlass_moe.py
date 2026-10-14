@@ -507,8 +507,6 @@ def cutlass_fused_experts_nvfp4_woq(
     The weights stay 4-bit in memory. Auto mode uses BF16 computation.
     ``SGLANG_NVFP4_WOQ_COMPUTE`` can select ``auto``, ``mxfp8``, or ``bf16``.
     For MXFP8, each 32-wide MMA-K slice is converted immediately before BDPAS.
-    Setting ``SGLANG_NVFP4_WOQ_QUANTIZE_IN_K_LOOP=0`` instead converts the
-    complete 64-wide K tile first.
 
     Args:
         a: (M, K) bfloat16 activations. FP16 is unsupported because neither

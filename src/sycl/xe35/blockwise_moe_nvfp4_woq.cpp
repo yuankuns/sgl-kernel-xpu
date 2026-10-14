@@ -15,8 +15,6 @@
 #include <c10/xpu/XPUStream.h>
 #include <torch/all.h>
 
-#include <cstdlib>
-#include <cstring>
 #include <cute/tensor.hpp>
 
 #include "nvfp4_woq_bf16_mainloop.hpp"
@@ -211,46 +209,6 @@ using sgl_kernel::vllm_grouped_gemm::GroupedGemmRunner;
 constexpr int64_t kMxBlockSize = 32;
 constexpr int64_t kNvFp4BlockSize = 16;
 
-bool nvfp4_woq_quantize_in_k_loop_enabled() {
-  const char* value = std::getenv("SGLANG_NVFP4_WOQ_QUANTIZE_IN_K_LOOP");
-  if (value == nullptr || value[0] == '\0') {
-    return true;
-  }
-  if (std::strcmp(value, "0") == 0 || std::strcmp(value, "false") == 0 || std::strcmp(value, "FALSE") == 0 ||
-      std::strcmp(value, "off") == 0 || std::strcmp(value, "OFF") == 0) {
-    return false;
-  }
-  if (std::strcmp(value, "1") == 0 || std::strcmp(value, "true") == 0 || std::strcmp(value, "TRUE") == 0 ||
-      std::strcmp(value, "on") == 0 || std::strcmp(value, "ON") == 0) {
-    return true;
-  }
-  TORCH_CHECK(
-      false,
-      "SGLANG_NVFP4_WOQ_QUANTIZE_IN_K_LOOP must be one of 0/1, "
-      "false/true, or off/on; got '",
-      value,
-      "'");
-}
-
-sgl_xpu::NvFp4WideCache nvfp4_woq_wide_cache_mode() {
-  const char* value = std::getenv("SGLANG_NVFP4_WOQ_WIDE_CACHE");
-  if (value == nullptr || value[0] == '\0' || std::strcmp(value, "none") == 0 || std::strcmp(value, "register") == 0) {
-    return sgl_xpu::NvFp4WideCache::None;
-  }
-  if (std::strcmp(value, "l1") == 0) {
-    return sgl_xpu::NvFp4WideCache::L1;
-  }
-  if (std::strcmp(value, "slm") == 0) {
-    return sgl_xpu::NvFp4WideCache::Slm;
-  }
-  TORCH_CHECK(
-      false,
-      "SGLANG_NVFP4_WOQ_WIDE_CACHE must be none, register, l1, or slm; "
-      "got '",
-      value,
-      "'");
-}
-
 enum class MTile {
   M8N128,
   M8N256,
@@ -260,31 +218,6 @@ enum class MTile {
 };
 
 MTile select_m_tile(int64_t total_rows, int64_t groups, int64_t n, int sm_count) {
-  const char* forced = std::getenv("SGLANG_NVFP4_WOQ_FORCE_TILE");
-  if (forced != nullptr && forced[0] != '\0' && std::strcmp(forced, "auto") != 0) {
-    if (std::strcmp(forced, "m8n128") == 0) {
-      return MTile::M8N128;
-    }
-    if (std::strcmp(forced, "m8n256") == 0) {
-      return MTile::M8N256;
-    }
-    if (std::strcmp(forced, "m32n256") == 0) {
-      return MTile::M32N256;
-    }
-    if (std::strcmp(forced, "m64n256") == 0) {
-      return MTile::M64N256;
-    }
-    if (std::strcmp(forced, "m256n256") == 0) {
-      return MTile::M256N256;
-    }
-    TORCH_CHECK(
-        false,
-        "SGLANG_NVFP4_WOQ_FORCE_TILE must be auto, m8n128, m8n256, "
-        "m32n256, m64n256, or m256n256; got '",
-        forced,
-        "'");
-  }
-
   const int64_t rows_per_group = (total_rows + groups - 1) / groups;
   if (rows_per_group <= 8) {
     const int64_t m8n256_workgroups = groups * cute::ceil_div(n, int64_t(256));
@@ -472,81 +405,22 @@ void nvfp4_woq_mxfp8_scaled_grouped_mm(
   run_mxfp8_policy<__VA_ARGS__>( \
       queue, hw_info, rows_per_expert, a, b, scales_a_mn, sfmx_b, c_b, workspace, output, n, k, groups)
 
-  const auto cache_mode = nvfp4_woq_wide_cache_mode();
-  if (cache_mode == sgl_xpu::NvFp4WideCache::L1) {
-    switch (tile) {
-      case MTile::M8N128:
-        RUN_MXFP8_POLICY(policies::moe_nvfp4_mxfp8_m8n128_policy<true>);
-        break;
-      case MTile::M8N256:
-        RUN_MXFP8_POLICY(policies::moe_nvfp4_mxfp8_m8n256_policy<true>);
-        break;
-      case MTile::M32N256:
-        RUN_MXFP8_POLICY(policies::moe_nvfp4_mxfp8_m32n256_policy<true, sgl_xpu::NvFp4WideCache::L1>);
-        break;
-      case MTile::M64N256:
-        RUN_MXFP8_POLICY(policies::moe_nvfp4_mxfp8_m64n256_policy<true, sgl_xpu::NvFp4WideCache::L1>);
-        break;
-      case MTile::M256N256:
-        RUN_MXFP8_POLICY(policies::moe_nvfp4_mxfp8_m256n256_policy<true, sgl_xpu::NvFp4WideCache::L1>);
-        break;
-    }
-  } else if (cache_mode == sgl_xpu::NvFp4WideCache::Slm) {
-    switch (tile) {
-      case MTile::M8N128:
-        RUN_MXFP8_POLICY(policies::moe_nvfp4_mxfp8_m8n128_policy<true>);
-        break;
-      case MTile::M8N256:
-        RUN_MXFP8_POLICY(policies::moe_nvfp4_mxfp8_m8n256_policy<true>);
-        break;
-      case MTile::M32N256:
-        // The M32 SLM specialization stalls on Xe3P.  The M64 policy is
-        // bit-exact for partial-M tiles and uses the proven cache path.
-        RUN_MXFP8_POLICY(policies::moe_nvfp4_mxfp8_m64n256_policy<true, sgl_xpu::NvFp4WideCache::Slm>);
-        break;
-      case MTile::M64N256:
-        RUN_MXFP8_POLICY(policies::moe_nvfp4_mxfp8_m64n256_policy<true, sgl_xpu::NvFp4WideCache::Slm>);
-        break;
-      case MTile::M256N256:
-        RUN_MXFP8_POLICY(policies::moe_nvfp4_mxfp8_m256n256_policy<true, sgl_xpu::NvFp4WideCache::Slm>);
-        break;
-    }
-  } else if (nvfp4_woq_quantize_in_k_loop_enabled()) {
-    switch (tile) {
-      case MTile::M8N128:
-        RUN_MXFP8_POLICY(policies::moe_nvfp4_mxfp8_m8n128_policy<true>);
-        break;
-      case MTile::M8N256:
-        RUN_MXFP8_POLICY(policies::moe_nvfp4_mxfp8_m8n256_policy<true>);
-        break;
-      case MTile::M32N256:
-        RUN_MXFP8_POLICY(policies::moe_nvfp4_mxfp8_m32n256_policy<true>);
-        break;
-      case MTile::M64N256:
-        RUN_MXFP8_POLICY(policies::moe_nvfp4_mxfp8_m64n256_policy<true>);
-        break;
-      case MTile::M256N256:
-        RUN_MXFP8_POLICY(policies::moe_nvfp4_mxfp8_m256n256_policy<true>);
-        break;
-    }
-  } else {
-    switch (tile) {
-      case MTile::M8N128:
-        RUN_MXFP8_POLICY(policies::moe_nvfp4_mxfp8_m8n128_policy<false>);
-        break;
-      case MTile::M8N256:
-        RUN_MXFP8_POLICY(policies::moe_nvfp4_mxfp8_m8n256_policy<false>);
-        break;
-      case MTile::M32N256:
-        RUN_MXFP8_POLICY(policies::moe_nvfp4_mxfp8_m32n256_policy<false>);
-        break;
-      case MTile::M64N256:
-        RUN_MXFP8_POLICY(policies::moe_nvfp4_mxfp8_m64n256_policy<false>);
-        break;
-      case MTile::M256N256:
-        RUN_MXFP8_POLICY(policies::moe_nvfp4_mxfp8_m256n256_policy<false>);
-        break;
-    }
+  switch (tile) {
+    case MTile::M8N128:
+      RUN_MXFP8_POLICY(policies::moe_nvfp4_mxfp8_m8n128_policy<true>);
+      break;
+    case MTile::M8N256:
+      RUN_MXFP8_POLICY(policies::moe_nvfp4_mxfp8_m8n256_policy<true>);
+      break;
+    case MTile::M32N256:
+      RUN_MXFP8_POLICY(policies::moe_nvfp4_mxfp8_m32n256_policy<true>);
+      break;
+    case MTile::M64N256:
+      RUN_MXFP8_POLICY(policies::moe_nvfp4_mxfp8_m64n256_policy<true>);
+      break;
+    case MTile::M256N256:
+      RUN_MXFP8_POLICY(policies::moe_nvfp4_mxfp8_m256n256_policy<true>);
+      break;
   }
 
 #undef RUN_MXFP8_POLICY
