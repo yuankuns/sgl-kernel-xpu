@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """Validate the production Muse Spark decode FMHA shapes against FP32."""
 
-import os
 import time
 
 import sgl_kernel  # noqa: F401
@@ -39,8 +38,6 @@ def reference(q, k_cache, v_cache, page_table, local):
 
 
 def main():
-    if os.environ.get("BATCHES", "8") != "8":
-        raise ValueError("Muse-Spark serving validation requires BATCHES=8")
     pages_per_seq = (SEQLEN_K + PAGE_SIZE - 1) // PAGE_SIZE
     num_pages = BATCH * pages_per_seq
     torch.manual_seed(0)

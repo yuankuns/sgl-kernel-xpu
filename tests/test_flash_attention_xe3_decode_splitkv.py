@@ -11,6 +11,8 @@ single split and the small-slot cases exercise the multi-split merge.
 
 """
 
+import time
+
 import pytest
 import sgl_kernel  # noqa: F401 - registers torch.ops.sgl_kernel.* custom ops
 import torch
@@ -54,7 +56,9 @@ def reference(q, k_cache, v_cache, page_table, cache_seqlens, window_left):
     return out
 
 
-def run_case(lengths, heads_q, heads_kv, head_dim, page_size, window, seed=0):
+def run_case(
+    lengths, heads_q, heads_kv, head_dim, page_size, window, seed=0, num_splits=0
+):
     device = torch.device("xpu")
     dtype = torch.bfloat16
     torch.manual_seed(seed)
@@ -86,10 +90,19 @@ def run_case(lengths, heads_q, heads_kv, head_dim, page_size, window, seed=0):
         causal=True,
         window_size=window,
         rotary_interleaved=False,
+        num_splits=num_splits,
     )
     torch.xpu.synchronize()
     ref = reference(q, k_cache, v_cache, page_table, lengths, window[0])
     return out.float().cpu(), ref
+
+
+@pytest.fixture(autouse=True)
+def cool_between_cases():
+    yield
+    if is_xpu_available():
+        torch.xpu.synchronize()
+        time.sleep(2)
 
 
 CASES = [
@@ -121,8 +134,8 @@ CASES = [
     pytest.param([777, 4097], 32, 8, 64, 64, (-1, -1), id="gqa4-global"),
     pytest.param([777, 4097], 16, 16, 64, 64, (300, 0), id="gqa1-swa300"),
     pytest.param([5000], 8, 1, 64, 64, (-1, -1), id="gqa8-single-slot"),
-    # Three slots force 8 splits; the 1- and 63-token requests leave 7 splits
-    # empty, and the 2048-token request ends exactly on a tile boundary.
+    # The small KV-head grid uses multiple splits; short requests leave some
+    # splits empty, and the 2048-token request ends on a tile boundary.
     pytest.param(
         [1, 63, 4097, 2048], 8, 1, 64, 64, (-1, -1), id="gqa8-ragged-many-splits"
     ),
@@ -144,6 +157,23 @@ CASES = [
 def test_decode_splitkv(lengths, heads_q, heads_kv, head_dim, page_size, window):
     out, ref = run_case(lengths, heads_q, heads_kv, head_dim, page_size, window)
     assert torch.isfinite(out).all()
+    torch.testing.assert_close(out, ref, rtol=2e-2, atol=2e-2)
+
+
+@pytest.mark.skipif(not is_cri_device(), reason="Requires a CRI (Xe3P) device")
+@pytest.mark.parametrize("num_splits", [1, 2, 4, 8, 16])
+@pytest.mark.parametrize("window", [(-1, -1), (2047, 0)])
+@pytest.mark.parametrize("heads_q", [128, 144])
+def test_decode_explicit_split_count(num_splits, window, heads_q):
+    out, ref = run_case(
+        [4097, 2049, 2112],
+        heads_q,
+        16,
+        64,
+        64,
+        window,
+        num_splits=num_splits,
+    )
     torch.testing.assert_close(out, ref, rtol=2e-2, atol=2e-2)
 
 

@@ -209,7 +209,11 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> mha_fwd(
   //   -1 or 1 -> split-KV disabled, use the non-split FMHAKernel
   //         0 -> auto: pick a split count from the device-occupancy heuristic
   //        >1 -> use the caller-provided split count with SplitKernel + ReduceKernel
-  if (num_kv_splits == 0 && max_seqlen_q == 1 && !sinks_.has_value()) {
+  const bool use_decode_gqa_splitkv =
+      is_paged && !is_fp8 && !sinks_.has_value() && (head_dim == 64 || head_dim == 128) &&
+      xe35_fmha::decode_splitkv_supported(
+          batch, static_cast<int>(q.size(0)), max_seqlen_q, num_heads_q, num_heads_kv, page_size);
+  if (num_kv_splits == 0 && max_seqlen_q == 1 && !sinks_.has_value() && !use_decode_gqa_splitkv) {
     auto get_num_splits = [](int batch_size, int num_heads_q, int num_heads_kv, int max_seqlen_k, bool is_paged, bool is_fp8) {
       const int cur_parallel_d = batch_size * num_heads_kv;
       const int gqa_ratio = num_heads_kv > 0 ? (num_heads_q / num_heads_kv) : 1;

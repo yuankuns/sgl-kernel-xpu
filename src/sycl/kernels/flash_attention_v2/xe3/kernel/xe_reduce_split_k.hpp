@@ -110,7 +110,6 @@ class ReduceSplitK {
       const int head_kv = head_q / head_group_q;
       const int q_in_group = head_q % head_group_q;
 
-      int split_blocks = cute::ceil_div(cute::ceil_div(seq_len_kv, get<1>(TileShapeQK{})), splits);
       int offset_q = 0;
       int offset_o = 0;
       int offset_accum = 0;
@@ -144,15 +143,19 @@ class ReduceSplitK {
       ElementLSE global_max = cutlass::platform::numeric_limits<ElementLSE>::lowest();
       ElementLSE global_sum = 0;
       int active_splits = 0;
-      for (int split = 0; split < splits; ++split) {
-        local_rescale[split] = 0;
-        if (split * split_blocks >= cute::ceil_div(seq_len_kv, get<1>(TileShapeQK{}))) break;
-        ElementLSE sum = exp_sums(split);
-        if (sum <= ElementLSE(0)) continue;
-        local_max_logits[split] = max_logits(split);
-        local_rescale[split] = sum;
-        global_max = sycl::max(global_max, local_max_logits[split]);
-        active_splits = split + 1;
+      if (seq_len_kv > 0) {
+        // The producer partitions only the visible SWA tiles. A split can be
+        // active even when its index exceeds a split count estimated from the
+        // full KV length. Every producer slot writes a nonnegative exp sum.
+        for (int split = 0; split < splits; ++split) {
+          local_rescale[split] = 0;
+          ElementLSE sum = exp_sums(split);
+          if (sum <= ElementLSE(0)) continue;
+          local_max_logits[split] = max_logits(split);
+          local_rescale[split] = sum;
+          global_max = sycl::max(global_max, local_max_logits[split]);
+          active_splits = split + 1;
+        }
       }
       for (int split = 0; split < active_splits; ++split) {
         if (local_rescale[split] <= ElementLSE(0)) continue;

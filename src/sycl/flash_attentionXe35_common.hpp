@@ -109,24 +109,38 @@ inline void decode_splitkv_workspace(
   *partials = base + ws.counter_bytes;
 }
 
-// Number of KV splits per (batch, kv head) for decode.
-//
-// Measured on CRI (Muse Spark L3 shape, 4097 cached tokens, BF16): with one
-// split the kernel streams K/V at ~1.0 TB/s, the device DRAM ceiling, once
-// there are >= 64 workgroups (batch >= 4).  Splitting a slot further is
-// harmful there: the split workgroups of one sequence read regions ~1-4 MB
-// apart at the same time and DRAM efficiency drops roughly in proportion to
-// the split count (B=8: 131 us at 1 split, 300 us at 8 splits).  Splits only
-// pay off when the grid is too small to cover the memory system (B=1: 53 us
-// at 1 split, 27 us at 4 splits), so target ~64 workgroups in total.
-inline int choose_decode_kv_splits(int slots, int max_tiles) {
+// Number of KV splits per (batch, kv head) for the one-pass decode kernel.
+// A small visible KV range pays more for split contention and merging than it
+// gains from extra workgroups. The tile limits are measured crossover points
+// for the Xe3 64-token KV tile, independent of any model sequence length.
+inline int choose_decode_kv_splits(int slots, int max_tiles, bool left_causal_local) {
   constexpr int target_wgs = 64;
   constexpr int max_splits = 8;
-  constexpr int min_tiles_per_split = 4;
+  constexpr int tiles_for_two_splits = 13;
+  constexpr int tiles_for_four_splits = 39;
+  constexpr int tiles_for_eight_splits = 152;
+  const int tile_limited_splits = max_tiles < tiles_for_two_splits    ? 1
+                                  : max_tiles < tiles_for_four_splits ? 2
+                                  : max_tiles < tiles_for_eight_splits ? 4
+                                                                        : 8;
   int splits = (target_wgs + std::max(1, slots) - 1) / std::max(1, slots);
   splits = std::min(splits, std::max(1, max_splits));
-  splits = std::min(splits, std::max(1, max_tiles / std::max(1, min_tiles_per_split)));
+  // A short finite left window benefits from two workgroups per KV-head slot
+  // while the grid has at most 64 slots; longer windows lose bandwidth there.
+  if (left_causal_local && slots <= 64 && max_tiles >= 20 && max_tiles <= 37) {
+    splits = std::max(splits, 2);
+  }
+  splits = std::min(splits, tile_limited_splits);
   return std::max(1, splits);
+}
+
+inline bool decode_splitkv_supported(
+    int batch, int total_q, int max_seqlen_q, int num_heads_q, int num_heads_kv, int page_size) {
+  if (max_seqlen_q != 1 || total_q != batch) return false;
+  if (num_heads_kv <= 0 || num_heads_q % num_heads_kv != 0) return false;
+  const int gqa_group = num_heads_q / num_heads_kv;
+  // One DPAS M block holds at most eight query heads from a KV head.
+  return gqa_group >= 1 && gqa_group <= 8 && (page_size == 64 || page_size == 128);
 }
 
 template <class Element, class OutputElement = Element>
@@ -157,10 +171,9 @@ struct Xe3FmhaConfig {
       class TileShapePV,
       class TileShapeOut,
       class SubgroupLayoutQK,
-      int FixedWindowLeft = -2,
-      int FixedWindowRight = -2,
       int FixedPageSize = -1,
-      XeStoreCachePolicy StoreCachePolicyO = XeStoreCachePolicy::kWT_WB_WB>
+      XeStoreCachePolicy StoreCachePolicyO = XeStoreCachePolicy::kWT_WB_WB,
+      bool LeftCausalWindow = false>
   static void
   run(const at::Tensor& q_dense,
       const at::Tensor& k_pool,
@@ -188,6 +201,9 @@ struct Xe3FmhaConfig {
     static constexpr bool BlockScale = false;
     static constexpr bool F8kvF16mma = false;
     static constexpr bool PerTensorScale = sizeof_bits_v<ElementInput> == 8;
+    static_assert(
+        !LeftCausalWindow || (LocalMask && !GqaFusion && Paged),
+        "left causal window specialization requires paged local attention without GQA fusion");
     // Paged KV is always cached; non-paged runs as plain attention (CachedKV=false)
     // with the KV placed in the "new" slot, which is the upstream-tested path.
     static constexpr bool CachedKV = Paged;
@@ -242,9 +258,8 @@ struct Xe3FmhaConfig {
         void,
         void,
         void,
-        FixedWindowLeft,
-        FixedWindowRight,
-        FixedPageSize>;
+        FixedPageSize,
+        LeftCausalWindow>;
 
     using CollectiveEpilogue = cutlass::fmha::collective::
         FMHAFwdEpilogue<CollectiveMainloop, TileShapeOut, TensorO, void, Sink, StoreCachePolicyO>;
@@ -554,8 +569,6 @@ struct Xe3FmhaDecodeSplitKvConfig {
         void,
         void,
         void,
-        -2,
-        -2,
         FixedPageSize>;
     using CollectiveEpilogue = cutlass::fmha::collective::
         FMHAFwdEpilogue<CollectiveMainloop, TileShapeOut, TensorO, void, false, XeStoreCachePolicy::kWT_WB_WB>;
@@ -659,13 +672,12 @@ bool dispatch_xe3_decode_splitkv(
     bool is_local,
     int window_size_left,
     int window_size_right,
-    bool use_sink) {
+    bool use_sink,
+    int requested_num_kv_splits) {
   if (use_sink) return false;
-  if (max_seqlen_q != 1 || q_dense.size(0) != batch) return false;
-  if (num_heads_kv <= 0 || num_heads_q % num_heads_kv != 0) return false;
-  const int gqa_group = num_heads_q / num_heads_kv;
-  if (gqa_group < 1 || gqa_group > 8) return false;
-  if (page_size != 64 && page_size != 128) return false;
+  if (!decode_splitkv_supported(batch, q_dense.size(0), max_seqlen_q, num_heads_q, num_heads_kv, page_size))
+    return false;
+  if (requested_num_kv_splits > 8) return false;
 
   // Upper bound on the cached tiles any request can touch: the page table
   // width bounds the cache length, and the window bounds the local layers.
@@ -674,7 +686,11 @@ bool dispatch_xe3_decode_splitkv(
   if (is_local && window_size_left >= 0) {
     max_tiles = std::min(max_tiles, (window_size_left + 1 + kBlkK - 1) / kBlkK + 1);
   }
-  const int num_kv_splits = choose_decode_kv_splits(batch * num_heads_kv, std::max(1, max_tiles));
+  const bool left_causal_local = is_local && window_size_left >= 0 && window_size_right == 0;
+  const int num_kv_splits = requested_num_kv_splits == 0
+                                ? choose_decode_kv_splits(
+                                      batch * num_heads_kv, std::max(1, max_tiles), left_causal_local)
+                                : std::max(1, requested_num_kv_splits);
   constexpr int grf = 512;
 
   using ShapeQK = Shape<_8, Int<kBlkK>, _32>;
@@ -771,8 +787,6 @@ void dispatch_xe3_kernel(
       PV,                                                                                            \
       OUT,                                                                                           \
       SGL,                                                                                           \
-      -2,                                                                                            \
-      -2,                                                                                            \
       -1,                                                                                            \
       (UseDecode || !std::is_same_v<Element, cutlass::bfloat16_t> ? XeStoreCachePolicy::kWT_WB_WB    \
                                                                   : XeStoreCachePolicy::kWB_WB_UC)>( \
@@ -835,7 +849,8 @@ void dispatch_xe3_kernel(
             is_local,
             window_size_left,
             window_size_right,
-            use_sink)) {
+            use_sink,
+            num_kv_splits)) {
       return;
     }
   }
@@ -921,7 +936,7 @@ void dispatch_xe3_kernel(
         using LocalShapePV = Shape<_64, _32, _64>;
         using LocalShapeOut = Shape<_64, _64>;
         using LocalSubgroupLayoutQK = Layout<Shape<_4, _1, _1>>;
-#define XE35_LOCAL(FIXED_LEFT, FIXED_RIGHT, FIXED_PAGE, STAGES) \
+#define XE35_LOCAL(FIXED_PAGE, STAGES)                           \
   Xe3FmhaConfig<Element, OutputElement>::template run<          \
       false,                                                    \
       true,                                                     \
@@ -933,10 +948,9 @@ void dispatch_xe3_kernel(
       LocalShapePV,                                             \
       LocalShapeOut,                                            \
       LocalSubgroupLayoutQK,                                    \
-      FIXED_LEFT,                                               \
-      FIXED_RIGHT,                                              \
       FIXED_PAGE,                                               \
-      XeStoreCachePolicy::kWB_WB_UC>(                           \
+      XeStoreCachePolicy::kWB_WB_UC,                            \
+      true>(                                                   \
       q_dense,                                                  \
       k_pool,                                                   \
       v_pool,                                                   \
@@ -959,16 +973,13 @@ void dispatch_xe3_kernel(
       window_size_left,                                         \
       window_size_right,                                        \
       nullptr)
+        // This mask class is shared by every finite left window with no
+        // lookahead; page-size specialization keeps tile addressing aligned.
         if (!use_sink && window_size_left >= 0 && window_size_right == 0 && (page_size == 64 || page_size == 128)) {
-          if (window_size_left == 2047) {
-            if (page_size == 64)
-              XE35_LOCAL(2047, 0, 64, 1);
-            else
-              XE35_LOCAL(2047, 0, 128, 1);
-          } else if (page_size == 64) {
-            XE35_LOCAL(-2, -2, 64, 1);
+          if (page_size == 64) {
+            XE35_LOCAL(64, 1);
           } else {
-            XE35_LOCAL(-2, -2, 128, 1);
+            XE35_LOCAL(128, 1);
           }
         } else {
           XE35_RUN(false, true, 2, false, ShapeQK, ShapePV, ShapeOut, SubgroupLayoutQK);

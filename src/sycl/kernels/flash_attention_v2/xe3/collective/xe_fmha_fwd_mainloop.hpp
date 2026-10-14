@@ -204,9 +204,8 @@ template <
     class TiledCopyV_ = void,  // Optional TiledCopy for loading V
     class TiledCopyK_cache_ = void,
     class TiledCopyV_cache_ = void,  // Optional TiledCopy for loading V_cache
-    int FixedWindowLeft_ = -2,
-    int FixedWindowRight_ = -2,
-    int FixedPageSize_ = -1>
+    int FixedPageSize_ = -1,
+    bool LeftCausalWindow_ = false>
 struct FMHAFwdMainloop {
   static_assert(cutlass::detail::dependent_false<DispatchPolicy_>, "Could not find a mainloop specialization.");
 };
@@ -238,9 +237,8 @@ template <
     class TiledCopyV_,
     class TiledCopyK_cache_,
     class TiledCopyV_cache_,
-    int FixedWindowLeft_,
-    int FixedWindowRight_,
-    int FixedPageSize_>
+    int FixedPageSize_,
+    bool LeftCausalWindow_>
 struct FMHAFwdMainloop<
     XeDefault<Stages>,
     CausalMask_,
@@ -266,9 +264,8 @@ struct FMHAFwdMainloop<
     TiledCopyV_,
     TiledCopyK_cache_,
     TiledCopyV_cache_,
-    FixedWindowLeft_,
-    FixedWindowRight_,
-    FixedPageSize_> {
+    FixedPageSize_,
+    LeftCausalWindow_> {
   //
   // Type Aliases
   //
@@ -370,9 +367,9 @@ struct FMHAFwdMainloop<
   static constexpr bool LocalMask = LocalMask_;
   static constexpr bool CachedKV = CachedKV_;
   static constexpr bool PagedKV = PagedKV_;
-  static constexpr int FixedWindowLeft = FixedWindowLeft_;
-  static constexpr int FixedWindowRight = FixedWindowRight_;
   static constexpr int FixedPageSize = FixedPageSize_;
+  static constexpr bool LeftCausalWindow = LeftCausalWindow_;
+  static_assert(!LeftCausalWindow || LocalMask, "left causal window requires local masking");
 
   static constexpr int BLK_Q = get<0>(TileShapeQK{});
   static constexpr int BLK_K = get<1>(TileShapeQK{});
@@ -429,15 +426,12 @@ struct FMHAFwdMainloop<
   using Params = Arguments;
 
   CUTLASS_HOST_DEVICE static int window_size_left(Params const& params) {
-    if constexpr (FixedWindowLeft != -2)
-      return FixedWindowLeft;
-    else
-      return params.window_size_left;
+    return params.window_size_left;
   }
 
   CUTLASS_HOST_DEVICE static int window_size_right(Params const& params) {
-    if constexpr (FixedWindowRight != -2)
-      return FixedWindowRight;
+    if constexpr (LeftCausalWindow)
+      return 0;
     else
       return params.window_size_right;
   }
@@ -474,11 +468,8 @@ struct FMHAFwdMainloop<
   }
 
   CUTLASS_HOST_DEVICE static bool can_implement(Arguments const& args) {
-    if constexpr (FixedWindowLeft != -2) {
-      if (args.window_size_left != FixedWindowLeft) return false;
-    }
-    if constexpr (FixedWindowRight != -2) {
-      if (args.window_size_right != FixedWindowRight) return false;
+    if constexpr (LeftCausalWindow) {
+      if (args.window_size_left < 0 || args.window_size_right != 0) return false;
     }
     if constexpr (FixedPageSize > 0) {
       if (args.page_size != FixedPageSize) return false;
@@ -1001,7 +992,7 @@ struct FMHAFwdMainloop<
         // Skip local masking in this case to avoid perturbing score fragments.
         const int win_left = window_size_left(params);
         const int win_right = window_size_right(params);
-        const bool full_window = (win_left < 0) && (win_right < 0);
+        const bool full_window = !LeftCausalWindow && win_left < 0 && win_right < 0;
         if (!full_window) {
           Tensor cPgP = make_identity_tensor(make_shape(seq_len, seq_len));
           Tensor gP = local_tile(cPgP, take<0, 2>(TileShapeQK{}), make_coord(get<0>(blk_qv), K));
@@ -1011,10 +1002,12 @@ struct FMHAFwdMainloop<
           const bool fused = gqa_fusion_q_per_head > 0;
           const int row_lo = fused ? 0 : row_off;
           const int row_hi = fused ? (gqa_fusion_q_per_head - 1) : (row_off + BLK_Q - 1);
-          const bool any_left_masked = win_left >= 0 && col_off < row_hi + full_tile_offset - win_left;
-          const bool any_right_masked = win_right >= 0 && col_off + BLK_K - 1 > row_lo + full_tile_offset + win_right;
+          const bool any_left_masked =
+              (LeftCausalWindow || win_left >= 0) && col_off < row_hi + full_tile_offset - win_left;
+          const bool any_right_masked =
+              (LeftCausalWindow || win_right >= 0) && col_off + BLK_K - 1 > row_lo + full_tile_offset + win_right;
           if (any_left_masked || any_right_masked) {
-            if (win_left >= 0 && win_right == 0 && !fused) {
+            if (LeftCausalWindow || (win_left >= 0 && win_right == 0 && !fused)) {
               const int row_col_delta0 = get<0>(cS_thread(0)) + full_tile_offset - get<1>(cS_thread(0));
               CUTLASS_PRAGMA_UNROLL
               for (int i = 0; i < tSrS.size(); ++i) {
