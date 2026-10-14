@@ -162,6 +162,11 @@ def test_fused_norm_residual(
     )
 
 
+def test_fused_norm_residual_hidden_tail_rows_boundary() -> None:
+    # H=8200 uses a partial final vector; rows=385 borders a workgroup change.
+    test_fused_norm_residual(385, 8200, "none", True)
+
+
 def benchmark(
     rows: int,
     hidden_size: int,
@@ -225,12 +230,15 @@ def benchmark(
             raise RuntimeError(
                 f"expected {iterations} XPU kernel events, got {len(kernels)}: {names}"
             )
-        latency_us = statistics.median(event["dur"] for event in kernels)
+        durations_us = [event["dur"] for event in kernels]
+        latency_us = statistics.median(durations_us)
         print(
             f"rows={rows} hidden={hidden_size} "
             f"post_norm_input_scale={post_norm_input_scale} "
             f"round_pre_norm_input={round_pre_norm_input} "
-            f"kernel_event_p50={latency_us:.3f} us"
+            f"kernel_event_p50={latency_us:.3f} us "
+            f"kernel_event_range_us=[{min(durations_us):.3f},{max(durations_us):.3f}] "
+            f"kernel_event_samples_us={json.dumps(durations_us)}"
         )
         return
 
@@ -270,16 +278,18 @@ if __name__ == "__main__":
     parser.add_argument("--osl", type=int, default=16)
     parser.add_argument("--tp", type=int, default=1)
     parser.add_argument("--ep", type=int, default=1)
-    parser.add_argument("--rows", type=int, choices=[8, 32768], default=32768)
-    parser.add_argument(
-        "--hidden-size", type=int, choices=[4096, 8192, 16384], default=8192
-    )
+    parser.add_argument("--rows", type=int, default=32768)
+    parser.add_argument("--hidden-size", type=int, default=8192)
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--iterations", type=int, default=30)
     parser.add_argument("--profiler", action="store_true")
     parser.add_argument("--post-norm-input-scale", action="store_true")
     parser.add_argument("--round-pre-norm-input", action="store_true")
     args = parser.parse_args()
+    if args.rows <= 0 or args.hidden_size <= 0 or args.hidden_size % 8:
+        parser.error(
+            "rows must be positive and hidden-size must be a positive multiple of 8"
+        )
     if (args.serving_batch, args.isl, args.osl, args.tp, args.ep) != (
         8,
         4096,
