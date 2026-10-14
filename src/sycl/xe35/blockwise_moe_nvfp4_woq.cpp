@@ -217,7 +217,7 @@ enum class MTile {
   M256N256,
 };
 
-MTile select_m_tile(int64_t total_rows, int64_t groups, int64_t n, int sm_count) {
+MTile select_m_tile(int64_t total_rows, int64_t groups, int64_t n, int sm_count, int64_t m64_max_rows) {
   const int64_t rows_per_group = (total_rows + groups - 1) / groups;
   if (rows_per_group <= 8) {
     const int64_t m8n256_workgroups = groups * cute::ceil_div(n, int64_t(256));
@@ -226,7 +226,7 @@ MTile select_m_tile(int64_t total_rows, int64_t groups, int64_t n, int sm_count)
   if (rows_per_group <= 32) {
     return MTile::M32N256;
   }
-  if (rows_per_group <= 64) {
+  if (rows_per_group <= m64_max_rows) {
     return MTile::M64N256;
   }
   return MTile::M256N256;
@@ -399,7 +399,7 @@ void nvfp4_woq_mxfp8_scaled_grouped_mm(
 
   auto& queue = at::xpu::getCurrentXPUStream(device.index()).queue();
   const auto hw_info = hardware_info(device);
-  const auto tile = select_m_tile(total_m, groups, n, hw_info.sm_count);
+  const auto tile = select_m_tile(total_m, groups, n, hw_info.sm_count, 64);
 
 #define RUN_MXFP8_POLICY(...)    \
   run_mxfp8_policy<__VA_ARGS__>( \
@@ -475,7 +475,9 @@ void nvfp4_woq_bf16_grouped_mm(
   auto rows_per_expert = problem_sizes.select(1, 0).contiguous();
   auto& queue = at::xpu::getCurrentXPUStream(device.index()).queue();
   const auto hw_info = hardware_info(device);
-  const auto tile = select_m_tile(total_m, groups, n, hw_info.sm_count);
+  // Paired device timings place the BF16 M64/M256 crossover after
+  // 192 average rows; MXFP8 retains its original threshold.
+  const auto tile = select_m_tile(total_m, groups, n, hw_info.sm_count, 192);
 
 #define RUN_BF16_POLICY(POLICY) \
   run_bf16_policy<POLICY>(queue, hw_info, rows_per_expert, a, b, sfmx_b, c_b, output, n, k, groups)
