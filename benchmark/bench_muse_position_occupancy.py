@@ -1,94 +1,179 @@
-"""Measure the model's position shape with direct Triton and registered SYCL kernels."""
+"""Compare main Triton position kernel and the registered SYCL kernel on XPU."""
 
 import argparse
+import importlib
 import json
 import os
 import tempfile
+import time
 from pathlib import Path
 from statistics import median
 
-import sgl_kernel  # noqa: F401
 import torch
 
-from sglang.kernels.ops.attention.position import (
-    compute_position_kernel,
-    compute_position_triton,
-)
+
+def measure(triton_fn, sycl_fn, samples, reverse_order):
+    order = (sycl_fn, triton_fn) if reverse_order else (triton_fn, sycl_fn)
+    for _ in range(5):
+        for fn in order:
+            fn()
+    torch.xpu.synchronize()
+    activities = [
+        torch.profiler.ProfilerActivity.CPU,
+        torch.profiler.ProfilerActivity.XPU,
+    ]
+    with torch.profiler.profile(activities=activities) as profile:
+        for _ in range(samples):
+            for fn in order:
+                fn()
+        torch.xpu.synchronize()
+    with tempfile.TemporaryDirectory() as directory:
+        path = Path(directory) / "trace.json"
+        profile.export_chrome_trace(str(path))
+        events = json.loads(path.read_text())["traceEvents"]
+    kernels = [
+        event for event in events if event.get("cat") == "kernel" and "dur" in event
+    ]
+    triton_us = [
+        float(event["dur"])
+        for event in kernels
+        if "compute_position_kernel" in event["name"]
+    ]
+    sycl_us = [
+        float(event["dur"])
+        for event in kernels
+        if "MuseComputePositionKernel" in event["name"]
+    ]
+    assert len(triton_us) == len(sycl_us) == samples, [
+        (event["name"], event["dur"]) for event in kernels[:10]
+    ]
+    return triton_us, sycl_us
+
+
+def spread(samples):
+    ordered = sorted(samples)
+    last = len(ordered) - 1
+    return ordered[round(0.2 * last)], ordered[round(0.8 * last)]
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--serving-batch", type=int, default=8)
+    parser.add_argument("--batch", type=int, default=8)
+    parser.add_argument("--lengths", default="16,64,128,256,512,1024,2048,4096")
+    parser.add_argument("--samples", type=int, default=7)
+    parser.add_argument("--length-dtype", choices=["int32", "int64"], default="int32")
     parser.add_argument("--isl", type=int, default=4096)
     parser.add_argument("--osl", type=int, default=16)
     parser.add_argument("--tp", type=int, default=1)
     parser.add_argument("--ep", type=int, default=1)
-    parser.add_argument("--active-requests", type=int, choices=[7, 8], default=8)
-    parser.add_argument(
-        "--max-seq-len-hint", type=int, choices=[-1, 4096], default=4096
-    )
-    parser.add_argument("--samples", type=int, default=31)
+    parser.add_argument("--skew", action="store_true")
+    parser.add_argument("--max-seq-len-hint", type=int, default=-1)
+    parser.add_argument("--reverse-order", action="store_true")
+    parser.add_argument("--prefix-mode", choices=["zero", "staggered"], default="zero")
     args = parser.parse_args()
-    if (args.serving_batch, args.isl, args.osl, args.tp, args.ep) != (
-        8,
-        4096,
-        16,
-        1,
-        1,
-    ) or os.environ.get("BATCHES", "8") != "8":
-        parser.error("Muse-Spark serving scope requires B=8, ISL=4096, OSL=16, TP1/EP1")
-
-    active = args.active_requests
-    tokens = active * args.isl
-    prefix = torch.zeros(active, device="xpu", dtype=torch.int64)
-    lengths = torch.full((active,), args.isl, device="xpu", dtype=torch.int64)
-    old_pos = torch.empty(tokens, device="xpu", dtype=torch.int64)
-    old_start = torch.empty(active, device="xpu", dtype=torch.int32)
-
-    def old():
-        compute_position_kernel[(active,)](old_pos, old_start, prefix, lengths, True)
-
-    def new():
-        return compute_position_triton(
-            prefix, lengths, tokens, max_seq_len_hint=args.max_seq_len_hint
-        )
-
-    old()
-    new_pos, new_start = new()
-    torch.xpu.synchronize()
-    torch.testing.assert_close(new_pos, old_pos)
-    torch.testing.assert_close(new_start, old_start)
-    with torch.profiler.profile(
-        activities=[
-            torch.profiler.ProfilerActivity.CPU,
-            torch.profiler.ProfilerActivity.XPU,
-        ]
-    ) as profile:
-        for i in range(args.samples):
-            old()
-            new()
-        torch.xpu.synchronize()
-    with tempfile.TemporaryDirectory() as dirname:
-        path = Path(dirname) / "trace.json"
-        profile.export_chrome_trace(str(path))
-        events = json.loads(path.read_text())["traceEvents"]
-    old_us = [
-        e["dur"]
-        for e in events
-        if e.get("cat") == "kernel" and "compute_position_kernel" in e["name"]
-    ]
-    new_us = [
-        e["dur"]
-        for e in events
-        if e.get("cat") == "kernel" and "MuseComputePositionKernel" in e["name"]
-    ]
-    assert len(old_us) == len(new_us) == args.samples, (len(old_us), len(new_us))
-    old_median, new_median = median(old_us), median(new_us)
-    print(
-        f"position B8 wave{active} T{tokens} hint={args.max_seq_len_hint}: "
-        f"Triton={old_median:.3f} us SYCL={new_median:.3f} us "
-        f"speedup={old_median / new_median:.3f}x"
+    importlib.import_module(os.environ.get("POSITION_EXTENSION_NAME", "sgl_kernel"))
+    position_module = importlib.import_module(
+        os.environ.get("POSITION_MAIN_MODULE", "sglang.kernels.ops.attention.position")
     )
+    compute_position_kernel = position_module.compute_position_kernel
+    length_dtype = getattr(torch, args.length_dtype)
+    assert args.batch > 0 and args.samples > 0
+    assert torch.xpu.is_available()
+    print(
+        json.dumps(
+            {
+                "meta": {
+                    "device": torch.xpu.get_device_name(0),
+                    "dtype": f"{args.length_dtype} lengths; int64 positions; int32 starts",
+                    "layout": "contiguous",
+                    "method": "torch.profiler XPU kernel event duration; us",
+                    "batch": args.batch,
+                    "isl": args.isl,
+                    "osl": args.osl,
+                    "tp": args.tp,
+                    "ep": args.ep,
+                    "samples": args.samples,
+                    "skew": args.skew,
+                    "max_seq_len_hint": args.max_seq_len_hint,
+                    "reverse_order": args.reverse_order,
+                    "prefix_mode": args.prefix_mode,
+                }
+            }
+        ),
+        flush=True,
+    )
+    for length in map(int, args.lengths.split(",")):
+        assert length >= 0
+        lengths = (
+            [length] + [0] * (args.batch - 1) if args.skew else [length] * args.batch
+        )
+        tokens = sum(lengths)
+        seq = torch.tensor(lengths, dtype=length_dtype, device="xpu")
+        prefix = torch.zeros(args.batch, dtype=length_dtype, device="xpu")
+        if args.prefix_mode == "staggered":
+            prefix = torch.arange(args.batch, dtype=length_dtype, device="xpu") * 3
+        positions_t = torch.empty(tokens, dtype=torch.int64, device="xpu")
+        starts_t = torch.empty(args.batch, dtype=torch.int32, device="xpu")
+        positions_s = torch.empty_like(positions_t)
+        starts_s = torch.empty_like(starts_t)
+
+        def main_triton():
+            compute_position_kernel[(args.batch,)](
+                positions_t, starts_t, prefix, seq, True
+            )
+
+        def branch_sycl():
+            if args.max_seq_len_hint >= 0:
+                torch.ops.sgl_kernel.muse_compute_position_with_hint(
+                    positions_s, starts_s, prefix, seq, args.max_seq_len_hint
+                )
+            else:
+                torch.ops.sgl_kernel.muse_compute_position(
+                    positions_s, starts_s, prefix, seq
+                )
+
+        main_triton()
+        branch_sycl()
+        torch.xpu.synchronize()
+        expected = torch.cat(
+            [
+                torch.arange(size, device="xpu", dtype=torch.int64)
+                + (i * 3 if args.prefix_mode == "staggered" else 0)
+                for i, size in enumerate(lengths)
+            ]
+        )
+        expected_starts = torch.tensor(
+            [sum(lengths[:i]) for i in range(args.batch)],
+            device="xpu",
+            dtype=torch.int32,
+        )
+        for pos, starts in ((positions_t, starts_t), (positions_s, starts_s)):
+            torch.testing.assert_close(pos, expected, rtol=0, atol=0)
+            torch.testing.assert_close(starts, expected_starts, rtol=0, atol=0)
+        t, s = measure(main_triton, branch_sycl, args.samples, args.reverse_order)
+        t_p20, t_p80 = spread(t)
+        s_p20, s_p80 = spread(s)
+        print(
+            json.dumps(
+                {
+                    "length": length,
+                    "tokens": tokens,
+                    "main_triton_us": t,
+                    "branch_sycl_us": s,
+                    "main_p50_us": median(t),
+                    "branch_p50_us": median(s),
+                    "main_p20_us": t_p20,
+                    "main_p80_us": t_p80,
+                    "branch_p20_us": s_p20,
+                    "branch_p80_us": s_p80,
+                    "main_span_us": max(t) - min(t),
+                    "branch_span_us": max(s) - min(s),
+                }
+            ),
+            flush=True,
+        )
+        torch.xpu.synchronize()
+        time.sleep(2)
 
 
 if __name__ == "__main__":

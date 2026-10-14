@@ -56,21 +56,22 @@ def test_muse_compute_position_multiple_workgroups_no_prefix():
     )
 
 
-def test_muse_compute_position_with_host_max_hint_skew_b8():
+@pytest.mark.parametrize("long_request", [4096, 8193])
+def test_muse_compute_position_with_host_max_hint_skew_b8(long_request):
     if not torch.xpu.is_available():
         pytest.skip("XPU unavailable")
-    lengths = torch.tensor([4096] + [0] * 7, device="xpu", dtype=torch.int32)
+    lengths = torch.tensor([long_request] + [0] * 7, device="xpu", dtype=torch.int32)
     prefix = torch.arange(8, device="xpu", dtype=torch.int32) * 3
-    positions = torch.empty(4096, device="xpu", dtype=torch.int64)
+    positions = torch.empty(long_request, device="xpu", dtype=torch.int64)
     starts = torch.empty(8, device="xpu", dtype=torch.int32)
     torch.ops.sgl_kernel.muse_compute_position_with_hint(
-        positions, starts, prefix, lengths, 4096
+        positions, starts, prefix, lengths, long_request
     )
-    torch.testing.assert_close(positions, torch.arange(4096, device="xpu"))
+    torch.testing.assert_close(positions, torch.arange(long_request, device="xpu"))
     torch.testing.assert_close(
         starts,
         torch.tensor(
-            [0, 4096, 4096, 4096, 4096, 4096, 4096, 4096],
+            [0] + [long_request] * 7,
             device="xpu",
             dtype=torch.int32,
         ),
@@ -79,7 +80,7 @@ def test_muse_compute_position_with_host_max_hint_skew_b8():
     torch.ops.sgl_kernel.muse_compute_position_with_hint(
         positions, starts, prefix, lengths, 1
     )
-    torch.testing.assert_close(positions, torch.arange(4096, device="xpu"))
+    torch.testing.assert_close(positions, torch.arange(long_request, device="xpu"))
     with pytest.raises(RuntimeError, match="nonnegative"):
         torch.ops.sgl_kernel.muse_compute_position_with_hint(
             positions, starts, prefix, lengths, -1

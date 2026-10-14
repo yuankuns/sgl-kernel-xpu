@@ -79,7 +79,10 @@ void muse_compute_position_impl(
   // still covers every sequence element.
   const int64_t average_groups = (positions.numel() + batch * 512 - 1) / (batch * 512);
   const int64_t hinted_groups = max_seq_len_hint > 0 ? (max_seq_len_hint + 511) / 512 : 1;
-  const int64_t groups_per_request = std::min<int64_t>(8, std::max<int64_t>({1, average_groups, hinted_groups}));
+  // There is no benefit in launching more groups per request than there are
+  // workgroup-sized chunks in the entire positions output.
+  const int64_t useful_groups = std::max<int64_t>(1, (positions.numel() + kPositionWorkgroup - 1) / kPositionWorkgroup);
+  const int64_t groups_per_request = std::min(useful_groups, std::max({int64_t{1}, average_groups, hinted_groups}));
   const auto global_size = sycl::range<1>(batch * groups_per_request * kPositionWorkgroup);
   const auto local_size = sycl::range<1>(kPositionWorkgroup);
   if (prefix_lens.scalar_type() == at::kInt && seq_lens.scalar_type() == at::kInt) {
