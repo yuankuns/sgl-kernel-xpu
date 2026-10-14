@@ -541,7 +541,7 @@ void sgl_padded_gather_per_token_group_quant_fp4(
   if (eps_f <= 0.0f) eps_f = 1e-10f;
 
   auto queue = dpcppGetCurrentQueue();
-#define LAUNCH_PADDED_GATHER_FP4(T, INDEX_T)                                                                       \
+#define LAUNCH_PADDED_GATHER_FP4(T, INDEX_T)                                                                        \
   do {                                                                                                              \
     using Kernel = PerTokenGroupQuantFP4Kernel<T, 32, false, 1, true, INDEX_T>;                                     \
     constexpr int kTargetThreads = 256;                                                                             \

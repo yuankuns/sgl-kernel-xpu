@@ -229,8 +229,7 @@ struct MuseSparkRouting {
 #pragma unroll
       for (int i = 0; i < kValuesPerLane; ++i) {
         const int expert = lane * kValuesPerLane + i;
-        if ((kFullTile || expert < args.experts) &&
-            (lane_slot < 0 || rank_values[i] > lane_value)) {
+        if ((kFullTile || expert < args.experts) && (lane_slot < 0 || rank_values[i] > lane_value)) {
           lane_value = rank_values[i];
           lane_slot = i;
         }
@@ -783,8 +782,8 @@ void fused_topk_sigmoid(
   if constexpr (sizeof(T) == 2) {
     const int values_per_lane = div_up(num_experts, 32);
     const bool full_tile = num_experts == values_per_lane * 32;
-    const bool vector_width = values_per_lane == 1 || values_per_lane == 2 || values_per_lane == 4 ||
-                              values_per_lane == 8;
+    const bool vector_width =
+        values_per_lane == 1 || values_per_lane == 2 || values_per_lane == 4 || values_per_lane == 8;
     if (topk == 8 && full_tile && vector_width) {
       RoutingArguments args{
           topk_weights,

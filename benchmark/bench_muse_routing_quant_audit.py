@@ -80,7 +80,12 @@ def main():
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--rep", type=int, default=21)
     parser.add_argument("--graph-replay", type=int, default=1)
-    parser.add_argument("--shapes", nargs="+", type=int, default=[64, 128, 252, 256, 260, 368, 372, 376, 512, 1024])
+    parser.add_argument(
+        "--shapes",
+        nargs="+",
+        type=int,
+        default=[64, 128, 252, 256, 260, 368, 372, 376, 512, 1024],
+    )
     parser.add_argument("--hidden", type=int, default=4096)
     args = parser.parse_args()
     global GRAPH_REPLAY
@@ -94,7 +99,17 @@ def main():
 
     torch.manual_seed(7)
     props = torch.xpu.get_device_properties(0)
-    print(json.dumps({"device": props.name, "device_id": props.device_id, "branch": args.branch, "hidden": args.hidden}), flush=True)
+    print(
+        json.dumps(
+            {
+                "device": props.name,
+                "device_id": props.device_id,
+                "branch": args.branch,
+                "hidden": args.hidden,
+            }
+        ),
+        flush=True,
+    )
     for i, rows in enumerate(args.shapes):
         if args.graph_replay > 1:
             torch.manual_seed(7000 + rows)
@@ -107,12 +122,27 @@ def main():
             q, s = sgl_padded_gather_per_token_group_quant_fp4(x, index)
             assert torch.equal(q, q_ref) and torch.equal(s, s_ref)
         if not args.lane_only:
-            bench(f"index_quant_rows{rows}", lambda: sgl_per_token_group_quant_fp4(x.index_select(0, index)), args.warmup, args.rep)
+            bench(
+                f"index_quant_rows{rows}",
+                lambda: sgl_per_token_group_quant_fp4(x.index_select(0, index)),
+                args.warmup,
+                args.rep,
+            )
         if not args.fused_only:
-            bench(f"plain_quant_rows{rows}", lambda: sgl_per_token_group_quant_fp4(gathered), args.warmup, args.rep)
+            bench(
+                f"plain_quant_rows{rows}",
+                lambda: sgl_per_token_group_quant_fp4(gathered),
+                args.warmup,
+                args.rep,
+            )
         if args.branch:
             if not args.fused_only:
-                bench(f"gather_quant_rows{rows}", lambda: sgl_padded_gather_per_token_group_quant_fp4(x, index), args.warmup, args.rep)
+                bench(
+                    f"gather_quant_rows{rows}",
+                    lambda: sgl_padded_gather_per_token_group_quant_fp4(x, index),
+                    args.warmup,
+                    args.rep,
+                )
             routed_rows = source_rows * 8
             active_experts = min(256, routed_rows)
             counts = torch.zeros(256, dtype=torch.int32)
@@ -154,15 +184,15 @@ def main():
                     args.warmup,
                     args.rep,
                 )
-            gate_up = torch.randn((rows, 2 * args.hidden), device="xpu", dtype=torch.bfloat16)
+            gate_up = torch.randn(
+                (rows, 2 * args.hidden), device="xpu", dtype=torch.bfloat16
+            )
             activated = silu_and_mul(gate_up)
             fused_q, fused_s = sgl_per_token_group_quant_fp4(
                 gate_up, fuse_silu_and_mul=True
             )
             separate_q, separate_s = sgl_per_token_group_quant_fp4(activated)
-            assert torch.equal(fused_q, separate_q) and torch.equal(
-                fused_s, separate_s
-            )
+            assert torch.equal(fused_q, separate_q) and torch.equal(fused_s, separate_s)
             if not args.lane_only:
                 bench(
                     f"separate_silu_quant_rows{rows}",
@@ -172,9 +202,7 @@ def main():
                 )
             bench(
                 f"fused_silu_quant_rows{rows}",
-                lambda: sgl_per_token_group_quant_fp4(
-                    gate_up, fuse_silu_and_mul=True
-                ),
+                lambda: sgl_per_token_group_quant_fp4(gate_up, fuse_silu_and_mul=True),
                 args.warmup,
                 args.rep,
             )
@@ -185,33 +213,51 @@ def main():
             logits = torch.randn((route_tokens, 256), device="xpu", dtype=torch.float32)
             bias = torch.randn((256,), device="xpu", dtype=torch.float32)
             multiplier = 0.3535533905932738
+
             def native():
                 scores = torch.sigmoid((logits * multiplier).float())
                 ids = torch.topk(scores + bias, 8, dim=-1, sorted=True)[1]
                 weights = scores.gather(1, ids)
                 return weights / (weights.sum(dim=-1, keepdim=True) + 1e-15), ids
-            main_weights = torch.empty((route_tokens, 8), device="xpu", dtype=torch.float32)
+
+            main_weights = torch.empty(
+                (route_tokens, 8), device="xpu", dtype=torch.float32
+            )
             main_ids = torch.empty((route_tokens, 8), device="xpu", dtype=torch.int32)
+
             def main_topk():
                 scaled_logits = logits * multiplier
                 topk_sigmoid(main_weights, main_ids, scaled_logits, True, bias)
                 return main_weights, main_ids
+
             main_w, main_i = main_topk()
             check_route(main_w, main_i, logits, bias, multiplier)
             if args.branch:
-                weights = torch.empty((route_tokens, 8), device="xpu", dtype=torch.float32)
+                weights = torch.empty(
+                    (route_tokens, 8), device="xpu", dtype=torch.float32
+                )
                 ids = torch.empty((route_tokens, 8), device="xpu", dtype=torch.int32)
+
                 def fused():
-                    muse_spark_moe_routing(weights, ids, logits, bias, multiplier, 1.0, 1e-15)
+                    muse_spark_moe_routing(
+                        weights, ids, logits, bias, multiplier, 1.0, 1e-15
+                    )
+
                 fused()
                 check_route(weights, ids, logits, bias, multiplier)
             bench(f"native_route_tokens{route_tokens}", native, args.warmup, args.rep)
-            bench(f"main_topk_route_tokens{route_tokens}", main_topk, args.warmup, args.rep)
+            bench(
+                f"main_topk_route_tokens{route_tokens}",
+                main_topk,
+                args.warmup,
+                args.rep,
+            )
             if args.triton_route:
                 try:
                     from sglang_meta_common.ops.fused_muse_spark_routing import (
                         fused_muse_spark_routing,
                     )
+
                     triton_weights = torch.empty_like(main_weights)
                     triton_ids = torch.empty_like(main_ids)
 
@@ -239,7 +285,10 @@ def main():
                 except Exception as exc:
                     print(
                         json.dumps(
-                            {"name": f"framework_auto_route_tokens{route_tokens}", "error": repr(exc)}
+                            {
+                                "name": f"framework_auto_route_tokens{route_tokens}",
+                                "error": repr(exc),
+                            }
                         ),
                         flush=True,
                     )

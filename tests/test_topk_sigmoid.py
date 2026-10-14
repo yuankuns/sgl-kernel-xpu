@@ -184,7 +184,9 @@ def test_muse_spark_topk8_ties_choose_lowest_expert(dtype, n_expert):
 def test_full_tile_topk8_options(dtype, n_expert, n_token, renormalize, with_bias):
     torch.manual_seed(31000 + n_expert + n_token)
     logits = torch.randn(n_token, n_expert, dtype=dtype, device=device)
-    bias = torch.randn(n_expert, dtype=torch.float32, device=device) if with_bias else None
+    bias = (
+        torch.randn(n_expert, dtype=torch.float32, device=device) if with_bias else None
+    )
     weights = torch.empty(n_token, 8, dtype=torch.float32, device=device)
     ids = torch.empty(n_token, 8, dtype=torch.int32, device=device)
     sgl_kernel.topk_sigmoid(weights, ids, logits, renormalize, bias)
@@ -194,7 +196,8 @@ def test_full_tile_topk8_options(dtype, n_expert, n_token, renormalize, with_bia
     torch.testing.assert_close(
         rank.gather(1, ids.long()),
         torch.topk(rank, 8, dim=-1, sorted=True).values,
-        rtol=0, atol=0,
+        rtol=0,
+        atol=0,
     )
     selected = scores.gather(1, ids.long())
     expected = selected / selected.sum(-1, keepdim=True) if renormalize else selected
