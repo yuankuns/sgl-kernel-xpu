@@ -22,7 +22,7 @@ def test_muse_mxfp4_small_permutation(index_dtype, experts, alignment):
     expanded_to_permuted = torch.empty(pairs, device="xpu", dtype=torch.int32)
     scale_map = torch.empty(upper_rows, 2, device="xpu", dtype=torch.int32)
 
-    torch.ops.sgl_kernel.muse_mxfp4_small_permutation(
+    torch.ops.sgl_kernel.mxfp4_small_permutation(
         ids, counts, perm_src, expanded_to_permuted, scale_map, alignment
     )
 

@@ -48,10 +48,10 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.impl("gemma_fused_add_rmsnorm", torch::kXPU, &at::native::xpu::gemma_fused_add_rmsnorm);
 
   m.def(
-      "muse_mxfp4_small_permutation(Tensor topk_ids, Tensor(a!) padded_counts, "
+      "mxfp4_small_permutation(Tensor topk_ids, Tensor(a!) padded_counts, "
       "Tensor(b!) perm_src, Tensor(c!) expanded_to_permuted, Tensor(d!) scale_map, "
       "int alignment) -> ()");
-  m.impl("muse_mxfp4_small_permutation", torch::kXPU, &at::native::xpu::muse_mxfp4_small_permutation);
+  m.impl("mxfp4_small_permutation", torch::kXPU, &at::native::xpu::mxfp4_small_permutation);
 
   m.def("topk_softmax(Tensor! topk_weights, Tensor! topk_indices, Tensor gating_output, bool renormalize) -> ()");
   m.impl("topk_softmax", torch::kXPU, &at::native::xpu::topk_softmax);
