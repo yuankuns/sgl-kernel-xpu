@@ -47,6 +47,12 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.def("gemma_fused_add_rmsnorm(Tensor! input, Tensor! residual, Tensor weight, float eps) -> ()");
   m.impl("gemma_fused_add_rmsnorm", torch::kXPU, &at::native::xpu::gemma_fused_add_rmsnorm);
 
+  m.def(
+      "fused_post_norm_residual_pre_norm(Tensor branch, Tensor stream, Tensor post_weight, Tensor pre_weight, Tensor "
+      "alpha, Tensor beta, Tensor! output, Tensor! new_stream, float post_eps, float pre_eps, bool "
+      "post_norm_input_scale, bool round_pre_norm_input, Tensor(a!)? output_fp32=None) -> ()");
+  m.impl("fused_post_norm_residual_pre_norm", torch::kXPU, &at::native::xpu::fused_post_norm_residual_pre_norm);
+
   m.def("topk_softmax(Tensor! topk_weights, Tensor! topk_indices, Tensor gating_output, bool renormalize) -> ()");
   m.impl("topk_softmax", torch::kXPU, &at::native::xpu::topk_softmax);
 

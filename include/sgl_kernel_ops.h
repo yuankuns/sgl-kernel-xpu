@@ -115,6 +115,20 @@ void rmsnorm(torch::Tensor& output, torch::Tensor& input, torch::Tensor& weight,
 void fused_add_rmsnorm(torch::Tensor input, torch::Tensor residual, torch::Tensor weight, double eps);
 void gemma_rmsnorm(torch::Tensor& output, torch::Tensor& input, torch::Tensor& weight, double eps);
 void gemma_fused_add_rmsnorm(torch::Tensor& input, torch::Tensor& residual, torch::Tensor& weight, double eps);
+void fused_post_norm_residual_pre_norm(
+    torch::Tensor branch,
+    torch::Tensor stream,
+    torch::Tensor post_weight,
+    torch::Tensor pre_weight,
+    torch::Tensor alpha,
+    torch::Tensor beta,
+    torch::Tensor output,
+    torch::Tensor new_stream,
+    double post_eps,
+    double pre_eps,
+    bool post_norm_input_scale,
+    bool round_pre_norm_input,
+    const std::optional<torch::Tensor>& output_fp32);
 void topk_softmax(at::Tensor& topk_weights, at::Tensor& topk_indices, at::Tensor& gating_output, bool renormalize);
 void topk_sigmoid(
     at::Tensor& topk_weights,
