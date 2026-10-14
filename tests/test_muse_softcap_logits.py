@@ -16,13 +16,17 @@ def test_muse_softcap_logits_strided():
 
 
 @pytest.mark.parametrize("width", [32, 33])
-def test_muse_softcap_logits_contiguous(width):
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.float16])
+def test_muse_softcap_logits_contiguous(width, dtype):
     if not torch.xpu.is_available():
         pytest.skip("XPU unavailable")
-    source = torch.linspace(-90, 90, 4 * width, device="xpu").reshape(4, width)
+    source = (
+        torch.linspace(-90, 90, 4 * width, device="xpu").to(dtype).reshape(4, width)
+    )
     logits = source.clone()
     torch.ops.sgl_kernel.muse_softcap_logits(logits, 30.0)
-    torch.testing.assert_close(logits, torch.tanh(source / 30.0) * 30.0)
+    expected = (torch.tanh(source.float() / 30.0) * 30.0).to(dtype)
+    torch.testing.assert_close(logits, expected, rtol=3e-5, atol=3e-5)
 
 
 def test_muse_softcap_logits_vector_accuracy_across_zero_and_saturation():

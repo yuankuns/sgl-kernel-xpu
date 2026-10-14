@@ -1,8 +1,7 @@
-"""Compare Triton and SYCL logits softcap at Muse Spark serving shapes."""
+"""Compare Triton and SYCL logits softcap; defaults match Muse Spark B8."""
 
 import argparse
 import json
-import os
 import tempfile
 from statistics import median
 
@@ -10,30 +9,20 @@ import sgl_kernel  # noqa: F401
 import torch
 import triton
 
-from sglang.kernels.ops.activation.softcap import (
-    softcap_inplace_logits,
-    softcap_inplace_logits_kernel,
-)
+from sglang.kernels.ops.activation.softcap import softcap_inplace_logits_kernel
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--batch", type=int, default=8)
-    parser.add_argument("--isl", type=int, default=4096)
-    parser.add_argument("--osl", type=int, default=16)
-    parser.add_argument("--tp", type=int, default=1)
-    parser.add_argument("--ep", type=int, default=1)
     parser.add_argument("--vocab", type=int, default=202048)
     parser.add_argument("--samples", type=int, default=30)
+    parser.add_argument(
+        "--order", choices=("triton-first", "sycl-first"), default="triton-first"
+    )
     args = parser.parse_args()
-    if (args.batch, args.isl, args.osl, args.tp, args.ep) != (
-        8,
-        4096,
-        16,
-        1,
-        1,
-    ) or os.environ.get("BATCHES", "8") != "8":
-        parser.error("Muse-Spark serving scope requires B=8, ISL=4096, OSL=16, TP1/EP1")
+    if args.batch < 1 or args.vocab < 1 or args.samples < 1:
+        parser.error("batch, vocab, and samples must be positive")
     cap = 20.0
     source = torch.randn(args.batch, args.vocab, device="xpu", dtype=torch.float32)
     triton_logits = source.clone()
@@ -45,7 +34,7 @@ def main() -> None:
         )
 
     def run_sycl() -> None:
-        softcap_inplace_logits(sycl_logits, cap)
+        torch.ops.sgl_kernel.muse_softcap_logits(sycl_logits, cap)
 
     run_triton()
     run_sycl()
@@ -57,10 +46,14 @@ def main() -> None:
             torch.profiler.ProfilerActivity.XPU,
         ]
     ) as profiler:
+        runs = (
+            (run_triton, run_sycl)
+            if args.order == "triton-first"
+            else (run_sycl, run_triton)
+        )
         for _ in range(args.samples):
-            run_triton()
-        for _ in range(args.samples):
-            run_sycl()
+            for run in runs:
+                run()
         torch.xpu.synchronize()
     with tempfile.NamedTemporaryFile(suffix=".json") as trace_file:
         profiler.export_chrome_trace(trace_file.name)
