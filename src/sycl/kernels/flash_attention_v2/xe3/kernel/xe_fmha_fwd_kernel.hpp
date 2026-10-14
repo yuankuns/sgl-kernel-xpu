@@ -433,6 +433,9 @@ class XeFMHAFwdKernel {
       int full_tile_offset = 0;
       int seq_len_new = seq_len_kv;
       int seq_coord = 0;
+      const int seq_len_kv_total = seq_len_kv_cache + seq_len_kv;
+      int kv_col_lo = 0;
+      int kv_cols = seq_len_kv_total;
       if constexpr (CollectiveMainloop::CausalMask || CollectiveMainloop::LocalMask) {
         int q_sg_tile = get<0>(shape_div(TileShapeQK{}, shape(SubgroupLayoutQK{})));
         auto cS = make_identity_tensor(take<0, 2>(TiledMMAQK{}.tile_mnk()));
@@ -440,40 +443,41 @@ class XeFMHAFwdKernel {
         auto q_offset_wi = get<0>(tScS(0));
         auto q_offset_sg = group_broadcast(sycl::ext::oneapi::this_work_item::get_sub_group(), q_offset_wi, 0);
 
-        if constexpr (CollectiveMainloop::CausalMask) {
-          int offset = cute::min(seq_len_qo, CollectiveMainloop::CachedKV ? seq_len_kv_cache : seq_len_kv);
-          discard_seq_coord = seq_len_qo - offset;
-          full_tile_offset = (CollectiveMainloop::CachedKV ? seq_len_kv_cache : seq_len_kv) - offset;
-        } else if constexpr (CollectiveMainloop::LocalMask) {
-          // Local attention uses the true query-to-KV offset for the whole batch,
-          // not the causal clamp. This preserves the reference window band
-          // row_kv_idx = row_q_idx + (seq_len_kv - seq_len_qo), which can be negative
-          // when the KV sequence is shorter than the query sequence.
-          full_tile_offset = (CollectiveMainloop::CachedKV ? seq_len_kv_cache : seq_len_kv) - seq_len_qo;
-        }
-
+        int offset = CollectiveMainloop::LocalMask ? seq_len_qo : cute::min(seq_len_qo, seq_len_kv_total);
+        discard_seq_coord = seq_len_qo - offset;
+        full_tile_offset = seq_len_kv_total - offset;
         seq_coord = cute::min(seq_len_qo, (blk_q * get<0>(TileShapeQK{}) + q_offset_sg));
-        if constexpr (CollectiveMainloop::CausalMask) {
-          // Skip only when the whole subgroup Q-tile lies below the causal cutoff.
-          if (seq_coord + q_sg_tile <= discard_seq_coord) continue;
+
+        int cols = full_tile_offset + (seq_coord - discard_seq_coord) + q_sg_tile;
+        if constexpr (CollectiveMainloop::LocalMask && !CollectiveMainloop::CausalMask) {
+          cols = params.mainloop.window_size_right >= 0 ? cols + params.mainloop.window_size_right : seq_len_kv_total;
         }
-        if constexpr (CollectiveMainloop::CachedKV) {
-          seq_len_new = 0;
-        } else if constexpr (CollectiveMainloop::LocalMask && !CollectiveMainloop::CausalMask) {
-          seq_len_new = seq_len_kv;
-        } else {
-          seq_len_new = full_tile_offset + cute::min(seq_len_kv, seq_coord - discard_seq_coord) + q_sg_tile;
+        kv_cols = cute::max(0, cute::min(seq_len_kv_total, cols));
+
+        if constexpr (CollectiveMainloop::LocalMask) {
+          if (params.mainloop.window_size_left >= 0) {
+            kv_col_lo =
+                cute::max(0, blk_q * get<0>(TileShapeQK{}) + full_tile_offset - params.mainloop.window_size_left);
+          }
         }
+      }
+      if constexpr (CollectiveMainloop::CachedKV) {
+        seq_len_new = cute::max(0, kv_cols - seq_len_kv_cache);
+      } else {
+        seq_len_new = kv_cols;
       }
       const int seq_len = seq_len_new + seq_len_kv_cache;
       // Compute k_blocks as sum of cache tiles + new tiles to avoid losing new data
       // when seq_len_kv_cache is not a multiple of the tile size.
       int k_blocks;
-      if constexpr (CollectiveMainloop::CausalMask || CollectiveMainloop::CachedKV) {
+      if constexpr (CollectiveMainloop::CausalMask || CollectiveMainloop::LocalMask || CollectiveMainloop::CachedKV) {
         const int kblocks_cache =
             CollectiveMainloop::CachedKV ? cute::ceil_div(seq_len_kv_cache, get<1>(TileShapeQK{})) : 0;
-        const int kblocks_new = cute::ceil_div(seq_len_new, get<1>(TileShapeQK{}));
-        k_blocks = kblocks_cache + kblocks_new;
+        const int cache_cols = cute::min(kv_cols, seq_len_kv_cache);
+        const int kblocks_cache_used =
+            CollectiveMainloop::CachedKV ? cute::ceil_div(cache_cols, get<1>(TileShapeQK{})) : 0;
+        const int kblocks_new = cute::ceil_div(kv_cols - cache_cols, get<1>(TileShapeQK{}));
+        k_blocks = kblocks_cache_used + kblocks_new;
       } else {
         // ceil (not floor) so a ragged non-paged seqlen that isn't a multiple of
         // the tile still processes its partial last block (remainder-masked below).
@@ -486,21 +490,15 @@ class XeFMHAFwdKernel {
 
       int blk_k0 = 0;
       int blk_k1 = k_blocks;
-      if constexpr (CollectiveMainloop::LocalMask) {
-        const int tile_q = get<0>(TileShapeQK{});
+      if (kv_col_lo > 0) {
         const int tile_k = get<1>(TileShapeQK{});
-        // Match the reference local-window semantics: the Q row is offset by the
-        // query-to-KV shift before applying the left/right band test.
-        const int q_tile_min_row_kv = blk_q * tile_q + full_tile_offset;
-        const int q_tile_max_row_kv = q_tile_min_row_kv + tile_q - 1;
-        // A negative window size means "unbounded" on that side: clamp left to 0
-        // and right to the full K range instead of the query position.
-        const int wsl = params.mainloop.window_size_left;
-        const int wsr = params.mainloop.window_size_right;
-        const int lo_kv = (wsl < 0) ? 0 : cute::max(0, q_tile_min_row_kv - wsl);
-        blk_k0 = lo_kv / tile_k;
-        blk_k1 = (wsr < 0) ? k_blocks : cute::min(k_blocks, cute::ceil_div(q_tile_max_row_kv + wsr + 1, tile_k));
-        if (blk_k0 >= blk_k1) continue;
+        const int kblocks_cache = CollectiveMainloop::CachedKV ? cute::ceil_div(seq_len_kv_cache, tile_k) : 0;
+        blk_k0 = kv_col_lo >= seq_len_kv_cache ? kblocks_cache + (kv_col_lo - seq_len_kv_cache) / tile_k
+                                               : (CollectiveMainloop::CachedKV ? kv_col_lo / tile_k : 0);
+        if (blk_k0 >= blk_k1) {
+          blk_k0 = 0;
+          blk_k1 = 0;
+        }
       }
 
       int offset_q = 0, offset_k = 0, offset_v = 0, offset_o = 0;
@@ -596,45 +594,33 @@ class XeFMHAFwdKernel {
         const int total_rows = g * q_len;
         const int num_q_blocks = (total_rows + int(QK_BLK_M) - 1) / int(QK_BLK_M);
 
-        int fusion_seq_len = seq_len;
-        int fusion_k_blocks = k_blocks;
-        int fusion_full_tile_offset = full_tile_offset;
-        int fusion_discard = discard_seq_coord;
-        int gqa_fusion_q_per_head = 0;
-        if constexpr (CollectiveMainloop::CausalMask || CollectiveMainloop::LocalMask) {
-          gqa_fusion_q_per_head = q_len;
-        }
-        if constexpr (CollectiveMainloop::CausalMask) {
-          fusion_seq_len = seq_len_kv;
-          fusion_full_tile_offset = seq_len_kv - cute::min(q_len, seq_len_kv);
-          fusion_discard = 0;
-          fusion_k_blocks = cute::ceil_div(seq_len_kv, get<1>(TileShapeQK{}));
-        }
+        // GQA fusion is selected only by the decode dispatch (q_len == 1).
+        // Preserve the paged-cache bounds computed above: replacing them with
+        // seq_len_kv drops the entire cache because decode has no new K/V.
+        const int gqa_fusion_q_per_head = q_len;
 
         const int idx_b_l = idx_b;
-        const int64_t q_group_off = int64_t(head_kv) * g * stride<2>(Q.layout());
-        const int64_t o_group_off = int64_t(head_kv) * g * stride<2>(O.layout());
+        const auto q_group_off = tile_scheduler.get_gqa_q_head_start(head_q) * stride<2>(Q.layout());
+        const auto o_group_off = tile_scheduler.get_gqa_q_head_start(head_q) * stride<2>(O.layout());
         for (int qb = 0; qb < num_q_blocks; ++qb) {
           const int row_start = qb * int(QK_BLK_M);
           const int valid_rows = cute::min(int(QK_BLK_M), total_rows - row_start);
 
           auto make_gqa_view_q = [&, idx_b_l, row_start, valid_rows]() {
-            int64_t offset =
-                int64_t(idx_b_l) * stride<3>(Q.layout()) + q_group_off + int64_t(row_start) * stride<0>(Q.layout());
+            auto offset = idx_b_l * stride<3>(Q.layout()) + q_group_off + row_start * stride<2>(Q.layout());
             return make_tensor(
                 Q.data() + offset,
                 make_layout(
                     make_shape(valid_rows, int(s.head_size_qk)),
-                    make_stride(int(stride<0>(Q.layout())), stride<1>(Q.layout()))));
+                    make_stride(int(stride<2>(Q.layout())), stride<1>(Q.layout()))));
           };
           auto make_gqa_view_o = [&, idx_b_l, row_start, valid_rows]() {
-            int64_t offset =
-                int64_t(idx_b_l) * stride<3>(O.layout()) + o_group_off + int64_t(row_start) * stride<0>(O.layout());
+            auto offset = idx_b_l * stride<3>(O.layout()) + o_group_off + row_start * stride<2>(O.layout());
             return make_tensor(
                 O.data() + offset,
                 make_layout(
                     make_shape(valid_rows, int(s.head_size_vo)),
-                    make_stride(int(stride<0>(O.layout())), stride<1>(O.layout()))));
+                    make_stride(int(stride<2>(O.layout())), stride<1>(O.layout()))));
           };
 
           if (qb > 0) {
@@ -645,7 +631,7 @@ class XeFMHAFwdKernel {
           FragARow tA_max;
           FragSPartialRow tA_sum;
 
-          mainloop.template operator()<true>(
+          mainloop.template operator()<true, TileScheduler::kCacheOnly>(
               make_gqa_view_q(),
               K(_, _, head_kv, idx_b),
               V(_, _, head_kv, idx_b),
@@ -653,16 +639,16 @@ class XeFMHAFwdKernel {
               tA_max,
               tA_sum,
               blk_qv,
-              0,
-              fusion_k_blocks,
-              fusion_k_blocks,
+              blk_k0,
+              blk_k1,
+              k_blocks,
               thr_id,
-              fusion_seq_len,
+              seq_len,
               seq_len_kv_cache,
               idx_b,
-              fusion_full_tile_offset,
-              fusion_discard,
-              0,
+              full_tile_offset,
+              discard_seq_coord,
+              causal_k_block_start,
               row_start,
               gqa_fusion_q_per_head,
               slice_2d_wide(K_cache, head, l_coord),
@@ -725,7 +711,7 @@ class XeFMHAFwdKernel {
         auto ScaleK_head = ScaleK(_, _, head, l_coord);
         auto ScaleV_head = ScaleV(_, _, head, l_coord);
 
-        mainloop(
+        mainloop.template operator()<false, TileScheduler::kCacheOnly>(
             Q(_, _, head_q, l_coord),
             K(_, _, head, l_coord),
             V(_, _, head, l_coord),
@@ -754,7 +740,7 @@ class XeFMHAFwdKernel {
             ScaleK_head,
             ScaleV_head);
       } else {
-        mainloop(
+        mainloop.template operator()<false, TileScheduler::kCacheOnly>(
             Q(_, _, head_q, l_coord),
             K(_, _, head, l_coord),
             V(_, _, head, l_coord),
@@ -1178,7 +1164,11 @@ class XeFMHAFwdDynamicSplitKernel {
             0,
             split_q_per_head);
 
-        tA_sum = reduce<0, cute::ReduceMode::Horizontal>(tA_sum_partial, sycl::plus<void>{});
+        if constexpr (CollectiveMainloop::DeferSumHReduce) {
+          tA_sum = reduce<0, cute::ReduceMode::Horizontal>(tA_sum_partial, sycl::plus<void>{});
+        } else {
+          tA_sum = tA_sum_partial;
+        }
 
         // partition id of start batch head id in current wg
         int partition_id = get_partition_id(wg_id, batch_head_id, num_blocks_per_wg, local_k_blocks);

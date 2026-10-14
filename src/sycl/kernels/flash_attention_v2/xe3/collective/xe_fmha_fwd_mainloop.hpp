@@ -53,6 +53,39 @@ class XeDefault {};  // Default FMHA mainloop, P in registers.
 namespace cutlass::fmha::collective {
 
 using namespace cute;
+
+#if defined(__SYCL_DEVICE_ONLY__) && defined(SYCL_INTEL_TARGET)
+CUTE_DEVICE uint32_t subgroup_any_less(float const& lhs, float const& rhs) {
+  uint32_t result;
+  asm("{\n"
+      ".decl OUT_UD v_type=G type=UD num_elts=16 alias=<%0,0>\n"
+      ".decl LHS_F v_type=G type=F num_elts=16 alias=<%1,0>\n"
+      ".decl RHS_F v_type=G type=F num_elts=16 alias=<%2,0>\n"
+      ".decl ANY_LESS v_type=P num_elts=16\n"
+      "cmp.lt (M1_NM, 16) ANY_LESS LHS_F(0,0)<1;1,0> RHS_F(0,0)<1;1,0>\n"
+      "(ANY_LESS.any) sel (M1_NM, 16) OUT_UD(0,0)<1> 0x1:ud 0x0:ud\n"
+      "}\n"
+      : "=rw"(result)
+      : "rw"(lhs), "rw"(rhs));
+  return result;
+}
+
+using float2v = intel::vector_t<float, 2>;
+CUTE_DEVICE float2v exp2_float2(float2v x) {
+  float2v y;
+  asm("exp (M1_NM,32) %0(0,0)<1> %1(0,0)<1;1,0>\n" : "=rw"(y) : "rw"(x));
+  return y;
+}
+#else
+CUTE_DEVICE uint32_t subgroup_any_less(float const& lhs, float const& rhs) {
+  return lhs < rhs;
+}
+
+using float2v = intel::vector_t<float, 2>;
+CUTE_DEVICE float2v exp2_float2(float2v x) {
+  return float2v{sycl::native::exp2(x[0]), sycl::native::exp2(x[1])};
+}
+#endif
 #if defined(__SYCL_DEVICE_ONLY__) && defined(SYCL_INTEL_TARGET)
 CUTE_DEVICE
 void cvt_f32x2_to_bf16x2_bias(float const& src0, float const& src1, cute::intel::uint2& tmp) {
@@ -170,7 +203,10 @@ template <
     class TiledCopyK_ = void,  // Optional TiledCopy for loading K
     class TiledCopyV_ = void,  // Optional TiledCopy for loading V
     class TiledCopyK_cache_ = void,
-    class TiledCopyV_cache_ = void>  // Optional TiledCopy for loading V_cache
+    class TiledCopyV_cache_ = void,  // Optional TiledCopy for loading V_cache
+    int FixedWindowLeft_ = -2,
+    int FixedWindowRight_ = -2,
+    int FixedPageSize_ = -1>
 struct FMHAFwdMainloop {
   static_assert(cutlass::detail::dependent_false<DispatchPolicy_>, "Could not find a mainloop specialization.");
 };
@@ -201,7 +237,10 @@ template <
     class TiledCopyK_,
     class TiledCopyV_,
     class TiledCopyK_cache_,
-    class TiledCopyV_cache_>
+    class TiledCopyV_cache_,
+    int FixedWindowLeft_,
+    int FixedWindowRight_,
+    int FixedPageSize_>
 struct FMHAFwdMainloop<
     XeDefault<Stages>,
     CausalMask_,
@@ -226,7 +265,10 @@ struct FMHAFwdMainloop<
     TiledCopyK_,
     TiledCopyV_,
     TiledCopyK_cache_,
-    TiledCopyV_cache_> {
+    TiledCopyV_cache_,
+    FixedWindowLeft_,
+    FixedWindowRight_,
+    FixedPageSize_> {
   //
   // Type Aliases
   //
@@ -305,7 +347,6 @@ struct FMHAFwdMainloop<
 
   using FragS = FragC<TiledMMAQK>;
   using FragSRow = decltype(reduce<1>(FragS{}, sycl::plus<void>{}));
-  using FragSPartialRow = decltype(reduce<1, ReduceMode::Vertical>(FragS{}, sycl::plus<void>{}));
   using FragSCol = decltype(reduce<0>(FragS{}, sycl::plus<void>{}));
   using ElementS = typename TiledMMAQK::ValTypeD;
 
@@ -314,10 +355,24 @@ struct FMHAFwdMainloop<
   using FragARow = decltype(reduce<1>(FragA{}, sycl::plus<void>{}));
   using ElementA = typename TiledMMAPV::ValTypeD;
 
+  /* Defer the horizontal row-sum reduction only while both the output
+     accumulator and the extra live partial fit the measured CRI budget. */
+  using FragSVertRow = decltype(reduce<1, ReduceMode::Vertical>(FragS{}, sycl::plus<void>{}));
+  static constexpr int kDeferRows = decltype(FragSVertRow{}.size())::value;
+  static constexpr bool DeferSumHReduce =
+      decltype(FragA{}.size())::value <= 64 && kDeferRows <= 16 && kDeferRows % VTiles == 0;
+  using FragSPartialRow = cute::conditional_t<DeferSumHReduce, FragSVertRow, FragARow>;
+  static_assert(
+      !DeferSumHReduce || decltype(FragARow{}.size())::value == 1,
+      "Deferred row-sum rescale requires one row-fragment element per lane");
+
   static constexpr bool CausalMask = CausalMask_;
   static constexpr bool LocalMask = LocalMask_;
   static constexpr bool CachedKV = CachedKV_;
   static constexpr bool PagedKV = PagedKV_;
+  static constexpr int FixedWindowLeft = FixedWindowLeft_;
+  static constexpr int FixedWindowRight = FixedWindowRight_;
+  static constexpr int FixedPageSize = FixedPageSize_;
 
   static constexpr int BLK_Q = get<0>(TileShapeQK{});
   static constexpr int BLK_K = get<1>(TileShapeQK{});
@@ -373,6 +428,27 @@ struct FMHAFwdMainloop<
   // Kernel-facing parameters
   using Params = Arguments;
 
+  CUTLASS_HOST_DEVICE static int window_size_left(Params const& params) {
+    if constexpr (FixedWindowLeft != -2)
+      return FixedWindowLeft;
+    else
+      return params.window_size_left;
+  }
+
+  CUTLASS_HOST_DEVICE static int window_size_right(Params const& params) {
+    if constexpr (FixedWindowRight != -2)
+      return FixedWindowRight;
+    else
+      return params.window_size_right;
+  }
+
+  CUTLASS_HOST_DEVICE static int page_size(Params const& params) {
+    if constexpr (FixedPageSize > 0)
+      return FixedPageSize;
+    else
+      return params.page_size;
+  }
+
   // SLM data
   struct SharedStorage {};
 
@@ -397,18 +473,30 @@ struct FMHAFwdMainloop<
         args.window_size_right};
   }
 
-  CUTLASS_HOST_DEVICE static bool can_implement(Arguments const&) {
+  CUTLASS_HOST_DEVICE static bool can_implement(Arguments const& args) {
+    if constexpr (FixedWindowLeft != -2) {
+      if (args.window_size_left != FixedWindowLeft) return false;
+    }
+    if constexpr (FixedWindowRight != -2) {
+      if (args.window_size_right != FixedWindowRight) return false;
+    }
+    if constexpr (FixedPageSize > 0) {
+      if (args.page_size != FixedPageSize) return false;
+    }
     return true;
   }
 
   CUTLASS_DEVICE
   int get_physical_k_tile(int K, int batch_offset, int tiles_per_page) {
+    if constexpr (PagedKV && FixedPageSize == BLK_K) {
+      return params.ptr_page_table[batch_offset + K];
+    }
     int page_idx = K / tiles_per_page;
     int tile_in_page = K % tiles_per_page;
     return params.ptr_page_table[batch_offset + page_idx] * tiles_per_page + tile_in_page;
   }
 
-  template <bool GqaFusion = false, typename QVCoord>
+  template <bool GqaFusion = false, bool CacheOnly = false, typename QVCoord>
   CUTLASS_DEVICE void operator()(
       TensorQ2D const& Q_2D,    // (q,d)
       TensorK2D const& K_2D,    // (k,d)
@@ -595,19 +683,21 @@ struct FMHAFwdMainloop<
       reorder(tQrQ, tSrQ_arr[d]);
     }
 
-    CUTLASS_PRAGMA_UNROLL
-    for (int d = 0; d < DTiles; d++) {
-      prepared_k[d] = prepare_payloads(copy_k, tKgK(_, _, _, 0, d));
-    }
-    CUTLASS_PRAGMA_UNROLL
-    for (int VV = 0; VV < VTiles; VV++) {
-      prepared_v[VV] = prepare_payloads(copy_v, tVgV(_, _, _, VV, 0));
+    if constexpr (!CacheOnly) {
+      CUTLASS_PRAGMA_UNROLL
+      for (int d = 0; d < DTiles; d++) {
+        prepared_k[d] = prepare_payloads(copy_k, tKgK(_, _, _, 0, d));
+      }
+      CUTLASS_PRAGMA_UNROLL
+      for (int VV = 0; VV < VTiles; VV++) {
+        prepared_v[VV] = prepare_payloads(copy_v, tVgV(_, _, _, VV, 0));
+      }
     }
 
     [[maybe_unused]] auto prepared_pk = prepare_payloads(prefetch_k, pKgK(_, _, _, 0));
     [[maybe_unused]] auto prepared_pv = prepare_payloads(prefetch_v, pVgV(_, _, _, 0));
     constexpr int kv_stride = get<1>(TileShapeQK{});
-    [[maybe_unused]] int const tiles_per_page = params.page_size / kv_stride;
+    [[maybe_unused]] int const tiles_per_page = page_size(params) / kv_stride;
     [[maybe_unused]] int const batch_offset = l_coord * params.num_pages_per_seq;
 
     // K layout: (k, d, h, b) with stride (1, head_size, ...) → seq is X mode
@@ -630,30 +720,32 @@ struct FMHAFwdMainloop<
       }
     }
 
-    const int k_start = (blk_k0 > kblocks_cache ? blk_k0 : kblocks_cache) - kblocks_cache;
-    if (k_start > 0) {
-      const int k_start_delta = k_start * kv_stride;
-      CUTLASS_PRAGMA_UNROLL
-      for (int d = 0; d < DTiles; d++) {
-        prepared_k[d] += k_seq_delta(k_start_delta);
+    if constexpr (!CacheOnly) {
+      const int k_start = (blk_k0 > kblocks_cache ? blk_k0 : kblocks_cache) - kblocks_cache;
+      if (k_start > 0) {
+        const int k_start_delta = k_start * kv_stride;
+        CUTLASS_PRAGMA_UNROLL
+        for (int d = 0; d < DTiles; d++) {
+          prepared_k[d] += k_seq_delta(k_start_delta);
+        }
+        CUTLASS_PRAGMA_UNROLL
+        for (int VV = 0; VV < VTiles; VV++) {
+          prepared_v[VV] += v_seq_delta(k_start_delta);
+        }
+        prepared_pk += k_seq_delta(k_start_delta);
+        prepared_pv += v_seq_delta(k_start_delta);
       }
-      CUTLASS_PRAGMA_UNROLL
-      for (int VV = 0; VV < VTiles; VV++) {
-        prepared_v[VV] += v_seq_delta(k_start_delta);
-      }
-      prepared_pk += k_seq_delta(k_start_delta);
-      prepared_pv += v_seq_delta(k_start_delta);
-    }
-    if constexpr (!GqaFusion) {
-      CUTLASS_PRAGMA_UNROLL
-      for (int K = 0; K < Stages; K++) {
-        prefetch(prefetch_k, prepared_pk);
-        prepared_pk += k_seq_delta(kv_stride);
-      }
-      CUTLASS_PRAGMA_UNROLL
-      for (int K = 0; K < Stages; K++) {
-        prefetch(prefetch_v, prepared_pv);
-        prepared_pv += v_seq_delta(kv_stride);
+      if constexpr (!GqaFusion) {
+        CUTLASS_PRAGMA_UNROLL
+        for (int K = 0; K < Stages; K++) {
+          prefetch(prefetch_k, prepared_pk);
+          prepared_pk += k_seq_delta(kv_stride);
+        }
+        CUTLASS_PRAGMA_UNROLL
+        for (int K = 0; K < Stages; K++) {
+          prefetch(prefetch_v, prepared_pv);
+          prepared_pv += v_seq_delta(kv_stride);
+        }
       }
     }
     // Cache K prefetch init, still uses legacy API.
@@ -730,7 +822,8 @@ struct FMHAFwdMainloop<
                              auto& pVgV_cur) {
 #if not defined(CUTLASS_TEST_FOR_CRI)
       /* Split barrier to keep threads together */
-      barrier_arrive(ScopeWorkgroup);
+      constexpr auto barrier_scope = (CausalMask || LocalMask) ? ScopeSubgroup : ScopeWorkgroup;
+      barrier_arrive(barrier_scope);
 #endif
       constexpr bool is_cache = decltype(cached_k)::value;
 
@@ -742,6 +835,24 @@ struct FMHAFwdMainloop<
         }
       } else {
         k_idx = K - kblocks_cache;
+      }
+
+      int K_next = K + Stages;
+      if constexpr (is_cache && PagedKV && FixedPageSize == BLK_K) {
+        if (K_next < kblocks_cache) {
+          constexpr int stage_mask = (Stages & (Stages - 1)) == 0 ? Stages - 1 : -1;
+          int const slot_next = stage_mask >= 0 ? ((K_next - blk_k0) & stage_mask) : ((K_next - blk_k0) % Stages);
+          int const physical_next = get_physical_k_tile(K_next, batch_offset, tiles_per_page);
+          physical_k_tiles_cache[slot_next] = physical_next;
+          CUTLASS_PRAGMA_UNROLL
+          for (int D = 0; D < size<4>(pKgK_cache); D++) {
+            prefetch(prefetch_k_cache, pKgK_cache(_, _, _, physical_next, D));
+          }
+        }
+        CUTLASS_PRAGMA_UNROLL
+        for (int VV = 0; VV < VTiles; VV++) {
+          prefetch(prefetch_v_cache, pVgV_cache(_, _, _, VV, k_idx));
+        }
       }
 
       // V prefetch for next iteration (non-cache only; cache prefetch lives below).
@@ -819,12 +930,12 @@ struct FMHAFwdMainloop<
       }
 
       /* K prefetch for next iteration */
-      if constexpr (is_cache) {
+      if constexpr (is_cache && !(PagedKV && FixedPageSize == BLK_K)) {
         CUTLASS_PRAGMA_UNROLL
         for (int VV = 0; VV < VTiles; VV++) {
           prefetch(prefetch_v_cache, pVgV_cache(_, _, _, VV, k_idx));
         }
-      } else if constexpr (!GqaFusion) {
+      } else if constexpr (!is_cache && !GqaFusion) {
         prefetch(prefetch_k, prepared_pk);
         prepared_pk += k_seq_delta(kv_stride);
       }
@@ -846,14 +957,18 @@ struct FMHAFwdMainloop<
             Tensor cPgP = make_identity_tensor(make_shape(seq_len, seq_len));
             Tensor gP = local_tile(cPgP, take<0, 2>(TileShapeQK{}), make_coord(get<0>(blk_qv), K));
             auto cS_thread = thr_mma_qk.partition_C(gP);
-            CUTLASS_PRAGMA_UNROLL
-            for (int i = 0; i < tSrS.size(); ++i) {
-              int row_idx = get<0>(cS_thread(i));
-              int col_idx = get<1>(cS_thread(i));
-              int row_q_idx =
-                  (GqaFusion && gqa_fusion_q_per_head > 0) ? ((q_pos_base + row_idx) % gqa_fusion_q_per_head) : row_idx;
-              if (col_idx > full_tile_offset + row_q_idx) {
-                tSrS(i) = ElementS(-INFINITY);
+            const int row_off = get<0>(blk_qv) * BLK_Q;
+            const int col_off = K * BLK_K;
+            const int row_lo = gqa_fusion_q_per_head > 0 ? 0 : row_off;
+            if (col_off + BLK_K - 1 > row_lo - discard_seq_coord + full_tile_offset) {
+              CUTLASS_PRAGMA_UNROLL
+              for (int i = 0; i < tSrS.size(); ++i) {
+                int row_idx = get<0>(cS_thread(i));
+                int col_idx = get<1>(cS_thread(i));
+                int seq_coord = gqa_fusion_q_per_head > 0 ? ((q_pos_base + row_idx) % gqa_fusion_q_per_head) : row_idx;
+                if (col_idx > seq_coord - discard_seq_coord + full_tile_offset) {
+                  tSrS(i) = ElementS(-INFINITY);
+                }
               }
             }
           }
@@ -884,24 +999,44 @@ struct FMHAFwdMainloop<
         // A full-coverage local window is equivalent to plain attention.
         // Window size of -1 indicates infinite window (no masking).
         // Skip local masking in this case to avoid perturbing score fragments.
-        const bool full_window = (params.window_size_left < 0) && (params.window_size_right < 0);
+        const int win_left = window_size_left(params);
+        const int win_right = window_size_right(params);
+        const bool full_window = (win_left < 0) && (win_right < 0);
         if (!full_window) {
           Tensor cPgP = make_identity_tensor(make_shape(seq_len, seq_len));
           Tensor gP = local_tile(cPgP, take<0, 2>(TileShapeQK{}), make_coord(get<0>(blk_qv), K));
           auto cS_thread = thr_mma_qk.partition_C(gP);
-          CUTLASS_PRAGMA_UNROLL
-          for (int i = 0; i < tSrS.size(); ++i) {
-            const int row_idx = get<0>(cS_thread(i));
-            const int col_idx = get<1>(cS_thread(i));
-            const int row_q_idx =
-                (GqaFusion && gqa_fusion_q_per_head > 0) ? ((q_pos_base + row_idx) % gqa_fusion_q_per_head) : row_idx;
-            const int row_kv_idx = row_q_idx + full_tile_offset;
-            // A negative window size means "unbounded" on that side (no mask).
-            const bool left_mask = (params.window_size_left >= 0) && (col_idx < row_kv_idx - params.window_size_left);
-            const bool right_mask =
-                (params.window_size_right >= 0) && (col_idx > row_kv_idx + params.window_size_right);
-            if (left_mask || right_mask) {
-              tSrS(i) = ElementS(-INFINITY);
+          const int row_off = get<0>(blk_qv) * BLK_Q;
+          const int col_off = K * BLK_K;
+          const bool fused = gqa_fusion_q_per_head > 0;
+          const int row_lo = fused ? 0 : row_off;
+          const int row_hi = fused ? (gqa_fusion_q_per_head - 1) : (row_off + BLK_Q - 1);
+          const bool any_left_masked = win_left >= 0 && col_off < row_hi + full_tile_offset - win_left;
+          const bool any_right_masked = win_right >= 0 && col_off + BLK_K - 1 > row_lo + full_tile_offset + win_right;
+          if (any_left_masked || any_right_masked) {
+            if (win_left >= 0 && win_right == 0 && !fused) {
+              const int row_col_delta0 = get<0>(cS_thread(0)) + full_tile_offset - get<1>(cS_thread(0));
+              CUTLASS_PRAGMA_UNROLL
+              for (int i = 0; i < tSrS.size(); ++i) {
+                const int coord_delta =
+                    (get<0>(cS_thread(i)) - get<0>(cS_thread(0))) - (get<1>(cS_thread(i)) - get<1>(cS_thread(0)));
+                if (static_cast<unsigned>(row_col_delta0 + coord_delta) > static_cast<unsigned>(win_left)) {
+                  tSrS(i) = ElementS(-INFINITY);
+                }
+              }
+            } else {
+              CUTLASS_PRAGMA_UNROLL
+              for (int i = 0; i < tSrS.size(); ++i) {
+                const int row_idx = get<0>(cS_thread(i));
+                const int col_idx = get<1>(cS_thread(i));
+                const int seq_coord = fused ? ((q_pos_base + row_idx) % gqa_fusion_q_per_head) : row_idx;
+                const int row_kv_idx = seq_coord + full_tile_offset;
+                const bool left_mask = win_left >= 0 && col_idx < row_kv_idx - win_left;
+                const bool right_mask = win_right >= 0 && col_idx > row_kv_idx + win_right;
+                if (left_mask || right_mask) {
+                  tSrS(i) = ElementS(-INFINITY);
+                }
+              }
             }
           }
         }
@@ -939,11 +1074,11 @@ struct FMHAFwdMainloop<
       if constexpr (PerTensorScale) {
         qk_scale = params.scale * ElementS(scale_q) * ElementS(scale_k);
       }
-      auto [rescale, tS_partial_sum] = softmax(tSrS, tA_max, tA_sum, qk_scale);
+      auto [rescale, tS_partial_sum, subgroup_needs_rescale] = softmax(tSrS, tA_max, tA_sum, qk_scale);
       asm volatile("fence_sw");
       auto sg = sycl::ext::oneapi::this_work_item::get_sub_group();
       constexpr int kSumSize = decltype(tA_sum.size())::value;
-      constexpr bool kSumDivVT = (kSumSize % VTiles == 0);
+      constexpr bool kSumDivVT = DeferSumHReduce && (kSumSize % VTiles == 0);
       constexpr int kSumPerVT = kSumDivVT ? (kSumSize / VTiles) : 0;
       /* Apply softmax and scaling (tA rescaling fused into GEMM2 VTile loop) */
       using ElementP = typename TiledMMAPV::ValTypeA;
@@ -1001,15 +1136,22 @@ struct FMHAFwdMainloop<
         }
         reorder(tVrV, tArV);
 
-        CUTLASS_PRAGMA_UNROLL
-        for (int i = tArA.size() / VTiles - 1; i >= 0; i--)
-          tArA(_, _, _, VV)(i) *= broadcast<0>(rescale, tArA, i);
-
-        if constexpr (kSumDivVT) {
+        if (subgroup_needs_rescale) {
+          CUTLASS_PRAGMA_UNROLL
+          for (int i = tArA.size() / VTiles - 1; i >= 0; i--)
+            tArA(_, _, _, VV)(i) *= broadcast<0>(rescale, tArA, i);
+          if constexpr (kSumDivVT) {
+            CUTLASS_PRAGMA_UNROLL
+            for (int j = 0; j < kSumPerVT; j++) {
+              int const i = VV * kSumPerVT + j;
+              tA_sum(i) = tA_sum(i) * group_broadcast(sg, rescale(0), i) + tS_partial_sum(i);
+            }
+          }
+        } else if constexpr (kSumDivVT) {
           CUTLASS_PRAGMA_UNROLL
           for (int j = 0; j < kSumPerVT; j++) {
             int const i = VV * kSumPerVT + j;
-            tA_sum(i) = tA_sum(i) * group_broadcast(sg, rescale(0), i) + tS_partial_sum(i);
+            tA_sum(i) += tS_partial_sum(i);
           }
         }
         if constexpr (BlockScale && !FP4Input) {
@@ -1050,9 +1192,8 @@ struct FMHAFwdMainloop<
       }
 
       /* K prefetch */
-      int K_next = K + Stages;
       if constexpr (is_cache) {
-        if (K_next < kblocks_cache) {
+        if (!(PagedKV && FixedPageSize == BLK_K) && K_next < kblocks_cache) {
           int physical_K_next = K_next;
           if constexpr (PagedKV) {
             int slot_next = (K_next - blk_k0) % Stages;
@@ -1075,7 +1216,7 @@ struct FMHAFwdMainloop<
         }
       }
 #if not defined(CUTLASS_TEST_FOR_CRI)
-      barrier_wait(ScopeWorkgroup);
+      barrier_wait(barrier_scope);
 #endif
     };
 
@@ -1095,8 +1236,10 @@ struct FMHAFwdMainloop<
       }
     }
 
-    for (int K = (blk_k0 > kblocks_cache ? blk_k0 : kblocks_cache); K < blk_k1; K++) {
-      mainloop_body(std::bool_constant<false>{}, K, copy_k, copy_v, prefetch_v, tKgK, tVgV, pVgV);
+    if constexpr (!CacheOnly) {
+      for (int K = (blk_k0 > kblocks_cache ? blk_k0 : kblocks_cache); K < blk_k1; K++) {
+        mainloop_body(std::bool_constant<false>{}, K, copy_k, copy_v, prefetch_v, tKgK, tVgV, pVgV);
+      }
     }
   }
 
@@ -1111,11 +1254,19 @@ struct FMHAFwdMainloop<
     auto tS_bmax = reduce<1, ReduceMode::Full, /*EnableFast64Rows=*/!CausalMask>(tS, sycl::maximum<void>{});
 
     FragARow rescale;
+    uint32_t subgroup_needs_rescale = 0;
     CUTLASS_PRAGMA_UNROLL
     for (int i = 0; i < tA_max.size(); i++) {
       ElementS new_max = sycl::max(tA_max(i), qk_scale * tS_bmax(i));
-      rescale(i) = sycl::native::exp2(tA_max(i) - new_max);
+      subgroup_needs_rescale |= subgroup_any_less(tA_max(i), new_max);
+      rescale(i) = tA_max(i) - new_max;
       tA_max(i) = new_max;
+    }
+    if (subgroup_needs_rescale) {
+      CUTLASS_PRAGMA_UNROLL
+      for (int i = 0; i < rescale.size(); ++i) {
+        rescale(i) = sycl::native::exp2(rescale(i));
+      }
     }
 
     /* Scale S and subtract maxima, then exponentiate */
@@ -1124,27 +1275,51 @@ struct FMHAFwdMainloop<
       tS(i) = qk_scale * tS(i) - broadcast<0>(tA_max, tS, i);
 
     asm volatile("fence_sw");
+    constexpr int kExpSize = decltype(tS.size())::value;
     CUTLASS_PRAGMA_UNROLL
-    for (int i = 0; i < tS.size(); i++)
-      tS(i) = sycl::native::exp2(tS(i));
+    for (int i = 0; i < kExpSize - 1; i += 2) {
+      float2v x{tS(i), tS(i + 1)};
+      float2v y = exp2_float2(x);
+      tS(i) = y[0];
+      tS(i + 1) = y[1];
+    }
+    if constexpr (kExpSize % 2 != 0) {
+      tS(kExpSize - 1) = sycl::native::exp2(tS(kExpSize - 1));
+    }
 
-    /* Per-lane vertical partial sum (deferred horizontal reduction) */
-    auto tS_partial_sum = reduce<1, ReduceMode::Vertical>(tS, sycl::plus<void>{});
+    /* Row sum of this block: either fully reduced, or only the per-lane
+       vertical half with the horizontal half deferred to the epilogue. */
+    auto tS_partial_sum = [&] {
+      if constexpr (DeferSumHReduce) {
+        return reduce<1, ReduceMode::Vertical>(tS, sycl::plus<void>{});
+      } else {
+        return reduce<1>(tS, sycl::plus<void>{});
+      }
+    }();
 
     constexpr int kSumSize = decltype(tA_sum.size())::value;
-    constexpr bool kSumDivVT = (kSumSize % VTiles == 0);
+    constexpr bool kSumDivVT = DeferSumHReduce && (kSumSize % VTiles == 0);
 
-    // When tA_sum.size() does not divide VTiles (e.g. decode with q=1),
-    // rescale + accumulate sums once here instead of fusing per VTile.
-    if constexpr (!kSumDivVT) {
-      auto sg = sycl::ext::oneapi::this_work_item::get_sub_group();
-      CUTLASS_PRAGMA_UNROLL
-      for (int i = 0; i < kSumSize; i++) {
-        tA_sum(i) = tA_sum(i) * group_broadcast(sg, rescale(0), i) + tS_partial_sum(i);
+    constexpr bool kSumUpdateHere = !DeferSumHReduce || !kSumDivVT;
+    if constexpr (kSumUpdateHere) {
+      if (subgroup_needs_rescale) {
+        auto sg = sycl::ext::oneapi::this_work_item::get_sub_group();
+        CUTLASS_PRAGMA_UNROLL
+        for (int i = 0; i < kSumSize; i++) {
+          if constexpr (!DeferSumHReduce)
+            tA_sum(i) = tA_sum(i) * rescale(i) + tS_partial_sum(i);
+          else
+            tA_sum(i) = tA_sum(i) * group_broadcast(sg, rescale(0), i) + tS_partial_sum(i);
+        }
+      } else {
+        CUTLASS_PRAGMA_UNROLL
+        for (int i = 0; i < kSumSize; i++) {
+          tA_sum(i) += tS_partial_sum(i);
+        }
       }
     }
 
-    return cute::make_tuple(rescale, tS_partial_sum);
+    return cute::make_tuple(rescale, tS_partial_sum, subgroup_needs_rescale);
   }
 };
 

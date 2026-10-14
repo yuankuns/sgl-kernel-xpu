@@ -51,7 +51,8 @@ template <
     class TileShapeO_,         // Shape of output tile, may be larger than P*V GEMM
     class TensorO_,            // 2D slice of global output tensor
     class TiledCopyO_ = void,  // Optional TiledCopy for loading O
-    bool Sink_ = false>
+    bool Sink_ = false,
+    XeStoreCachePolicy StoreCachePolicyO_ = XeStoreCachePolicy::kWT_WB_WB>
 class FMHAFwdEpilogue {
  public:
   //
@@ -95,9 +96,10 @@ class FMHAFwdEpilogue {
 
   static auto default_tiled_copy_O_helper() {
     if constexpr (ReduceK{} == _1{})
-      return make_block_2d_copy_D(TiledMMAPV{}, TensorO2D{});
+      return make_block_2d_copy_D<StoreCachePolicyO_>(TiledMMAPV{}, TensorO2D{});
     else
-      return make_block_2d_copy_D_subtiled(TiledMMAPV{}, ReduceFragA{}.tv_layout(), ReduceSGLayout{}, TensorO2D{});
+      return make_block_2d_copy_D_subtiled<StoreCachePolicyO_>(
+          TiledMMAPV{}, ReduceFragA{}.tv_layout(), ReduceSGLayout{}, TensorO2D{});
   }
 
   using DefaultTiledCopyO = decltype(default_tiled_copy_O_helper());
@@ -147,7 +149,7 @@ class FMHAFwdEpilogue {
     using namespace cute;
     using ElementA = typename FragA::element_type;
     auto tA_sum_full = [&]() -> decltype(auto) {
-      if constexpr (SumIsReduced)
+      if constexpr (SumIsReduced || !CollectiveMainloop::DeferSumHReduce)
         return (tA_sum);
       else
         return reduce<0, ReduceMode::Horizontal>(tA_sum, sycl::plus<void>{});
@@ -169,13 +171,12 @@ class FMHAFwdEpilogue {
       }
     }
 
-    /* Complete softmax, dividing out sums. */
+    /* Complete softmax. A fully masked row has both a zero accumulator and a
+       zero denominator; define its output as zero instead of producing NaN. */
     CUTLASS_PRAGMA_UNROLL
     for (int i = 0; i < rA_sum.size(); i++) {
-      if constexpr (CollectiveMainloop::PerTensorScale)
-        rA_sum(i) = ElementA(v_scale) / rA_sum(i);
-      else
-        rA_sum(i) = ElementA(1) / rA_sum(i);
+      ElementA scale = CollectiveMainloop::PerTensorScale ? ElementA(v_scale) : ElementA(1);
+      rA_sum(i) = rA_sum(i) == ElementA(0) ? ElementA(0) : scale / rA_sum(i);
     }
 
     /* Tile output */

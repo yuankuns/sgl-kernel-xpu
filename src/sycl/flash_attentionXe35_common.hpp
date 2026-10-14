@@ -18,8 +18,13 @@
 #if defined(CUTLASS_SYCL_PROFILING_ENABLED)
 #include <cutlass/util/sycl_event_manager.hpp>
 #endif
+#include <algorithm>
+#include <mutex>
+#include <unordered_map>
+
 #include "kernels/flash_attention_v2/xe3/collective/xe_fmha_fwd_epilogue.hpp"
 #include "kernels/flash_attention_v2/xe3/collective/xe_fmha_fwd_mainloop.hpp"
+#include "kernels/flash_attention_v2/xe3/kernel/xe_fmha_fwd_decode_splitkv_kernel.hpp"
 #include "kernels/flash_attention_v2/xe3/kernel/xe_fmha_fwd_kernel.hpp"
 #include "kernels/flash_attention_v2/xe3/kernel/xe_reduce_split_k.hpp"
 #include "kernels/flash_attention_v2/xe3/kernel/xe_tile_scheduler.hpp"
@@ -58,6 +63,71 @@ inline SplitKVCache& get_split_kv_cache() {
   return cache;
 }
 }  // namespace detail
+// FMHA must run on the caller's torch stream, not on a private queue.
+//
+// A private queue shares the context and device with torch's stream but nothing
+// orders the two, so (a) attention neither waits for the producers of q/k/v nor
+// is waited on by its consumers, and (b) the torch caching allocator's
+// stream-ordered reuse guarantee is void: `out`, `softmax_lse` and the decode
+// workspace are freed when the op returns while the kernel is still writing
+// them, and the next torch-stream allocation lands on those blocks. That was
+// observed as a grouped-MoE GEMM reading bf16 attention data in place of its
+// (M,N,K) table and pointer array, producing block-2D descriptors with absurd
+// extents -> prefetch faults -> engine reset -> UR_RESULT_ERROR_DEVICE_LOST.
+inline sycl::queue& torch_stream_queue(const at::Tensor& t) {
+  return at::xpu::getCurrentXPUStream(t.device().index()).queue();
+}
+
+// Persistent split-KV workspace for the decode kernel: one int counter per
+// (batch, kv head) followed by the per-split partial blocks.  Workspaces are
+// private to each torch stream: calls on one stream are ordered, while calls
+// on different streams may execute concurrently.  The kernel resets counters
+// after the last split, so a stream's buffer only needs zeroing when allocated.
+// Growing it is safe through the torch stream-ordered caching allocator.
+struct DecodeSplitKvWorkspace {
+  at::Tensor buffer;
+  size_t counter_bytes = 0;
+  size_t partial_bytes = 0;
+};
+
+inline void decode_splitkv_workspace(
+    const at::Tensor& like, int slots, int num_splits, size_t bytes_per_split, int** counters, void** partials) {
+  static std::mutex mutex;
+  static std::unordered_map<int, std::unordered_map<int64_t, DecodeSplitKvWorkspace>> per_stream;
+  std::lock_guard<std::mutex> guard(mutex);
+  const auto stream_id = static_cast<int64_t>(at::xpu::getCurrentXPUStream(like.device().index()).id());
+  auto& ws = per_stream[like.device().index()][stream_id];
+  const size_t need_counter_bytes = ((size_t(slots) * sizeof(int) + 255) / 256) * 256;
+  const size_t need_partial_bytes = size_t(slots) * num_splits * bytes_per_split;
+  if (!ws.buffer.defined() || ws.counter_bytes < need_counter_bytes || ws.partial_bytes < need_partial_bytes) {
+    ws.counter_bytes = std::max(ws.counter_bytes, need_counter_bytes);
+    ws.partial_bytes = std::max(ws.partial_bytes, need_partial_bytes);
+    ws.buffer = at::zeros({static_cast<long>(ws.counter_bytes + ws.partial_bytes)}, like.options().dtype(at::kByte));
+  }
+  auto* base = static_cast<char*>(ws.buffer.data_ptr());
+  *counters = reinterpret_cast<int*>(base);
+  *partials = base + ws.counter_bytes;
+}
+
+// Number of KV splits per (batch, kv head) for decode.
+//
+// Measured on CRI (Muse Spark L3 shape, 4097 cached tokens, BF16): with one
+// split the kernel streams K/V at ~1.0 TB/s, the device DRAM ceiling, once
+// there are >= 64 workgroups (batch >= 4).  Splitting a slot further is
+// harmful there: the split workgroups of one sequence read regions ~1-4 MB
+// apart at the same time and DRAM efficiency drops roughly in proportion to
+// the split count (B=8: 131 us at 1 split, 300 us at 8 splits).  Splits only
+// pay off when the grid is too small to cover the memory system (B=1: 53 us
+// at 1 split, 27 us at 4 splits), so target ~64 workgroups in total.
+inline int choose_decode_kv_splits(int slots, int max_tiles) {
+  constexpr int target_wgs = 64;
+  constexpr int max_splits = 8;
+  constexpr int min_tiles_per_split = 4;
+  int splits = (target_wgs + std::max(1, slots) - 1) / std::max(1, slots);
+  splits = std::min(splits, std::max(1, max_splits));
+  splits = std::min(splits, std::max(1, max_tiles / std::max(1, min_tiles_per_split)));
+  return std::max(1, splits);
+}
 
 template <class Element, class OutputElement = Element>
 struct Xe3FmhaConfig {
@@ -86,7 +156,11 @@ struct Xe3FmhaConfig {
       class TileShapeQK,
       class TileShapePV,
       class TileShapeOut,
-      class SubgroupLayoutQK>
+      class SubgroupLayoutQK,
+      int FixedWindowLeft = -2,
+      int FixedWindowRight = -2,
+      int FixedPageSize = -1,
+      XeStoreCachePolicy StoreCachePolicyO = XeStoreCachePolicy::kWT_WB_WB>
   static void
   run(const at::Tensor& q_dense,
       const at::Tensor& k_pool,
@@ -167,12 +241,18 @@ struct Xe3FmhaConfig {
         void,
         void,
         void,
-        void>;
+        void,
+        FixedWindowLeft,
+        FixedWindowRight,
+        FixedPageSize>;
 
-    using CollectiveEpilogue =
-        cutlass::fmha::collective::FMHAFwdEpilogue<CollectiveMainloop, TileShapeOut, TensorO, void, Sink>;
+    using CollectiveEpilogue = cutlass::fmha::collective::
+        FMHAFwdEpilogue<CollectiveMainloop, TileShapeOut, TensorO, void, Sink, StoreCachePolicyO>;
     using ProblemShape = cutlass::fmha::kernel::FMHAProblemShape<true>;
-    using Scheduler = cutlass::fmha::kernel::XeFHMAIndividualTileScheduler<false, false, Causal, GqaFusion>;
+    // Single-stage paged local attention has no new-K/V path.
+    static constexpr bool CacheOnly = Paged && LocalMask && PipelineStages == 1;
+    using Scheduler = cutlass::fmha::kernel::
+        XeFHMAIndividualTileScheduler<false, false, Causal, GqaFusion, CacheOnly, GqaFusion ? 2 : 0>;
     using FMHAKernel =
         cutlass::fmha::kernel::XeFMHAFwdKernel<ProblemShape, CollectiveMainloop, CollectiveEpilogue, Scheduler>;
     using SplitScheduler = cutlass::fmha::kernel::XeFHMAIndividualTileScheduler<false, false, Causal, true>;
@@ -359,12 +439,9 @@ struct Xe3FmhaConfig {
     TORCH_CHECK(FMHAKernel::can_implement(arguments), "flash_attentionXe35: invalid cutlass FMHA arguments");
 
     size_t workspace_size = FMHAKernel::get_workspace_size(arguments);
-    // Zero-init: the split-reduction workspace is otherwise read while partially
-    // uninitialized, giving non-deterministic results across launches.
+    // Zero-init split-reduction workspace on the torch stream.
     at::Tensor workspace = at::zeros({static_cast<long>(workspace_size)}, q_dense.options().dtype(at::kByte));
     auto* workspace_ptr = workspace_size > 0 ? workspace.data_ptr() : nullptr;
-    auto status = FMHAKernel::initialize_workspace(arguments, workspace_ptr);
-    TORCH_CHECK(status == cutlass::Status::kSuccess, "flash_attentionXe35: FMHA workspace initialization failed");
 
     auto params = FMHAKernel::to_underlying_arguments(arguments, workspace_ptr);
 
@@ -378,7 +455,7 @@ struct Xe3FmhaConfig {
         syclex::sub_group_size<cute::intel::sg_size>, intelex::grf_size<512>};
     compat::experimental::launch_policy policy{
         compat::dim3(grid.x, grid.y, grid.z), compat::dim3(block.x, block.y, block.z), launch_props, kernel_props};
-    sycl::queue& queue = at::xpu::getCurrentXPUStream().queue();
+    sycl::queue& queue = xe35_fmha::torch_stream_queue(q_dense);
 #if defined(CUTLASS_SYCL_PROFILING_ENABLED)
     auto event = compat::experimental::launch<cutlass::device_kernel<FMHAKernel>, FMHAKernel>(policy, queue, params);
     EventManager::getInstance().addEvent(event);
@@ -387,6 +464,268 @@ struct Xe3FmhaConfig {
 #endif
   }
 };
+
+template <class Element>
+struct Xe3FmhaDecodeSplitKvConfig {
+  using ElementInput = Element;
+  using ElementOutput = Element;
+  using ElementScale = float;
+  using StrideQ = Stride<int, _1, int, int>;
+  using StrideK = Stride<int, _1, int, int>;
+  using StrideV = Stride<_1, int, int, int>;
+  using StrideO = Stride<int, _1, int, int>;
+  using StrideScale = Stride<_1, int, int, int>;
+
+  template <typename T, typename S>
+  static auto make_dummy_tensor(T val, S stride) {
+    return make_tensor(make_gmem_ptr(&val), make_layout(repeat<rank_v<S>>(1), stride));
+  }
+
+  // Decode (one query per request): all GQA heads of a KV head share one
+  // workgroup and the cache is split across `num_kv_splits` workgroups.  See
+  // xe_fmha_fwd_decode_splitkv_kernel.hpp.
+  template <
+      bool LocalMask,
+      int PipelineStages,
+      int FixedPageSize,
+      int GrfSize,
+      class TileShapeQK,
+      class TileShapePV,
+      class TileShapeOut>
+  static void run_decode_splitkv(
+      const at::Tensor& q_dense,
+      const at::Tensor& k_pool,
+      const at::Tensor& v_pool,
+      const at::Tensor& page_table,
+      int num_pages_per_seq,
+      const at::Tensor& cu_seqlens_q,
+      const at::Tensor& cu_seqlens_k_cache,
+      at::Tensor& out_dense,
+      int batch,
+      int num_heads_q,
+      int num_heads_kv,
+      int max_seqlen_kv_cache,
+      int head_dim,
+      int page_size,
+      float softmax_scale,
+      int window_size_left,
+      int window_size_right,
+      int num_kv_splits) {
+    using SubgroupLayoutQK = Layout<Shape<_1, _1, _1>>;
+    constexpr int SGTileQ = get<0>(TileShapeQK{});
+    static_assert(SGTileQ == 8, "decode GQA tile packs the query heads of one KV head into one DPAS M block");
+    using MMAOperation = XE_DPAS_TT<8, float, ElementInput>;
+    using SubgroupLayoutPV = decltype(cutlass::fmha::collective::get_sg_layout_pv(SubgroupLayoutQK{}));
+    using TiledMMAQK = typename TiledMMAHelper<MMA_Atom<MMAOperation>, Layout<TileShapeQK>, SubgroupLayoutQK>::TiledMMA;
+    using TiledMMAPV = typename TiledMMAHelper<MMA_Atom<MMAOperation>, Layout<TileShapePV>, SubgroupLayoutPV>::TiledMMA;
+    static_assert(get<0>(TileShapeOut{}) == get<0>(TileShapePV{}), "Output tile and P*V tile must match on Q");
+    static constexpr int VTiles = get<1>(TileShapeOut{}) / get<1>(TileShapePV{});
+
+    using TensorQ = decltype(make_dummy_tensor(ElementInput{}, StrideQ{}));
+    using TensorK = decltype(make_dummy_tensor(ElementInput{}, StrideK{}));
+    using TensorV = decltype(make_dummy_tensor(ElementInput{}, StrideV{}));
+    using TensorO = decltype(make_dummy_tensor(ElementOutput{}, StrideO{}));
+    using TensorScaleQ = decltype(make_dummy_tensor(ElementScale{}, StrideScale{}));
+    using TensorScaleK = decltype(make_dummy_tensor(ElementScale{}, StrideScale{}));
+    using TensorScaleV = decltype(make_dummy_tensor(ElementScale{}, StrideScale{}));
+
+    using CollectiveMainloop = cutlass::fmha::collective::FMHAFwdMainloop<
+        cutlass::fmha::XeDefault<PipelineStages>,
+        /*Causal=*/false,
+        LocalMask,
+        /*BlockScale=*/false,
+        /*F8kvF16mma=*/false,
+        /*PerTensorScale=*/false,
+        /*CachedKV=*/true,
+        /*PagedKV=*/true,
+        TiledMMAQK,
+        TiledMMAPV,
+        VTiles,
+        TensorQ,
+        TensorK,
+        TensorV,
+        TensorScaleQ,
+        TensorScaleK,
+        TensorScaleV,
+        TensorK,
+        TensorV,
+        void,
+        void,
+        void,
+        void,
+        void,
+        -2,
+        -2,
+        FixedPageSize>;
+    using CollectiveEpilogue = cutlass::fmha::collective::
+        FMHAFwdEpilogue<CollectiveMainloop, TileShapeOut, TensorO, void, false, XeStoreCachePolicy::kWT_WB_WB>;
+    using ProblemShape = cutlass::fmha::kernel::FMHAProblemShape<true>;
+    using Scheduler = cutlass::fmha::kernel::XeFMHADecodeSplitKvTileScheduler;
+    using FMHAKernel = cutlass::fmha::kernel::
+        XeFMHAFwdDecodeSplitKvKernel<ProblemShape, CollectiveMainloop, CollectiveEpilogue, Scheduler, GrfSize>;
+
+    typename FMHAKernel::StrideQ stride_q{
+        static_cast<int>(q_dense.stride(0)), {}, static_cast<int>(q_dense.stride(1)), 0};
+    typename FMHAKernel::StrideK stride_k{
+        static_cast<int>(k_pool.stride(0)), {}, static_cast<int>(k_pool.stride(1)), 0};
+    typename FMHAKernel::StrideV stride_v{
+        {}, static_cast<int>(v_pool.stride(0)), static_cast<int>(v_pool.stride(1)), 0};
+    typename FMHAKernel::StrideO stride_o{
+        static_cast<int>(out_dense.stride(0)), {}, static_cast<int>(out_dense.stride(1)), 0};
+
+    int* counters = nullptr;
+    void* partials = nullptr;
+    if (num_kv_splits > 1) {
+      decode_splitkv_workspace(
+          q_dense, batch * num_heads_kv, num_kv_splits, FMHAKernel::partial_bytes_per_split(), &counters, &partials);
+    }
+
+    typename FMHAKernel::Arguments arguments{
+        {
+            {batch,
+             num_heads_q,
+             num_heads_kv,
+             {1, static_cast<int>(q_dense.size(0)), cu_seqlens_q.data_ptr<int>(), nullptr},
+             {0, 0, nullptr, nullptr},
+             {max_seqlen_kv_cache, static_cast<int>(k_pool.size(0)), cu_seqlens_k_cache.data_ptr<int>(), nullptr},
+             head_dim,
+             head_dim},
+            static_cast<const ElementInput*>(q_dense.data_ptr()),
+            stride_q,
+            static_cast<const ElementInput*>(k_pool.data_ptr()),
+            stride_k,
+            static_cast<const ElementInput*>(v_pool.data_ptr()),
+            stride_v,
+            static_cast<ElementOutput*>(out_dense.data_ptr()),
+            stride_o,
+        },
+        {
+            softmax_scale,
+            static_cast<const int*>(page_table.data_ptr()),
+            page_size,
+            num_pages_per_seq,
+            static_cast<int>(k_pool.size(0)),
+            window_size_left,
+            window_size_right,
+        },
+        {},
+        num_kv_splits,
+        static_cast<typename FMHAKernel::ElementA*>(partials),
+        counters,
+    };
+
+    TORCH_CHECK(FMHAKernel::can_implement(arguments), "flash_attentionXe35: invalid decode split-KV arguments");
+    auto params = FMHAKernel::to_underlying_arguments(arguments, nullptr);
+
+    namespace syclex = sycl::ext::oneapi::experimental;
+    namespace intelex = sycl::ext::intel::experimental;
+    compat::dim3 const block = FMHAKernel::get_block_shape();
+    compat::dim3 const grid = FMHAKernel::get_grid_shape(params);
+    const int smem_size = FMHAKernel::SharedStorageSize;
+    compat::experimental::launch_properties launch_props{syclex::work_group_scratch_size(smem_size)};
+    compat::experimental::kernel_properties kernel_props{
+        syclex::sub_group_size<cute::intel::sg_size>, intelex::grf_size<GrfSize>};
+    compat::experimental::launch_policy policy{
+        compat::dim3(grid.x, grid.y, grid.z), compat::dim3(block.x, block.y, block.z), launch_props, kernel_props};
+    sycl::queue& queue = xe35_fmha::torch_stream_queue(q_dense);
+#if defined(CUTLASS_SYCL_PROFILING_ENABLED)
+    auto event = compat::experimental::launch<cutlass::device_kernel<FMHAKernel>, FMHAKernel>(policy, queue, params);
+    EventManager::getInstance().addEvent(event);
+#else
+    compat::experimental::launch<cutlass::device_kernel<FMHAKernel>, FMHAKernel, false>(policy, queue, params);
+#endif
+  }
+};
+
+// Decode dispatch for the split-KV GQA kernel.  Returns false when the request
+// is not a plain single-token decode this kernel covers.
+template <int HeadDim>
+bool dispatch_xe3_decode_splitkv(
+    const at::Tensor& q_dense,
+    const at::Tensor& k_pool,
+    const at::Tensor& v_pool,
+    const at::Tensor& page_table,
+    int num_pages_per_seq,
+    const at::Tensor& cu_seqlens_q,
+    const at::Tensor& cu_seqlens_k_cache,
+    at::Tensor& out_dense,
+    int batch,
+    int num_heads_q,
+    int num_heads_kv,
+    int max_seqlen_q,
+    int max_seqlen_kv_cache,
+    int page_size,
+    float softmax_scale,
+    bool is_local,
+    int window_size_left,
+    int window_size_right,
+    bool use_sink) {
+  if (use_sink) return false;
+  if (max_seqlen_q != 1 || q_dense.size(0) != batch) return false;
+  if (num_heads_kv <= 0 || num_heads_q % num_heads_kv != 0) return false;
+  const int gqa_group = num_heads_q / num_heads_kv;
+  if (gqa_group < 1 || gqa_group > 8) return false;
+  if (page_size != 64 && page_size != 128) return false;
+
+  // Upper bound on the cached tiles any request can touch: the page table
+  // width bounds the cache length, and the window bounds the local layers.
+  constexpr int kBlkK = 64;
+  int max_tiles = (num_pages_per_seq * page_size + kBlkK - 1) / kBlkK;
+  if (is_local && window_size_left >= 0) {
+    max_tiles = std::min(max_tiles, (window_size_left + 1 + kBlkK - 1) / kBlkK + 1);
+  }
+  const int num_kv_splits = choose_decode_kv_splits(batch * num_heads_kv, std::max(1, max_tiles));
+  constexpr int grf = 512;
+
+  using ShapeQK = Shape<_8, Int<kBlkK>, _32>;
+  using ShapePV = Shape<_8, _32, Int<kBlkK>>;
+  using ShapeOut = Shape<_8, Int<HeadDim>>;
+
+#define XE35_DECODE_SPLITKV_RUN(LOCAL, FIXED_PAGE, GRF)                                   \
+  Xe3FmhaDecodeSplitKvConfig<cutlass::bfloat16_t>::                                       \
+      template run_decode_splitkv<LOCAL, 2, FIXED_PAGE, GRF, ShapeQK, ShapePV, ShapeOut>( \
+          q_dense,                                                                        \
+          k_pool,                                                                         \
+          v_pool,                                                                         \
+          page_table,                                                                     \
+          num_pages_per_seq,                                                              \
+          cu_seqlens_q,                                                                   \
+          cu_seqlens_k_cache,                                                             \
+          out_dense,                                                                      \
+          batch,                                                                          \
+          num_heads_q,                                                                    \
+          num_heads_kv,                                                                   \
+          max_seqlen_kv_cache,                                                            \
+          HeadDim,                                                                        \
+          page_size,                                                                      \
+          softmax_scale,                                                                  \
+          window_size_left,                                                               \
+          window_size_right,                                                              \
+          num_kv_splits)
+
+#define XE35_DECODE_SPLITKV_RUN_GRF(LOCAL, FIXED_PAGE) \
+  do {                                                 \
+    if (grf == 256)                                    \
+      XE35_DECODE_SPLITKV_RUN(LOCAL, FIXED_PAGE, 256); \
+    else                                               \
+      XE35_DECODE_SPLITKV_RUN(LOCAL, FIXED_PAGE, 512); \
+  } while (false)
+
+  if (is_local) {
+    if (page_size == kBlkK)
+      XE35_DECODE_SPLITKV_RUN_GRF(true, kBlkK);
+    else
+      XE35_DECODE_SPLITKV_RUN_GRF(true, -1);
+  } else {
+    if (page_size == kBlkK)
+      XE35_DECODE_SPLITKV_RUN_GRF(false, kBlkK);
+    else
+      XE35_DECODE_SPLITKV_RUN_GRF(false, -1);
+  }
+#undef XE35_DECODE_SPLITKV_RUN_GRF
+#undef XE35_DECODE_SPLITKV_RUN
+  return true;
+}
 
 template <int HeadDim, bool UseDecode, bool Paged, class Element = cutlass::bfloat16_t, class OutputElement = Element>
 void dispatch_xe3_kernel(
@@ -420,30 +759,45 @@ void dispatch_xe3_kernel(
 
   // Paged is a compile-time parameter so each translation unit only instantiates
   // one KV-layout variant; paged and non-paged are generated as separate .cpp.
-#define XE35_INVOKE(CAUSAL, LOCAL, SINKV, STAGES, GQA, QK, PV, OUT, SGL, SINKPTR)                                  \
-  Xe3FmhaConfig<Element, OutputElement>::template run<CAUSAL, LOCAL, SINKV, STAGES, GQA, Paged, QK, PV, OUT, SGL>( \
-      q_dense,                                                                                                     \
-      k_pool,                                                                                                      \
-      v_pool,                                                                                                      \
-      page_table,                                                                                                  \
-      num_pages_per_seq,                                                                                           \
-      cu_seqlens_q,                                                                                                \
-      cu_seqlens_k_cache,                                                                                          \
-      out_dense,                                                                                                   \
-      batch,                                                                                                       \
-      num_heads_q,                                                                                                 \
-      num_heads_kv,                                                                                                \
-      max_seqlen_q,                                                                                                \
-      max_seqlen_kv_cache,                                                                                         \
-      HeadDim,                                                                                                     \
-      page_size,                                                                                                   \
-      q_descale,                                                                                                   \
-      k_descale,                                                                                                   \
-      v_descale,                                                                                                   \
-      softmax_scale,                                                                                               \
-      window_size_left,                                                                                            \
-      window_size_right,                                                                                           \
-      SINKPTR,                                                                                                     \
+#define XE35_INVOKE(CAUSAL, LOCAL, SINKV, STAGES, GQA, QK, PV, OUT, SGL, SINKPTR)                    \
+  Xe3FmhaConfig<Element, OutputElement>::template run<                                               \
+      CAUSAL,                                                                                        \
+      LOCAL,                                                                                         \
+      SINKV,                                                                                         \
+      STAGES,                                                                                        \
+      GQA,                                                                                           \
+      Paged,                                                                                         \
+      QK,                                                                                            \
+      PV,                                                                                            \
+      OUT,                                                                                           \
+      SGL,                                                                                           \
+      -2,                                                                                            \
+      -2,                                                                                            \
+      -1,                                                                                            \
+      (UseDecode || !std::is_same_v<Element, cutlass::bfloat16_t> ? XeStoreCachePolicy::kWT_WB_WB    \
+                                                                  : XeStoreCachePolicy::kWB_WB_UC)>( \
+      q_dense,                                                                                       \
+      k_pool,                                                                                        \
+      v_pool,                                                                                        \
+      page_table,                                                                                    \
+      num_pages_per_seq,                                                                             \
+      cu_seqlens_q,                                                                                  \
+      cu_seqlens_k_cache,                                                                            \
+      out_dense,                                                                                     \
+      batch,                                                                                         \
+      num_heads_q,                                                                                   \
+      num_heads_kv,                                                                                  \
+      max_seqlen_q,                                                                                  \
+      max_seqlen_kv_cache,                                                                           \
+      HeadDim,                                                                                       \
+      page_size,                                                                                     \
+      q_descale,                                                                                     \
+      k_descale,                                                                                     \
+      v_descale,                                                                                     \
+      softmax_scale,                                                                                 \
+      window_size_left,                                                                              \
+      window_size_right,                                                                             \
+      SINKPTR,                                                                                       \
       num_kv_splits)
 
 #define XE35_RUN(CAUSAL, LOCAL, STAGES, GQA, QK, PV, OUT, SGL)                     \
@@ -458,6 +812,33 @@ void dispatch_xe3_kernel(
       XE35_INVOKE(CAUSAL, LOCAL, false, STAGES, GQA, QK, PV, OUT, SGL, nullptr);   \
     }                                                                              \
   } while (false)
+
+  if constexpr (
+      UseDecode && Paged && (HeadDim == 64 || HeadDim == 128) && std::is_same_v<Element, cutlass::bfloat16_t> &&
+      std::is_same_v<OutputElement, cutlass::bfloat16_t>) {
+    if (dispatch_xe3_decode_splitkv<HeadDim>(
+            q_dense,
+            k_pool,
+            v_pool,
+            page_table,
+            num_pages_per_seq,
+            cu_seqlens_q,
+            cu_seqlens_k_cache,
+            out_dense,
+            batch,
+            num_heads_q,
+            num_heads_kv,
+            max_seqlen_q,
+            max_seqlen_kv_cache,
+            page_size,
+            softmax_scale,
+            is_local,
+            window_size_left,
+            window_size_right,
+            use_sink)) {
+      return;
+    }
+  }
 
   if constexpr (HeadDim == 256) {
     using ShapeQK = Shape<_128, _64, _64>;
@@ -534,7 +915,68 @@ void dispatch_xe3_kernel(
     using ShapeOut = Shape<_128, _64>;
     using SubgroupLayoutQK = Layout<Shape<_8, _1, _1>>;
     if (is_local) {
-      XE35_RUN(false, true, 2, false, ShapeQK, ShapePV, ShapeOut, SubgroupLayoutQK);
+      if constexpr (
+          Paged && std::is_same_v<Element, cutlass::bfloat16_t> && std::is_same_v<OutputElement, cutlass::bfloat16_t>) {
+        using LocalShapeQK = Shape<_64, _64, _32>;
+        using LocalShapePV = Shape<_64, _32, _64>;
+        using LocalShapeOut = Shape<_64, _64>;
+        using LocalSubgroupLayoutQK = Layout<Shape<_4, _1, _1>>;
+#define XE35_LOCAL(FIXED_LEFT, FIXED_RIGHT, FIXED_PAGE, STAGES) \
+  Xe3FmhaConfig<Element, OutputElement>::template run<          \
+      false,                                                    \
+      true,                                                     \
+      false,                                                    \
+      STAGES,                                                   \
+      false,                                                    \
+      Paged,                                                    \
+      LocalShapeQK,                                             \
+      LocalShapePV,                                             \
+      LocalShapeOut,                                            \
+      LocalSubgroupLayoutQK,                                    \
+      FIXED_LEFT,                                               \
+      FIXED_RIGHT,                                              \
+      FIXED_PAGE,                                               \
+      XeStoreCachePolicy::kWB_WB_UC>(                           \
+      q_dense,                                                  \
+      k_pool,                                                   \
+      v_pool,                                                   \
+      page_table,                                               \
+      num_pages_per_seq,                                        \
+      cu_seqlens_q,                                             \
+      cu_seqlens_k_cache,                                       \
+      out_dense,                                                \
+      batch,                                                    \
+      num_heads_q,                                              \
+      num_heads_kv,                                             \
+      max_seqlen_q,                                             \
+      max_seqlen_kv_cache,                                      \
+      HeadDim,                                                  \
+      page_size,                                                \
+      q_descale,                                                \
+      k_descale,                                                \
+      v_descale,                                                \
+      softmax_scale,                                            \
+      window_size_left,                                         \
+      window_size_right,                                        \
+      nullptr)
+        if (!use_sink && window_size_left >= 0 && window_size_right == 0 && (page_size == 64 || page_size == 128)) {
+          if (window_size_left == 2047) {
+            if (page_size == 64)
+              XE35_LOCAL(2047, 0, 64, 1);
+            else
+              XE35_LOCAL(2047, 0, 128, 1);
+          } else if (page_size == 64) {
+            XE35_LOCAL(-2, -2, 64, 1);
+          } else {
+            XE35_LOCAL(-2, -2, 128, 1);
+          }
+        } else {
+          XE35_RUN(false, true, 2, false, ShapeQK, ShapePV, ShapeOut, SubgroupLayoutQK);
+        }
+#undef XE35_LOCAL
+      } else {
+        XE35_RUN(false, true, 2, false, ShapeQK, ShapePV, ShapeOut, SubgroupLayoutQK);
+      }
     } else if (is_causal) {
       XE35_RUN(true, false, 2, false, ShapeQK, ShapePV, ShapeOut, SubgroupLayoutQK);
     } else {

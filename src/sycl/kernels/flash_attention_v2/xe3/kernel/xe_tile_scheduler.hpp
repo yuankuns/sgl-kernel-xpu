@@ -41,11 +41,20 @@ namespace detail {
 struct EmptyDivmod {};
 }  // namespace detail
 
-template <bool OneBatch = false, bool NoGQA = false, bool CausalMask = false, bool GqaFusion = false>
+template <
+    bool OneBatch = false,
+    bool NoGQA = false,
+    bool CausalMask = false,
+    bool GqaFusion = false,
+    bool CacheOnly = false,
+    int GqaFusionSize = 0>
 struct XeFHMAIndividualTileScheduler {
   static constexpr bool kGqaFusion = GqaFusion;
+  static constexpr bool kCacheOnly = CacheOnly;
+  static constexpr int kGqaFusionSize = GqaFusionSize;
   using NumHeadsDivmod = cute::conditional_t<OneBatch, detail::EmptyDivmod, FastDivmod>;
-  using HeadGroupDivmod = cute::conditional_t<NoGQA || GqaFusion, detail::EmptyDivmod, FastDivmod>;
+  using HeadGroupDivmod =
+      cute::conditional_t<NoGQA || (GqaFusion && GqaFusionSize == 0), detail::EmptyDivmod, FastDivmod>;
 
   struct Params {
     dim3 grid;
@@ -70,7 +79,12 @@ struct XeFHMAIndividualTileScheduler {
       const int& num_kv_splits = -1) {
     using namespace cute;
 
-    int heads_in_grid = (num_kv_splits >= 1 || GqaFusion) ? shape.num_heads_kv : shape.num_heads_q;
+    int heads_in_grid = shape.num_heads_q;
+    if (num_kv_splits >= 1 || (GqaFusion && GqaFusionSize == 0)) {
+      heads_in_grid = shape.num_heads_kv;
+    } else if constexpr (GqaFusion) {
+      heads_in_grid = shape.num_heads_q / kGqaFusionSize;
+    }
 
     dim3 grid;
     if (num_kv_splits >= 1) {
@@ -104,7 +118,7 @@ struct XeFHMAIndividualTileScheduler {
     if constexpr (!OneBatch) {
       p.divmod_num_heads = FastDivmod(heads_in_grid);
     }
-    if constexpr (!NoGQA && !GqaFusion) {
+    if constexpr (!NoGQA && !(GqaFusion && GqaFusionSize == 0)) {
       p.divmod_head_group_q = FastDivmod(shape.num_heads_q / shape.num_heads_kv);
     }
     return p;
@@ -167,8 +181,10 @@ struct XeFHMAIndividualTileScheduler {
 
   CUTLASS_DEVICE
   int divide_head_group(int head_q) const {
-    if constexpr (NoGQA || GqaFusion) {
+    if constexpr (NoGQA || (GqaFusion && GqaFusionSize == 0)) {
       return head_q;
+    } else if constexpr (GqaFusion) {
+      return params.divmod_head_group_q.div(head_q * kGqaFusionSize);
     } else {
       return params.divmod_head_group_q.div(head_q);
     }
@@ -176,7 +192,20 @@ struct XeFHMAIndividualTileScheduler {
 
   CUTLASS_DEVICE
   int get_gqa_group_size() const {
+    if constexpr (GqaFusion && GqaFusionSize > 0) {
+      return kGqaFusionSize;
+    }
     return params.gqa_group_size;
+  }
+
+  CUTLASS_DEVICE
+  int get_gqa_q_head_start(int fused_head) const {
+    if constexpr (GqaFusion && GqaFusionSize > 0) {
+      return fused_head * kGqaFusionSize;
+    } else if constexpr (GqaFusion) {
+      return fused_head * params.gqa_group_size;
+    }
+    return fused_head;
   }
 
   CUTLASS_DEVICE

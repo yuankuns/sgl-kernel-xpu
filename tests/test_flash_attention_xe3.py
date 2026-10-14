@@ -5,6 +5,8 @@ This covers the Xe3P/Xe35 flash-attention entry via flash_attn_with_kvcache
 and keeps shapes intentionally tiny so it can run on simulator hardware.
 """
 
+import time
+
 import pytest
 import sgl_kernel  # noqa: F401 - registers torch.ops.sgl_kernel.* custom ops
 import torch
@@ -158,8 +160,73 @@ def is_cri_device() -> bool:
 
 @pytest.mark.skipif(not is_xpu_available(), reason="Intel XPU not available")
 @pytest.mark.skipif(not is_cri_device(), reason="Requires a CRI (Xe3P) device")
-@pytest.mark.parametrize("nheads_q,nheads_kv", [(4, 2)])
+@pytest.mark.parametrize("window_left", [0, 1, 63, 1023, 2046, 2047, 2048, 4095])
+@pytest.mark.parametrize("page_size", [64, 128])
+def test_flash_attention_xe3_prefill_local_window_boundary(window_left, page_size):
+    batch, seqlen_q, seqlen_k = 1, 128, 2113
+    nheads_q, nheads_kv, head_dim = 4, 2, 64
+    pages_per_seq = (seqlen_k + page_size - 1) // page_size
+    q = torch.randn(
+        batch, seqlen_q, nheads_q, head_dim, device="xpu", dtype=torch.bfloat16
+    )
+    k_cache = torch.randn(
+        batch * pages_per_seq,
+        page_size,
+        nheads_kv,
+        head_dim,
+        device="xpu",
+        dtype=torch.bfloat16,
+    )
+    v_cache = torch.randn_like(k_cache)
+    page_table = torch.arange(
+        batch * pages_per_seq, device="xpu", dtype=torch.int32
+    ).view(batch, pages_per_seq)
+    cache_seqlens = torch.full((batch,), seqlen_k, device="xpu", dtype=torch.int32)
+    cu_seqlens_q = torch.arange(batch + 1, device="xpu", dtype=torch.int32) * seqlen_q
+    scale = head_dim**-0.5
+    window_size = (window_left, 0)
+
+    out = flash_attn_with_kvcache(
+        q.view(batch * seqlen_q, nheads_q, head_dim),
+        k_cache,
+        v_cache,
+        cache_seqlens=cache_seqlens,
+        page_table=page_table,
+        cu_seqlens_q=cu_seqlens_q,
+        max_seqlen_q=seqlen_q,
+        max_seqlen_k=seqlen_k,
+        softmax_scale=scale,
+        causal=True,
+        window_size=window_size,
+        rotary_interleaved=False,
+    )
+    expected = cpu_ref(
+        q,
+        k_cache,
+        v_cache,
+        page_table,
+        cache_seqlens,
+        seqlen_q,
+        scale,
+        window_size=window_size,
+        causal=True,
+        upcast=True,
+    )
+    torch.testing.assert_close(
+        out.float().cpu().reshape_as(expected), expected.float(), rtol=2e-2, atol=2e-2
+    )
+    torch.xpu.synchronize()
+    time.sleep(2)
+
+
+@pytest.mark.skipif(not is_xpu_available(), reason="Intel XPU not available")
+@pytest.mark.skipif(not is_cri_device(), reason="Requires a CRI (Xe3P) device")
+@pytest.mark.parametrize(
+    "nheads_q,nheads_kv",
+    [(4, 2), (1, 1), (12, 4), (16, 4), (8, 1), (16, 1), (128, 16)],
+)
 @pytest.mark.parametrize("causal,local", [(False, False), (False, True), (True, False)])
+@pytest.mark.parametrize("window_left", [1, 2047])
 @pytest.mark.parametrize("use_sinks", [False, True])
 @pytest.mark.parametrize("head_dim", [64, 128, 256])
 @pytest.mark.parametrize("seqlen_q", [1, 128])
@@ -174,6 +241,7 @@ def test_flash_attention_xe3_fwd(
     page_size,
     causal,
     local,
+    window_left,
     use_sinks,
     nheads_q,
     nheads_kv,
@@ -188,10 +256,18 @@ def test_flash_attention_xe3_fwd(
     if local and seqlen_q == 1:
         pytest.skip("local-window coverage uses seqlen_q > 1")
 
-    window_size = (1, 0) if local else (-1, -1)
+    if not local and window_left != 1:
+        pytest.skip("window_left only applies to local attention")
+
+    if (nheads_q, nheads_kv) != (4, 2) and (
+        causal or local or use_sinks or head_dim != 64 or page_size != 128
+    ):
+        pytest.skip("expanded GQA ratios use one representative global configuration")
+
+    window_size = (window_left, 0) if local else (-1, -1)
     case_name = (
         f"b{batch}_q{seqlen_q}_k{seqlen_k}_d{head_dim}_p{page_size}"
-        f"_causal{int(causal)}_local{int(local)}_sink{int(use_sinks)}"
+        f"_causal{int(causal)}_local{int(local)}_wl{window_left}_sink{int(use_sinks)}"
     )
 
     num_pages_per_seq = (seqlen_k + page_size - 1) // page_size
@@ -269,6 +345,77 @@ def test_flash_attention_xe3_fwd(
         f"Xe3 flash attention case={case_name} failed: kernel_diff={kernel_diff} > tol={tol} "
         f"(baseline={baseline_diff})"
     )
+
+
+@pytest.mark.skipif(not is_xpu_available(), reason="Intel XPU not available")
+@pytest.mark.skipif(not is_cri_device(), reason="Requires a CRI (Xe3P) device")
+@pytest.mark.parametrize("window_size", [(-1, -1), (63, 0)])
+def test_flash_attention_xe3_decode_gqa_fusion(window_size):
+    """Cover decode GQA packing, paged tail handling, and local cache bounds."""
+    batch, seqlen_q, seqlen_k = 2, 1, 129
+    nheads_q, nheads_kv, head_dim, page_size = 128, 16, 64, 64
+    device = torch.device("xpu")
+    dtype = torch.bfloat16
+    pages_per_seq = (seqlen_k + page_size - 1) // page_size
+    num_pages = batch * pages_per_seq
+
+    torch.manual_seed(0)
+    q = torch.randn(batch, seqlen_q, nheads_q, head_dim, device=device, dtype=dtype)
+    k_cache = torch.randn(
+        num_pages, page_size, nheads_kv, head_dim, device=device, dtype=dtype
+    )
+    v_cache = torch.randn_like(k_cache)
+    page_table = torch.randperm(num_pages, dtype=torch.int32, device=device).view(
+        batch, pages_per_seq
+    )
+    cache_seqlens = torch.full((batch,), seqlen_k, dtype=torch.int32, device=device)
+    cu_seqlens_q = torch.arange(batch + 1, dtype=torch.int32, device=device)
+    softmax_scale = head_dim**-0.5
+
+    out, *_ = flash_attn_with_kvcache(
+        q.view(batch, nheads_q, head_dim),
+        k_cache,
+        v_cache,
+        cache_seqlens=cache_seqlens,
+        page_table=page_table,
+        cu_seqlens_q=cu_seqlens_q,
+        max_seqlen_q=seqlen_q,
+        max_seqlen_k=seqlen_k,
+        softmax_scale=softmax_scale,
+        causal=True,
+        window_size=window_size,
+        rotary_interleaved=False,
+        return_softmax_lse=True,
+    )
+    torch.xpu.synchronize()
+
+    ref_fp32 = cpu_ref(
+        q,
+        k_cache,
+        v_cache,
+        page_table,
+        cache_seqlens,
+        seqlen_q,
+        softmax_scale,
+        window_size=window_size,
+        causal=True,
+        upcast=True,
+    )
+    ref_bf16 = cpu_ref(
+        q,
+        k_cache,
+        v_cache,
+        page_table,
+        cache_seqlens,
+        seqlen_q,
+        softmax_scale,
+        window_size=window_size,
+        causal=True,
+        upcast=False,
+    )
+    kernel_diff = (out.view_as(q).float().cpu() - ref_fp32).abs().max().item()
+    baseline_diff = (ref_bf16 - ref_fp32).abs().max().item()
+    assert kernel_diff <= 2.0 * baseline_diff + 1e-5
 
 
 if __name__ == "__main__":

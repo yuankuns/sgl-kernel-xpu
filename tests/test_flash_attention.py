@@ -1576,6 +1576,100 @@ def _generate_block_kvcache(
     not is_fa3_supported(),
     reason="flash_attn at sgl-kernel is only supported on sm90 and above",
 )
+@pytest.mark.parametrize("causal", [False, True], ids=["nocausal", "causal"])
+@pytest.mark.parametrize("nheads_q,nheads_kv", [(8, 1), (8, 2)], ids=["mqa", "gqa"])
+@pytest.mark.parametrize("batch_size", [1, 2], ids=lambda batch: f"b{batch}")
+@pytest.mark.parametrize("page_size", [64, 128], ids=lambda page: f"page{page}")
+@pytest.mark.parametrize(
+    "k_remainder", [0, 1, 2, 3], ids=lambda remainder: f"krem{remainder}"
+)
+@pytest.mark.parametrize("seqlen_q", [1, 128, 129], ids=lambda q: f"q{q}")
+def test_flash_attn_paged_edge_cases(
+    batch_size,
+    seqlen_q,
+    page_size,
+    k_remainder,
+    nheads_q,
+    nheads_kv,
+    causal,
+):
+    """Cross page/tile boundaries orthogonally across MQA/GQA, batch, and causal."""
+    from sgl_kernel.flash_attn import flash_attn_with_kvcache
+
+    torch.manual_seed(0)
+    dtype = torch.bfloat16
+    d = 64
+    seqlen_k = math.ceil(seqlen_q / page_size) * page_size + k_remainder
+    softmax_scale = d**-0.5
+
+    q = torch.randn(batch_size, seqlen_q, nheads_q, d, dtype=dtype)
+    (
+        k_cache,
+        v_cache,
+        page_table,
+        k_cache_paged,
+        v_cache_paged,
+        _,
+    ) = _generate_block_kvcache(
+        seqlen_k,
+        page_size,
+        batch_size,
+        nheads_kv,
+        d,
+        d,
+        "cpu",
+        dtype,
+        dtype,
+    )
+    cache_seqlens = torch.full((batch_size,), seqlen_k, dtype=torch.int32)
+    cu_seqlens_q = torch.arange(batch_size + 1, dtype=torch.int32) * seqlen_q
+
+    k_ref = repeat(k_cache, "b s h d -> b s (h g) d", g=nheads_q // nheads_kv)
+    v_ref = repeat(v_cache, "b s h d -> b s (h g) d", g=nheads_q // nheads_kv)
+    out_ref, _ = attention_ref(
+        q,
+        k_ref,
+        v_ref,
+        softmax_scale,
+        causal=causal,
+    )
+    out_pt, _ = attention_ref(
+        q,
+        k_ref,
+        v_ref,
+        softmax_scale,
+        causal=causal,
+        upcast=False,
+        reorder_ops=True,
+    )
+
+    out, *_ = flash_attn_with_kvcache(
+        _to_xpu(rearrange(q, "b s h d -> (b s) h d")),
+        _to_xpu(k_cache_paged),
+        _to_xpu(v_cache_paged),
+        cache_seqlens=_to_xpu(cache_seqlens),
+        page_table=_to_xpu(page_table),
+        cu_seqlens_q=_to_xpu(cu_seqlens_q),
+        max_seqlen_q=seqlen_q,
+        causal=causal,
+        softmax_scale=softmax_scale,
+        rotary_interleaved=False,
+        return_softmax_lse=True,
+    )
+    torch.xpu.synchronize()
+    out = rearrange(out.cpu(), "(b s) h d -> b s h d", b=batch_size)
+
+    kernel_error = (out - out_ref).abs()
+    reference_error = (out_pt - out_ref).abs()
+    assert kernel_error.max().item() <= 2 * reference_error.max().item() + 1e-5
+    assert kernel_error.mean().item() <= 1.5 * reference_error.mean().item() + 1e-5
+
+
+@pytest.mark.skip(reason="varlen is not supported on Xe3")
+@pytest.mark.skipif(
+    not is_fa3_supported(),
+    reason="flash_attn at sgl-kernel is only supported on sm90 and above",
+)
 @pytest.mark.parametrize(
     "dtype", [torch.bfloat16] + ([torch.float8_e4m3fn] if not DISABLE_FP8 else [])
 )
