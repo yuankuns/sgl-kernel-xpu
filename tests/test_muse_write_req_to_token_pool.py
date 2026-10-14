@@ -1,6 +1,18 @@
+import os
+import time
+
 import pytest
-import sgl_kernel  # noqa: F401
 import torch
+
+if library := os.environ.get("MUSE_MEMORY_TEST_LIBRARY"):
+    torch.ops.load_library(library)
+else:
+    import sgl_kernel  # noqa: F401
+
+
+@pytest.fixture(autouse=True)
+def cool_between_device_shapes():
+    time.sleep(2)
 
 
 def test_muse_write_req_to_token_pool_prefix_and_extension():
@@ -30,23 +42,25 @@ def test_muse_write_req_to_token_pool_prefix_and_extension():
         extend_lens,
         out_cache_loc,
     )
+    torch.xpu.synchronize()
+    pool_cpu = pool.cpu()
     torch.testing.assert_close(
-        pool[3],
-        torch.tensor(
-            [20, 21, 10, 11, -1, -1, -1, -1], device=device, dtype=torch.int32
-        ),
+        pool_cpu[3],
+        torch.tensor([20, 21, 10, 11, -1, -1, -1, -1], dtype=torch.int32),
+        rtol=0,
+        atol=0,
     )
     torch.testing.assert_close(
-        pool[1],
-        torch.tensor(
-            [12, 13, -1, -1, -1, -1, -1, -1], device=device, dtype=torch.int32
-        ),
+        pool_cpu[1],
+        torch.tensor([12, 13, -1, -1, -1, -1, -1, -1], dtype=torch.int32),
+        rtol=0,
+        atol=0,
     )
     torch.testing.assert_close(
-        pool[4],
-        torch.tensor(
-            [30, 31, 32, 14, -1, -1, -1, -1], device=device, dtype=torch.int32
-        ),
+        pool_cpu[4],
+        torch.tensor([30, 31, 32, 14, -1, -1, -1, -1], dtype=torch.int32),
+        rtol=0,
+        atol=0,
     )
 
 
@@ -67,11 +81,14 @@ def test_muse_write_req_to_token_pool_multigroup_irregular_prefix():
     torch.ops.sgl_kernel.muse_write_req_to_token_pool(
         pool, req_indices, pointers, prefix_lens, seq_lens, extend_lens, loc
     )
-    torch.testing.assert_close(pool[2, :5050], torch.cat((prefix, loc[:2049])).int())
+    torch.xpu.synchronize()
+    pool_cpu = pool.cpu()
+    expected = torch.cat((prefix.cpu(), loc[:2049].cpu())).int()
+    torch.testing.assert_close(pool_cpu[2, :5050], expected, rtol=0, atol=0)
     torch.testing.assert_close(
-        pool[2, 5050:], torch.full((150,), -1, device="xpu", dtype=torch.int32)
+        pool_cpu[2, 5050:], torch.full((150,), -1, dtype=torch.int32), rtol=0, atol=0
     )
-    torch.testing.assert_close(pool[0, 0], loc[-1].int())
+    torch.testing.assert_close(pool_cpu[0, 0], loc[-1].cpu().int(), rtol=0, atol=0)
     torch.testing.assert_close(
-        pool[0, 1:], torch.full((5199,), -1, device="xpu", dtype=torch.int32)
+        pool_cpu[0, 1:], torch.full((5199,), -1, dtype=torch.int32), rtol=0, atol=0
     )

@@ -16,7 +16,56 @@ inline int64_t ceil_pages(int64_t tokens, int64_t page_size) {
   return (tokens + page_size - 1) / page_size;
 }
 
-template <typename LastScalar, int TilesPerReq, bool Page64>
+// Positive shifts are compile-time page-size variants; zero is a dynamic
+// power-of-two size, and -1 keeps the general division path.
+template <int PageShift>
+inline int64_t effective_page_size(int64_t page_size) {
+  if constexpr (PageShift > 0) {
+    return int64_t{1} << PageShift;
+  } else {
+    return page_size;
+  }
+}
+
+template <int PageShift>
+inline int page_shift(int64_t page_size) {
+  if constexpr (PageShift > 0) {
+    return PageShift;
+  } else if constexpr (PageShift == 0) {
+    return sycl::ctz(static_cast<uint64_t>(page_size));
+  } else {
+    return 0;
+  }
+}
+
+template <int PageShift>
+inline int64_t page_count(int64_t tokens, int64_t page_size, int shift) {
+  if constexpr (PageShift >= 0) {
+    return (tokens + page_size - 1) >> shift;
+  } else {
+    return ceil_pages(tokens, page_size);
+  }
+}
+
+template <int PageShift>
+inline int64_t page_index(int64_t position, int64_t page_size, int shift) {
+  if constexpr (PageShift >= 0) {
+    return position >> shift;
+  } else {
+    return position / page_size;
+  }
+}
+
+template <int PageShift>
+inline int64_t page_offset(int64_t position, int64_t page_size) {
+  if constexpr (PageShift >= 0) {
+    return position & (page_size - 1);
+  } else {
+    return position % page_size;
+  }
+}
+
+template <typename LastScalar, int TilesPerReq, int PageShift>
 struct MuseAllocExtendKernel {
   const int64_t* __restrict__ prefix_lens;
   const int64_t* __restrict__ seq_lens;
@@ -33,24 +82,26 @@ struct MuseAllocExtendKernel {
     if (req >= batch) {
       return;
     }
-    const int64_t effective_page_size = Page64 ? 64 : page_size;
+    const int64_t size = effective_page_size<PageShift>(page_size);
+    const int shift = page_shift<PageShift>(page_size);
     int64_t output_start = 0;
     int64_t new_page_start = 0;
     for (int64_t i = 0; i < req; ++i) {
       output_start += seq_lens[i] - prefix_lens[i];
-      new_page_start += ceil_pages(seq_lens[i], effective_page_size) - ceil_pages(prefix_lens[i], effective_page_size);
+      new_page_start +=
+          page_count<PageShift>(seq_lens[i], size, shift) - page_count<PageShift>(prefix_lens[i], size, shift);
     }
     const int64_t prefix_len = prefix_lens[req];
     const int64_t seq_len = seq_lens[req];
-    const int64_t old_boundary = ceil_pages(prefix_len, effective_page_size) * effective_page_size;
+    const int64_t old_boundary = page_count<PageShift>(prefix_len, size, shift) * size;
     for (int64_t offset = tile * kWorkgroup + lane; offset < seq_len - prefix_len; offset += TilesPerReq * kWorkgroup) {
       const int64_t position = prefix_len + offset;
       int64_t location;
       if (position < old_boundary) {
         location = last_loc[req] + 1 + offset;
       } else {
-        const int64_t page_offset = (position - old_boundary) / effective_page_size;
-        location = free_pages[new_page_start + page_offset] * effective_page_size + position % effective_page_size;
+        const int64_t new_page = page_index<PageShift>(position - old_boundary, size, shift);
+        location = free_pages[new_page_start + new_page] * size + page_offset<PageShift>(position, size);
       }
       out_indices[output_start + offset] = location;
     }
@@ -58,7 +109,7 @@ struct MuseAllocExtendKernel {
 };
 
 // One launch produces the paged locations and writes the request table.
-template <typename LastScalar, int TilesPerReq, bool Page64>
+template <typename LastScalar, int TilesPerReq, int PageShift>
 struct MuseAllocExtendAndWriteKernel {
   const int64_t* __restrict__ prefix_lens;
   const int64_t* __restrict__ seq_lens;
@@ -77,52 +128,40 @@ struct MuseAllocExtendAndWriteKernel {
     const int64_t tile = item.get_group(0) % TilesPerReq;
     const int64_t lane = item.get_local_id(0);
     if (req >= batch) return;
-    const int64_t effective_page_size = Page64 ? 64 : page_size;
+    const int64_t size = effective_page_size<PageShift>(page_size);
+    const int shift = page_shift<PageShift>(page_size);
     int64_t output_start = 0;
     int64_t new_page_start = 0;
     for (int64_t i = 0; i < req; ++i) {
       output_start += seq_lens[i] - prefix_lens[i];
-      if constexpr (Page64) {
-        // Valid prefix/sequence lengths are nonnegative; ceil(x / 64).
-        new_page_start += ((seq_lens[i] + 63) >> 6) - ((prefix_lens[i] + 63) >> 6);
-      } else {
-        new_page_start +=
-            ceil_pages(seq_lens[i], effective_page_size) - ceil_pages(prefix_lens[i], effective_page_size);
-      }
+      new_page_start +=
+          page_count<PageShift>(seq_lens[i], size, shift) - page_count<PageShift>(prefix_lens[i], size, shift);
     }
     const int64_t prefix_len = prefix_lens[req];
     const int64_t seq_len = seq_lens[req];
     const int64_t row = req_pool_indices[req] * row_stride;
-    if constexpr (Page64) {
-      // Model prefill often starts every request at zero. This branch is
-      // uniform within a request and avoids prefix-table reads and the
-      // old-page test in the page64 hot loop; partial prefixes still use
-      // the fully general implementation below.
-      if (prefix_len == 0) {
-        for (int64_t offset = tile * kWorkgroup + lane; offset < seq_len; offset += TilesPerReq * kWorkgroup) {
-          const int64_t location = free_pages[new_page_start + (offset >> 6)] * 64 + (offset & 63);
-          out_indices[output_start + offset] = location;
-          req_to_token[row + offset] = static_cast<int32_t>(location);
-        }
-        return;
+    if (prefix_len == 0) {
+      for (int64_t offset = tile * kWorkgroup + lane; offset < seq_len; offset += TilesPerReq * kWorkgroup) {
+        const int64_t location = free_pages[new_page_start + page_index<PageShift>(offset, size, shift)] * size +
+                                 page_offset<PageShift>(offset, size);
+        out_indices[output_start + offset] = location;
+        req_to_token[row + offset] = static_cast<int32_t>(location);
       }
+      return;
     }
     const auto* prefix = reinterpret_cast<const int64_t*>(static_cast<uintptr_t>(prefix_pointers[req]));
     for (int64_t pos = tile * kWorkgroup + lane; pos < prefix_len; pos += TilesPerReq * kWorkgroup) {
       req_to_token[row + pos] = static_cast<int32_t>(prefix[pos]);
     }
-    const int64_t old_boundary =
-        Page64 ? ((prefix_len + 63) & ~int64_t{63}) : ceil_pages(prefix_len, effective_page_size) * effective_page_size;
+    const int64_t old_boundary = page_count<PageShift>(prefix_len, size, shift) * size;
     for (int64_t offset = tile * kWorkgroup + lane; offset < seq_len - prefix_len; offset += TilesPerReq * kWorkgroup) {
       const int64_t position = prefix_len + offset;
       int64_t location;
       if (position < old_boundary) {
         location = last_loc[req] + 1 + offset;
-      } else if constexpr (Page64) {
-        location = free_pages[new_page_start + ((position - old_boundary) >> 6)] * 64 + (position & 63);
       } else {
-        location = free_pages[new_page_start + (position - old_boundary) / effective_page_size] * effective_page_size +
-                   position % effective_page_size;
+        location = free_pages[new_page_start + page_index<PageShift>(position - old_boundary, size, shift)] * size +
+                   page_offset<PageShift>(position, size);
       }
       out_indices[output_start + offset] = location;
       req_to_token[row + position] = static_cast<int32_t>(location);
@@ -130,7 +169,7 @@ struct MuseAllocExtendAndWriteKernel {
   }
 };
 
-template <typename LastScalar, bool Page64>
+template <typename LastScalar, int PageShift>
 struct MuseAllocDecodeKernel {
   const int64_t* __restrict__ seq_lens;
   const LastScalar* __restrict__ last_loc;
@@ -144,15 +183,16 @@ struct MuseAllocDecodeKernel {
     if (req >= batch) {
       return;
     }
-    const int64_t effective_page_size = Page64 ? 64 : page_size;
+    const int64_t size = effective_page_size<PageShift>(page_size);
+    const int shift = page_shift<PageShift>(page_size);
     int64_t new_page_start = 0;
     for (int64_t i = 0; i < req; ++i) {
       const int64_t seq = seq_lens[i];
-      new_page_start += ceil_pages(seq, effective_page_size) - ceil_pages(seq - 1, effective_page_size);
+      new_page_start += page_count<PageShift>(seq, size, shift) - page_count<PageShift>(seq - 1, size, shift);
     }
     const int64_t seq = seq_lens[req];
-    const bool need_page = ceil_pages(seq, effective_page_size) > ceil_pages(seq - 1, effective_page_size);
-    out_indices[req] = need_page ? free_pages[new_page_start] * effective_page_size : last_loc[req] + 1;
+    const bool need_page = page_count<PageShift>(seq, size, shift) > page_count<PageShift>(seq - 1, size, shift);
+    out_indices[req] = need_page ? free_pages[new_page_start] * size : last_loc[req] + 1;
   }
 };
 
@@ -170,7 +210,7 @@ void check_last_loc(const torch::Tensor& tensor) {
       "last_loc must be a contiguous XPU int32 or int64 vector");
 }
 
-template <typename LastScalar, int TilesPerReq, bool Page64>
+template <typename LastScalar, int TilesPerReq, int PageShift>
 void launch_extend(
     const torch::Tensor& prefix_lens,
     const torch::Tensor& seq_lens,
@@ -180,7 +220,7 @@ void launch_extend(
     int64_t page_size,
     sycl::queue& queue) {
   const int64_t batch = prefix_lens.numel();
-  MuseAllocExtendKernel<LastScalar, TilesPerReq, Page64> kernel{
+  MuseAllocExtendKernel<LastScalar, TilesPerReq, PageShift> kernel{
       prefix_lens.data_ptr<int64_t>(),
       seq_lens.data_ptr<int64_t>(),
       last_loc.data_ptr<LastScalar>(),
@@ -191,7 +231,7 @@ void launch_extend(
   sycl_kernel_submit(sycl::range<1>(batch * TilesPerReq * kWorkgroup), sycl::range<1>(kWorkgroup), queue, kernel);
 }
 
-template <typename LastScalar, bool Page64>
+template <typename LastScalar, int PageShift>
 void dispatch_extend_tiles(
     const torch::Tensor& prefix_lens,
     const torch::Tensor& seq_lens,
@@ -202,15 +242,16 @@ void dispatch_extend_tiles(
     int64_t output_per_req,
     sycl::queue& queue) {
   if (output_per_req >= 8 * kWorkgroup) {
-    launch_extend<LastScalar, 16, Page64>(prefix_lens, seq_lens, last_loc, free_pages, out_indices, page_size, queue);
+    launch_extend<LastScalar, 16, PageShift>(
+        prefix_lens, seq_lens, last_loc, free_pages, out_indices, page_size, queue);
   } else if (output_per_req >= 2 * kWorkgroup) {
-    launch_extend<LastScalar, 4, Page64>(prefix_lens, seq_lens, last_loc, free_pages, out_indices, page_size, queue);
+    launch_extend<LastScalar, 4, PageShift>(prefix_lens, seq_lens, last_loc, free_pages, out_indices, page_size, queue);
   } else {
-    launch_extend<LastScalar, 1, Page64>(prefix_lens, seq_lens, last_loc, free_pages, out_indices, page_size, queue);
+    launch_extend<LastScalar, 1, PageShift>(prefix_lens, seq_lens, last_loc, free_pages, out_indices, page_size, queue);
   }
 }
 
-template <typename LastScalar, int TilesPerReq, bool Page64>
+template <typename LastScalar, int TilesPerReq, int PageShift>
 void launch_extend_and_write(
     const torch::Tensor& prefix_lens,
     const torch::Tensor& seq_lens,
@@ -223,7 +264,7 @@ void launch_extend_and_write(
     int64_t page_size,
     sycl::queue& queue) {
   const int64_t batch = prefix_lens.numel();
-  MuseAllocExtendAndWriteKernel<LastScalar, TilesPerReq, Page64> kernel{
+  MuseAllocExtendAndWriteKernel<LastScalar, TilesPerReq, PageShift> kernel{
       prefix_lens.data_ptr<int64_t>(),
       seq_lens.data_ptr<int64_t>(),
       last_loc.data_ptr<LastScalar>(),
@@ -238,7 +279,7 @@ void launch_extend_and_write(
   sycl_kernel_submit(sycl::range<1>(batch * TilesPerReq * kWorkgroup), sycl::range<1>(kWorkgroup), queue, kernel);
 }
 
-template <typename LastScalar, bool Page64>
+template <typename LastScalar, int PageShift>
 void dispatch_extend_and_write(
     const torch::Tensor& prefix_lens,
     const torch::Tensor& seq_lens,
@@ -253,7 +294,7 @@ void dispatch_extend_and_write(
   const int64_t batch = prefix_lens.numel();
   const int64_t output_per_req = out_indices.numel() / batch;
   if (output_per_req >= 8 * kWorkgroup) {
-    launch_extend_and_write<LastScalar, 16, Page64>(
+    launch_extend_and_write<LastScalar, 16, PageShift>(
         prefix_lens,
         seq_lens,
         last_loc,
@@ -265,7 +306,7 @@ void dispatch_extend_and_write(
         page_size,
         queue);
   } else if (output_per_req >= 2 * kWorkgroup) {
-    launch_extend_and_write<LastScalar, 4, Page64>(
+    launch_extend_and_write<LastScalar, 4, PageShift>(
         prefix_lens,
         seq_lens,
         last_loc,
@@ -277,7 +318,7 @@ void dispatch_extend_and_write(
         page_size,
         queue);
   } else {
-    launch_extend_and_write<LastScalar, 1, Page64>(
+    launch_extend_and_write<LastScalar, 1, PageShift>(
         prefix_lens,
         seq_lens,
         last_loc,
@@ -291,7 +332,7 @@ void dispatch_extend_and_write(
   }
 }
 
-template <typename LastScalar, bool Page64>
+template <typename LastScalar, int PageShift>
 void launch_decode(
     const torch::Tensor& seq_lens,
     const torch::Tensor& last_loc,
@@ -300,7 +341,7 @@ void launch_decode(
     int64_t page_size,
     sycl::queue& queue) {
   const int64_t batch = seq_lens.numel();
-  MuseAllocDecodeKernel<LastScalar, Page64> kernel{
+  MuseAllocDecodeKernel<LastScalar, PageShift> kernel{
       seq_lens.data_ptr<int64_t>(),
       last_loc.data_ptr<LastScalar>(),
       free_pages.data_ptr<int64_t>(),
@@ -312,6 +353,27 @@ void launch_decode(
       sycl::range<1>(kDecodeWorkgroup),
       queue,
       kernel);
+}
+
+template <typename Launch>
+void dispatch_page_family(int64_t page_size, Launch&& launch) {
+  switch (page_size) {
+    case 32:
+      launch.template operator()<5>();
+      break;
+    case 64:
+      launch.template operator()<6>();
+      break;
+    case 128:
+      launch.template operator()<7>();
+      break;
+    default:
+      if ((page_size & (page_size - 1)) == 0) {
+        launch.template operator()<0>();
+      } else {
+        launch.template operator()<-1>();
+      }
+  }
 }
 
 }  // namespace
@@ -337,23 +399,16 @@ void muse_alloc_extend(
   }
   auto queue = at::xpu::getCurrentXPUStream().queue();
   const int64_t output_per_req = out_indices.numel() / batch;
-  // The serving model uses page size 64; specialize its division and modulo.
   if (last_loc.scalar_type() == at::kInt) {
-    if (page_size == 64) {
-      dispatch_extend_tiles<int32_t, true>(
+    dispatch_page_family(page_size, [&]<int PageShift>() {
+      dispatch_extend_tiles<int32_t, PageShift>(
           prefix_lens, seq_lens, last_loc, free_pages, out_indices, page_size, output_per_req, queue);
-    } else {
-      dispatch_extend_tiles<int32_t, false>(
-          prefix_lens, seq_lens, last_loc, free_pages, out_indices, page_size, output_per_req, queue);
-    }
+    });
   } else {
-    if (page_size == 64) {
-      dispatch_extend_tiles<int64_t, true>(
+    dispatch_page_family(page_size, [&]<int PageShift>() {
+      dispatch_extend_tiles<int64_t, PageShift>(
           prefix_lens, seq_lens, last_loc, free_pages, out_indices, page_size, output_per_req, queue);
-    } else {
-      dispatch_extend_tiles<int64_t, false>(
-          prefix_lens, seq_lens, last_loc, free_pages, out_indices, page_size, output_per_req, queue);
-    }
+    });
   }
 }
 
@@ -389,8 +444,8 @@ void muse_alloc_extend_and_write(
   if (!batch) return;
   auto queue = at::xpu::getCurrentXPUStream().queue();
   if (last_loc.scalar_type() == at::kInt) {
-    if (page_size == 64) {
-      dispatch_extend_and_write<int32_t, true>(
+    dispatch_page_family(page_size, [&]<int PageShift>() {
+      dispatch_extend_and_write<int32_t, PageShift>(
           prefix_lens,
           seq_lens,
           last_loc,
@@ -401,22 +456,10 @@ void muse_alloc_extend_and_write(
           prefix_pointers,
           page_size,
           queue);
-    } else {
-      dispatch_extend_and_write<int32_t, false>(
-          prefix_lens,
-          seq_lens,
-          last_loc,
-          free_pages,
-          out_indices,
-          req_to_token,
-          req_pool_indices,
-          prefix_pointers,
-          page_size,
-          queue);
-    }
+    });
   } else {
-    if (page_size == 64) {
-      dispatch_extend_and_write<int64_t, true>(
+    dispatch_page_family(page_size, [&]<int PageShift>() {
+      dispatch_extend_and_write<int64_t, PageShift>(
           prefix_lens,
           seq_lens,
           last_loc,
@@ -427,19 +470,7 @@ void muse_alloc_extend_and_write(
           prefix_pointers,
           page_size,
           queue);
-    } else {
-      dispatch_extend_and_write<int64_t, false>(
-          prefix_lens,
-          seq_lens,
-          last_loc,
-          free_pages,
-          out_indices,
-          req_to_token,
-          req_pool_indices,
-          prefix_pointers,
-          page_size,
-          queue);
-    }
+    });
   }
 }
 
@@ -462,17 +493,13 @@ void muse_alloc_decode(
   }
   auto queue = at::xpu::getCurrentXPUStream().queue();
   if (last_loc.scalar_type() == at::kInt) {
-    if (page_size == 64) {
-      launch_decode<int32_t, true>(seq_lens, last_loc, free_pages, out_indices, page_size, queue);
-    } else {
-      launch_decode<int32_t, false>(seq_lens, last_loc, free_pages, out_indices, page_size, queue);
-    }
+    dispatch_page_family(page_size, [&]<int PageShift>() {
+      launch_decode<int32_t, PageShift>(seq_lens, last_loc, free_pages, out_indices, page_size, queue);
+    });
   } else {
-    if (page_size == 64) {
-      launch_decode<int64_t, true>(seq_lens, last_loc, free_pages, out_indices, page_size, queue);
-    } else {
-      launch_decode<int64_t, false>(seq_lens, last_loc, free_pages, out_indices, page_size, queue);
-    }
+    dispatch_page_family(page_size, [&]<int PageShift>() {
+      launch_decode<int64_t, PageShift>(seq_lens, last_loc, free_pages, out_indices, page_size, queue);
+    });
   }
 }
 
