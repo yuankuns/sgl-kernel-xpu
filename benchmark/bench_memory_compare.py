@@ -13,6 +13,12 @@ import tempfile
 from pathlib import Path
 from statistics import median
 
+serving_scope_parser = argparse.ArgumentParser(add_help=False)
+serving_scope_parser.add_argument("--batch", type=int, default=8)
+serving_scope, _ = serving_scope_parser.parse_known_args()
+if serving_scope.batch != 8:
+    serving_scope_parser.error("Muse-Spark serving benchmarks require --batch 8")
+
 import torch
 import triton
 
@@ -45,7 +51,9 @@ def main_memory_ops():
         modules = {}
         for filename in ("allocator.py", "common.py"):
             path = Path(source) / filename
-            spec = importlib.util.spec_from_file_location(f"sglang_memory_bench_{filename[:-3]}", path)
+            spec = importlib.util.spec_from_file_location(
+                f"sglang_memory_bench_{filename[:-3]}", path
+            )
             module = importlib.util.module_from_spec(spec)
             spec.loader.exec_module(module)
             modules[filename] = module
@@ -54,7 +62,10 @@ def main_memory_ops():
             modules["allocator.py"].alloc_decode_kernel,
             modules["common.py"].write_req_to_token_pool_triton,
         )
-    from sglang.kernels.ops.memory.allocator import alloc_decode_kernel, alloc_extend_kernel
+    from sglang.kernels.ops.memory.allocator import (
+        alloc_decode_kernel,
+        alloc_extend_kernel,
+    )
     from sglang.kernels.ops.memory.common import write_req_to_token_pool_triton
 
     return alloc_extend_kernel, alloc_decode_kernel, write_req_to_token_pool_triton
@@ -66,7 +77,10 @@ def profile_pair(name, shape, old, new, old_kernels, new_kernel, samples):
         new()
     torch.xpu.synchronize()
     with torch.profiler.profile(
-        activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.XPU]
+        activities=[
+            torch.profiler.ProfilerActivity.CPU,
+            torch.profiler.ProfilerActivity.XPU,
+        ]
     ) as profiler:
         for iteration in range(samples):
             if iteration % 2:
@@ -130,7 +144,10 @@ def profile_main(name, shape, old, old_kernels, samples):
         old()
     torch.xpu.synchronize()
     with torch.profiler.profile(
-        activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.XPU]
+        activities=[
+            torch.profiler.ProfilerActivity.CPU,
+            torch.profiler.ProfilerActivity.XPU,
+        ]
     ) as profiler:
         for _ in range(samples):
             old()
@@ -149,67 +166,119 @@ def profile_main(name, shape, old, old_kernels, samples):
     }
     for needle, values in durations.items():
         if len(values) != samples:
-            raise RuntimeError(f"{name} {shape}: expected {samples} kernels for {needle}, got {len(values)}")
-    old_us = [sum(durations[needle][index] for needle in old_kernels) for index in range(samples)]
+            raise RuntimeError(
+                f"{name} {shape}: expected {samples} kernels for {needle}, got {len(values)}"
+            )
+    old_us = [
+        sum(durations[needle][index] for needle in old_kernels)
+        for index in range(samples)
+    ]
     print(
-        json.dumps({
-            "case": name,
-            **shape,
-            "samples": samples,
-            "timing": "torch.profiler XPU kernel event duration",
-            "main_samples_us": old_us,
-            "main_us": {
-                "p20": quantile(old_us, 0.2),
-                "p50": median(old_us),
-                "p80": quantile(old_us, 0.8),
-                "min": min(old_us),
-                "max": max(old_us),
-            },
-        }),
+        json.dumps(
+            {
+                "case": name,
+                **shape,
+                "samples": samples,
+                "timing": "torch.profiler XPU kernel event duration",
+                "main_samples_us": old_us,
+                "main_us": {
+                    "p20": quantile(old_us, 0.2),
+                    "p50": median(old_us),
+                    "p80": quantile(old_us, 0.8),
+                    "min": min(old_us),
+                    "max": max(old_us),
+                },
+            }
+        ),
         flush=True,
     )
     torch.xpu.synchronize()
 
 
-def compare_extend(batch, prefix_len, extend_len, page_size, samples, fused, main_only=False):
+def compare_extend(
+    batch, prefix_len, extend_len, page_size, samples, fused, main_only=False
+):
     alloc_extend_kernel, _, write_req_to_token_pool_triton = main_memory_ops()
 
     prefix = torch.full((batch,), prefix_len, dtype=torch.int64, device="xpu")
     seq = torch.full((batch,), prefix_len + extend_len, dtype=torch.int64, device="xpu")
     extensions = torch.full((batch,), extend_len, dtype=torch.int64, device="xpu")
     last = torch.full((batch,), prefix_len - 1, dtype=torch.int32, device="xpu")
-    free_pages = torch.arange(1, batch * ((extend_len + page_size - 1) // page_size) + 2, dtype=torch.int64, device="xpu")
+    free_pages = torch.arange(
+        1,
+        batch * ((extend_len + page_size - 1) // page_size) + 2,
+        dtype=torch.int64,
+        device="xpu",
+    )
     old_out = torch.empty(batch * extend_len, dtype=torch.int64, device="xpu")
     new_out = torch.empty_like(old_out)
     shape = {
-        "batch": batch, "prefix_len": prefix_len, "extend_len": extend_len,
-        "page_size": page_size, "last_dtype": "int32",
+        "batch": batch,
+        "prefix_len": prefix_len,
+        "extend_len": extend_len,
+        "page_size": page_size,
+        "last_dtype": "int32",
     }
     if fused:
-        old_pool = torch.empty((batch, prefix_len + extend_len), dtype=torch.int32, device="xpu")
+        old_pool = torch.empty(
+            (batch, prefix_len + extend_len), dtype=torch.int32, device="xpu"
+        )
         new_pool = torch.empty_like(old_pool)
         req_indices = torch.arange(batch, dtype=torch.int64, device="xpu")
-        prefix_values = torch.arange(max(1, batch * prefix_len), dtype=torch.int64, device="xpu")
+        prefix_values = torch.arange(
+            max(1, batch * prefix_len), dtype=torch.int64, device="xpu"
+        )
         pointers = torch.tensor(
-            [prefix_values.data_ptr() + index * prefix_len * 8 for index in range(batch)],
-            dtype=torch.uint64, device="xpu",
+            [
+                prefix_values.data_ptr() + index * prefix_len * 8
+                for index in range(batch)
+            ],
+            dtype=torch.uint64,
+            device="xpu",
         )
 
         def old():
             alloc_extend_kernel[(batch,)](
-                prefix, seq, last, free_pages, old_out, triton.next_power_of_2(batch), page_size
+                prefix,
+                seq,
+                last,
+                free_pages,
+                old_out,
+                triton.next_power_of_2(batch),
+                page_size,
             )
             write_req_to_token_pool_triton[(batch,)](
-                old_pool, req_indices, pointers, prefix, seq, extensions, old_out, old_pool.stride(0)
+                old_pool,
+                req_indices,
+                pointers,
+                prefix,
+                seq,
+                extensions,
+                old_out,
+                old_pool.stride(0),
             )
 
         def new():
             torch.ops.sgl_kernel.paged_alloc_extend_and_write(
-                prefix, seq, last, free_pages, new_out, new_pool, req_indices, pointers, page_size
+                prefix,
+                seq,
+                last,
+                free_pages,
+                new_out,
+                new_pool,
+                req_indices,
+                pointers,
+                page_size,
             )
 
         if main_only:
-            profile_main("fused", shape, old, ("alloc_extend_kernel", "write_req_to_token_pool_triton"), samples)
+            profile_main(
+                "fused",
+                shape,
+                old,
+                ("alloc_extend_kernel", "write_req_to_token_pool_triton"),
+                samples,
+            )
             return
         old()
         new()
@@ -221,7 +290,13 @@ def compare_extend(batch, prefix_len, extend_len, page_size, samples, fused, mai
 
         def old():
             alloc_extend_kernel[(batch,)](
-                prefix, seq, last, free_pages, old_out, triton.next_power_of_2(batch), page_size
+                prefix,
+                seq,
+                last,
+                free_pages,
+                old_out,
+                triton.next_power_of_2(batch),
+                page_size,
             )
 
         def new():
@@ -238,14 +313,26 @@ def compare_extend(batch, prefix_len, extend_len, page_size, samples, fused, mai
         old_kernels = ("alloc_extend_kernel",)
         new_kernel = "PagedAllocExtendKernel"
     torch.testing.assert_close(new_out.cpu(), old_out.cpu(), rtol=0, atol=0)
-    profile_pair("fused" if fused else "extend", shape, old, new, old_kernels, new_kernel, samples)
+    profile_pair(
+        "fused" if fused else "extend",
+        shape,
+        old,
+        new,
+        old_kernels,
+        new_kernel,
+        samples,
+    )
 
 
 def compare_decode(samples, main_only=False):
     _, alloc_decode_kernel, _ = main_memory_ops()
 
     batch, page_size = 8, 64
-    seq = torch.tensor([4096, 4097, 4098, 4104, 4112, 4096, 4100, 4111], dtype=torch.int64, device="xpu")
+    seq = torch.tensor(
+        [4096, 4097, 4098, 4104, 4112, 4096, 4100, 4111],
+        dtype=torch.int64,
+        device="xpu",
+    )
     last = torch.arange(batch, dtype=torch.int32, device="xpu") + 4095
     free_pages = torch.arange(1, 16, dtype=torch.int64, device="xpu")
     old_out = torch.empty(batch, dtype=torch.int64, device="xpu")
@@ -255,7 +342,9 @@ def compare_decode(samples, main_only=False):
         alloc_decode_kernel[(batch,)](seq, last, free_pages, old_out, batch, page_size)
 
     def new():
-        torch.ops.sgl_kernel.paged_alloc_decode(seq, last, free_pages, new_out, page_size)
+        torch.ops.sgl_kernel.paged_alloc_decode(
+            seq, last, free_pages, new_out, page_size
+        )
 
     if main_only:
         profile_main(
@@ -288,10 +377,13 @@ def compare_write(samples, prefix_len, extend_len, main_only=False):
     old_pool = torch.empty((batch, seq_len), dtype=torch.int32, device="xpu")
     new_pool = torch.empty_like(old_pool)
     req_indices = torch.arange(batch, dtype=torch.int64, device="xpu")
-    prefix_values = torch.arange(max(1, batch * prefix_len), dtype=torch.int64, device="xpu")
+    prefix_values = torch.arange(
+        max(1, batch * prefix_len), dtype=torch.int64, device="xpu"
+    )
     pointers = torch.tensor(
         [prefix_values.data_ptr() + index * prefix_len * 8 for index in range(batch)],
-        dtype=torch.uint64, device="xpu",
+        dtype=torch.uint64,
+        device="xpu",
     )
     prefix = torch.full((batch,), prefix_len, dtype=torch.int64, device="xpu")
     seq = torch.full((batch,), seq_len, dtype=torch.int64, device="xpu")
@@ -300,7 +392,14 @@ def compare_write(samples, prefix_len, extend_len, main_only=False):
 
     def old():
         write_req_to_token_pool_triton[(batch,)](
-            old_pool, req_indices, pointers, prefix, seq, extensions, cache_loc, old_pool.stride(0)
+            old_pool,
+            req_indices,
+            pointers,
+            prefix,
+            seq,
+            extensions,
+            cache_loc,
+            old_pool.stride(0),
         )
 
     def new():
@@ -311,8 +410,14 @@ def compare_write(samples, prefix_len, extend_len, main_only=False):
     if main_only:
         profile_main(
             "write",
-            {"batch": batch, "prefix_len": prefix_len, "extend_len": extend_len,
-             "seq_len": seq_len, "pool_dtype": "int32", "cache_loc_dtype": "int64"},
+            {
+                "batch": batch,
+                "prefix_len": prefix_len,
+                "extend_len": extend_len,
+                "seq_len": seq_len,
+                "pool_dtype": "int32",
+                "cache_loc_dtype": "int64",
+            },
             old,
             ("write_req_to_token_pool_triton",),
             samples,
@@ -324,8 +429,14 @@ def compare_write(samples, prefix_len, extend_len, main_only=False):
     torch.testing.assert_close(new_pool.cpu(), old_pool.cpu(), rtol=0, atol=0)
     profile_pair(
         "write",
-        {"batch": batch, "prefix_len": prefix_len, "extend_len": extend_len,
-         "seq_len": seq_len, "pool_dtype": "int32", "cache_loc_dtype": "int64"},
+        {
+            "batch": batch,
+            "prefix_len": prefix_len,
+            "extend_len": extend_len,
+            "seq_len": seq_len,
+            "pool_dtype": "int32",
+            "cache_loc_dtype": "int64",
+        },
         old,
         new,
         ("write_req_to_token_pool_triton",),
@@ -348,20 +459,28 @@ def main():
     parser.add_argument("--prefix-lengths", nargs="+", type=int, default=(0, 4096))
     parser.add_argument("--main-only", action="store_true")
     parser.add_argument(
-        "--cases", nargs="+", choices=("decode", "extend", "write", "fused"), default=("decode", "extend", "write", "fused")
+        "--cases",
+        nargs="+",
+        choices=("decode", "extend", "write", "fused"),
+        default=("decode", "extend", "write", "fused"),
     )
     args = parser.parse_args()
-    if (args.samples < 1 or args.batch < 1 or
-            any(x < 1 for x in (*args.lengths, *args.page_sizes)) or
-            any(x < 0 for x in args.prefix_lengths)):
+    if (
+        args.samples < 1
+        or args.batch < 1
+        or any(x < 1 for x in (*args.lengths, *args.page_sizes))
+        or any(x < 0 for x in args.prefix_lengths)
+    ):
         parser.error("samples, batch, lengths and page sizes must be positive")
     print(
-        json.dumps({
-            "torch": torch.__version__,
-            "device": torch.xpu.get_device_name(0),
-            "main_source": str(memory_setup.memory_source or "installed sglang"),
-            "serving_scope": {"batch": 8, "isl": 4096, "osl": 16, "tp": 1, "ep": 1},
-        }),
+        json.dumps(
+            {
+                "torch": torch.__version__,
+                "device": torch.xpu.get_device_name(0),
+                "main_source": str(memory_setup.memory_source or "installed sglang"),
+                "serving_scope": {"batch": 8, "isl": 4096, "osl": 16, "tp": 1, "ep": 1},
+            }
+        ),
         flush=True,
     )
     if "decode" in args.cases:
@@ -373,9 +492,25 @@ def main():
         for prefix_len in args.prefix_lengths:
             for extend_len in args.lengths:
                 if "extend" in args.cases:
-                    compare_extend(args.batch, prefix_len, extend_len, page_size, args.samples, False, args.main_only)
+                    compare_extend(
+                        args.batch,
+                        prefix_len,
+                        extend_len,
+                        page_size,
+                        args.samples,
+                        False,
+                        args.main_only,
+                    )
                 if "fused" in args.cases:
-                    compare_extend(args.batch, prefix_len, extend_len, page_size, args.samples, True, args.main_only)
+                    compare_extend(
+                        args.batch,
+                        prefix_len,
+                        extend_len,
+                        page_size,
+                        args.samples,
+                        True,
+                        args.main_only,
+                    )
 
 
 if __name__ == "__main__":

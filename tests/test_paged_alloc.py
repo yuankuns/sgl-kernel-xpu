@@ -1,6 +1,6 @@
 import pytest
-import torch
 import sgl_kernel  # noqa: F401
+import torch
 
 
 @pytest.mark.parametrize("last_dtype", [torch.int32, torch.int64])
@@ -112,3 +112,60 @@ def test_paged_alloc_extend_and_write_matches_split_with_prefix(page_size, last_
     torch.xpu.synchronize()
     torch.testing.assert_close(fused_out.cpu(), split_out.cpu(), rtol=0, atol=0)
     torch.testing.assert_close(fused_pool.cpu(), split_pool.cpu(), rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("last_dtype", [torch.int32, torch.int64])
+def test_paged_alloc_prefill_and_decode_exact(last_dtype):
+    # Muse serving is B8/ISL4096/OSL16/TP1/EP1; page_size64 is not a batch size.
+    if not torch.xpu.is_available():
+        pytest.skip("XPU unavailable")
+    batch, input_length, output_length, page_size = 8, 4096, 16, 64
+    prefix_lens = torch.zeros(batch, device="xpu", dtype=torch.int64)
+    seq_lens = torch.full_like(prefix_lens, input_length)
+    last = torch.full((batch,), -1, device="xpu", dtype=last_dtype)
+    free_pages = torch.arange(1, batch * input_length // page_size + 1, device="xpu")
+    locations = torch.empty(batch * input_length, device="xpu", dtype=torch.int64)
+    pool = torch.full(
+        (batch, input_length + output_length), -1, device="xpu", dtype=torch.int32
+    )
+    req_indices = torch.arange(batch - 1, -1, -1, device="xpu", dtype=torch.int64)
+    empty_prefix = torch.zeros(1, device="xpu", dtype=torch.int64)
+    pointers = torch.full(
+        (batch,), empty_prefix.data_ptr(), device="xpu", dtype=torch.uint64
+    )
+    torch.ops.sgl_kernel.paged_alloc_extend_and_write(
+        prefix_lens,
+        seq_lens,
+        last,
+        free_pages,
+        locations,
+        pool,
+        req_indices,
+        pointers,
+        page_size,
+    )
+    expected_locations = torch.arange(
+        page_size, page_size + batch * input_length, dtype=torch.int64
+    )
+    torch.testing.assert_close(locations.cpu(), expected_locations, rtol=0, atol=0)
+    expected_pool = torch.full(
+        (batch, input_length + output_length), -1, dtype=torch.int32
+    )
+    expected_pool[:, :input_length] = (
+        expected_locations.reshape(batch, input_length).flip(0).int()
+    )
+    torch.testing.assert_close(pool.cpu(), expected_pool, rtol=0, atol=0)
+
+    last = locations.reshape(batch, input_length)[:, -1].to(last_dtype).contiguous()
+    decode_pages = torch.arange(1000, 1000 + batch, device="xpu", dtype=torch.int64)
+    expected_decode = torch.arange(1000, 1000 + batch, dtype=torch.int64) * page_size
+    decode_locations = torch.empty(batch, device="xpu", dtype=torch.int64)
+    for step in range(output_length):
+        seq_lens.fill_(input_length + step + 1)
+        torch.ops.sgl_kernel.paged_alloc_decode(
+            seq_lens, last, decode_pages, decode_locations, page_size
+        )
+        torch.testing.assert_close(
+            decode_locations.cpu(), expected_decode + step, rtol=0, atol=0
+        )
+        last = decode_locations.to(last_dtype)
