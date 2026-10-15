@@ -1,6 +1,5 @@
 import argparse
 import statistics
-import time
 
 import torch
 from sgl_kernel import (
@@ -100,7 +99,7 @@ def routing_metadata(routed_rows, experts, alignment, rows, device):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Compare Muse MXFP4 index-select and padded-gather quant paths."
+        description="Compare MXFP4 index-select and padded-gather quant paths."
     )
     parser.add_argument(
         "--tokens",
@@ -120,7 +119,6 @@ def main():
     parser.add_argument("--alignment", type=int, default=4)
     parser.add_argument("--warmup", type=int, default=3)
     parser.add_argument("--repeat", type=int, default=10)
-    parser.add_argument("--cooldown", type=float, default=2.0)
     args = parser.parse_args()
     if any(
         value <= 0
@@ -143,8 +141,6 @@ def main():
         parser.error("--hidden must be positive and divisible by 32")
     if args.warmup < 0 or args.repeat <= 0:
         parser.error("--warmup must be nonnegative and --repeat must be positive")
-    if len(args.tokens) > 1 and args.cooldown < 2.0:
-        parser.error("--cooldown must be at least 2 seconds for a shape sweep")
 
     if not torch.xpu.is_available():
         raise RuntimeError("an XPU is required")
@@ -159,7 +155,7 @@ def main():
         f"B={args.serving_batch} ISL={args.isl} OSL={args.osl} TP={args.tp} EP={args.ep}"
     )
 
-    for index, token_count in enumerate(args.tokens):
+    for token_count in args.tokens:
         routed_rows = token_count * args.topk
         rows = routed_rows + (args.alignment - 1) * min(args.experts, routed_rows)
         hidden_states = torch.randn(
@@ -248,8 +244,6 @@ def main():
         del gate_up, hidden_states, row_map_i32, scales_rm
         del padded_counts
         torch.xpu.synchronize()
-        if index + 1 < len(args.tokens):
-            time.sleep(args.cooldown)
 
 
 if __name__ == "__main__":

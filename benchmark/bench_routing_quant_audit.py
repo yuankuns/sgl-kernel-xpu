@@ -3,7 +3,6 @@
 import argparse
 import json
 import statistics
-import time
 
 import torch
 from sgl_kernel import sgl_per_token_group_quant_fp4, silu_and_mul, topk_sigmoid
@@ -110,7 +109,7 @@ def main():
         ),
         flush=True,
     )
-    for i, rows in enumerate(args.shapes):
+    for rows in args.shapes:
         if args.graph_replay > 1:
             torch.manual_seed(7000 + rows)
         source_rows = 32768 if rows >= 32768 * 8 else 8
@@ -295,8 +294,6 @@ def main():
             if args.branch:
                 bench(f"fused_route_tokens{route_tokens}", fused, args.warmup, args.rep)
         torch.xpu.synchronize()
-        if i + 1 < len(args.shapes):
-            time.sleep(2)
 
 
 if __name__ == "__main__":

@@ -1,7 +1,6 @@
-"""Accuracy tests for the fused Muse Spark MoE routing op.
+"""Accuracy tests for fused MoE routing.
 
-The reference mirrors `sglang_meta_common.ops.fused_muse_spark_routing`'s
-`FusedMuseSparkRouting.forward_native`: multiply the router logits by the metap
+The reference follows native routing dtype transitions: multiply logits by the metap
 multiplier, sigmoid, add the fp32 bias for selection only, take the top-k, then
 emit the unbiased scores as `score * route_scale / (sum + eps)`. Padded rows
 carry expert id -1, and the emitted ids pass through the expert-parallel table.
@@ -20,7 +19,7 @@ import utils
 device = utils.get_device()
 
 
-def muse_spark_routing_torch_native(
+def routing_torch_native(
     gating_output: torch.Tensor,
     bias: Optional[torch.Tensor],
     topk: int,
@@ -28,7 +27,7 @@ def muse_spark_routing_torch_native(
     router_output_multiplier: float,
     division_eps: float,
 ):
-    """Mirror FusedMuseSparkRouting.forward_native's dtype transitions."""
+    """Mirror the native routing dtype transitions."""
     logits = gating_output * router_output_multiplier
     scores = torch.sigmoid(logits.float())
     rank_keys = scores if bias is None else scores + bias.unsqueeze(0)
@@ -71,7 +70,7 @@ def check_routing(
         num_valid_tensor,
     )
 
-    _, ref_ids, scores, rank_keys = muse_spark_routing_torch_native(
+    _, ref_ids, scores, rank_keys = routing_torch_native(
         gating_output, bias, topk, route_scale, router_output_multiplier, division_eps
     )
     scores = scores.cpu()
@@ -125,7 +124,7 @@ def check_routing(
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
 @pytest.mark.parametrize("num_tokens", [1, 7, 33, 129, 1024])
 @pytest.mark.parametrize("num_experts", [128, 256])
-def test_muse_spark_moe_routing_production_shape(dtype, num_tokens, num_experts):
+def test_moe_routing_production_shape(dtype, num_tokens, num_experts):
     """256 experts / top-k 8 is the production shape; 128 uses the same path."""
     torch.manual_seed(1024)
     gating_output = torch.randn(num_tokens, num_experts, dtype=dtype, device=device)
@@ -144,7 +143,7 @@ def test_muse_spark_moe_routing_production_shape(dtype, num_tokens, num_experts)
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
 @pytest.mark.parametrize("num_experts", [2, 8, 33, 96, 255])
 @pytest.mark.parametrize("topk", [1, 4, 8])
-def test_muse_spark_moe_routing_generic_shapes(dtype, num_experts, topk):
+def test_moe_routing_generic_shapes(dtype, num_experts, topk):
     """Cover partial subgroup tiles, different top-k values and dtypes."""
     if topk > num_experts:
         pytest.skip("topk must not exceed the expert count")
@@ -162,7 +161,7 @@ def test_muse_spark_moe_routing_generic_shapes(dtype, num_experts, topk):
 
 
 @pytest.mark.parametrize("num_experts", [96, 256])
-def test_muse_spark_moe_routing_no_bias(num_experts):
+def test_moe_routing_no_bias(num_experts):
     torch.manual_seed(11)
     gating_output = torch.randn(9, num_experts, dtype=torch.float32, device=device)
     check_routing(
@@ -177,7 +176,7 @@ def test_muse_spark_moe_routing_no_bias(num_experts):
 
 @pytest.mark.parametrize("num_experts", [96, 256])
 @pytest.mark.parametrize("num_valid", [0, 1, 11])
-def test_muse_spark_moe_routing_padded_rows(num_experts, num_valid):
+def test_moe_routing_padded_rows(num_experts, num_valid):
     """Rows past the device-scalar valid count get id -1 and weight 0."""
     torch.manual_seed(13)
     gating_output = torch.randn(20, num_experts, dtype=torch.float32, device=device)
@@ -195,7 +194,7 @@ def test_muse_spark_moe_routing_padded_rows(num_experts, num_valid):
 
 @pytest.mark.parametrize("num_experts", [48, 256])
 @pytest.mark.parametrize("num_valid", [None, 11])
-def test_muse_spark_moe_routing_local_expert_mapping(num_experts, num_valid):
+def test_moe_routing_local_expert_mapping(num_experts, num_valid):
     """Expert-parallel remap: only the emitted id changes, never the selection."""
     torch.manual_seed(17)
     topk = 8 if num_experts == 256 else 6
@@ -215,7 +214,7 @@ def test_muse_spark_moe_routing_local_expert_mapping(num_experts, num_valid):
     )
 
 
-def test_muse_spark_moe_routing_zero_multiplier():
+def test_moe_routing_zero_multiplier():
     """A zero multiplier makes every sigmoid exactly 0.5, so bias alone ranks."""
     torch.manual_seed(19)
     gating_output = torch.randn(5, 256, dtype=torch.float32, device=device)
@@ -236,7 +235,7 @@ def test_muse_spark_moe_routing_zero_multiplier():
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
 @pytest.mark.parametrize("num_experts", [32, 63, 64, 65, 127, 128, 129, 255, 256])
 @pytest.mark.parametrize("topk", [7, 8])
-def test_muse_spark_moe_routing_equal_scores_choose_lowest(dtype, num_experts, topk):
+def test_moe_routing_equal_scores_choose_lowest(dtype, num_experts, topk):
     """Equal scores select lowest IDs across vector tiles and masked tails."""
     logits = torch.zeros(3, num_experts, dtype=dtype, device=device)
     bias = torch.zeros(num_experts, dtype=torch.float32, device=device)
@@ -259,7 +258,7 @@ def test_muse_spark_moe_routing_equal_scores_choose_lowest(dtype, num_experts, t
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
 @pytest.mark.parametrize("num_experts", [63, 64, 65, 127, 128, 129, 255, 256])
 @pytest.mark.parametrize("topk", [7, 8])
-def test_muse_spark_moe_routing_full_tile_neighbors(dtype, num_experts, topk):
+def test_moe_routing_full_tile_neighbors(dtype, num_experts, topk):
     torch.manual_seed(30000 + num_experts + topk)
     logits = torch.randn(17, num_experts, dtype=dtype, device=device)
     bias = torch.randn(num_experts, dtype=torch.float32, device=device)
@@ -267,7 +266,7 @@ def test_muse_spark_moe_routing_full_tile_neighbors(dtype, num_experts, topk):
 
 
 @pytest.mark.parametrize("num_experts", [128, 256])
-def test_muse_spark_moe_routing_near_topk_boundary(num_experts):
+def test_moe_routing_near_topk_boundary(num_experts):
     """A small biased-score gap must preserve the production expert ID."""
     multiplier = 0.3535533905932738
     logits_cpu = torch.zeros(1, num_experts, dtype=torch.float32)
@@ -277,7 +276,7 @@ def test_muse_spark_moe_routing_near_topk_boundary(num_experts):
     bias_cpu[:7] = torch.linspace(2.0, 1.4, 7)
     bias_cpu[70] = 0.9 - scores[0, 70]
     bias_cpu[71] = 0.9 - 1e-7 - scores[0, 71]
-    _, expected_ids, _, keys = muse_spark_routing_torch_native(
+    _, expected_ids, _, keys = routing_torch_native(
         logits_cpu, bias_cpu, 8, 1.0, multiplier, 1e-15
     )
     assert 0 < keys[0, 70] - keys[0, 71] < 1e-6

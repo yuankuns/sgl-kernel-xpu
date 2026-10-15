@@ -32,7 +32,6 @@
 #include <torch/all.h>
 
 #include <algorithm>
-#include <cstdlib>
 #include <sycl/sycl.hpp>
 
 #include "SYCLHelpers.h"
@@ -46,69 +45,13 @@ constexpr int kWorkGroupSize = 256;
 // Bounds the SLM tile at kTileRows * kMaxGroups bytes (16 KB), i.e. K <= 8192.
 constexpr int kMaxGroups = 256;
 
-// `out` must hold sum(round_up(rows_e, kScaleAlignRows)) rows -- up to
-// kScaleAlignRows - 1 more per expert than `in` provides. An undersized `out` is not
-// a memory-safety problem here (the stores below are clamped), but the rows that get
-// dropped are read by moe_grouped_mm_nt_xe35_mxfp4_w4a4, so catch it at the source.
-// Exact padding validation needs a D2H copy and is opt-in via
-// SGL_KERNEL_MXFP4_CHECK_ROW_COUNTS=1. The normal path keeps the row-alignment
-// contract without draining the stream (which would break graph capture).
-bool row_count_checks_enabled() {
-  const char* v = std::getenv("SGL_KERNEL_MXFP4_CHECK_ROW_COUNTS");
-  return v != nullptr && v[0] == '1' && v[1] == '\0';
-}
-
-// The row counts live on the device, so this costs one num_experts-element D2H copy
-// and therefore a queue drain; keep it out of any inner loop.
-void check_out_rows(const torch::Tensor& rows_per_expert, int64_t out_rows, int64_t in_rows) {
+void check_out_rows(int64_t out_rows, int64_t in_rows) {
   TORCH_CHECK(
       out_rows >= in_rows,
       "mxfp4_moe_scale_to_mn_major: out must have at least as many rows as the ",
       in_rows,
       "-row surface it is built from (padding only grows it), got ",
       out_rows);
-
-  // The row-count check below is opt-in because reading device counts on the host is
-  // not free of side effects in this op's callers:
-  //   * a D2H copy is not recordable into an XPU graph -- the level-zero backend
-  //     rejects it with UR_RESULT_ERROR_UNSUPPORTED_FEATURE, and since every Muse-Spark
-  //     layer is MoE that makes every decode graph uncapturable; and
-  //   * the drain it implies waits on whatever the stream already holds, which in a
-  //     TP-parallel model includes not-yet-matched all-reduces, so ranks draining here
-  //     while a peer waits in its all-reduce deadlock.
-  // The shape-only check above is free and always runs.
-  if (!row_count_checks_enabled()) {
-    return;
-  }
-
-  const auto rows_cpu = rows_per_expert.to(at::kCPU).contiguous();
-  const int32_t* rows = rows_cpu.data_ptr<int32_t>();
-  int64_t total = 0;
-  int64_t padded_total = 0;
-  for (int64_t e = 0; e < rows_cpu.numel(); ++e) {
-    TORCH_CHECK(rows[e] >= 0, "mxfp4_moe_scale_to_mn_major: rows_per_expert[", e, "] is negative (", rows[e], ")");
-    total += rows[e];
-    padded_total += (rows[e] + kScaleAlignRows - 1) / kScaleAlignRows * kScaleAlignRows;
-  }
-  TORCH_CHECK(
-      total <= in_rows,
-      "mxfp4_moe_scale_to_mn_major: rows_per_expert sums to ",
-      total,
-      " rows but in only has ",
-      in_rows);
-  TORCH_CHECK(
-      padded_total <= out_rows,
-      "mxfp4_moe_scale_to_mn_major: out needs sum(round_up(rows_e, ",
-      kScaleAlignRows,
-      ")) = ",
-      padded_total,
-      " rows for these row counts (sum(rows_e) = ",
-      total,
-      "), but it has only ",
-      out_rows,
-      ". Pad every expert's row block to a multiple of ",
-      kScaleAlignRows,
-      ", or size out for the padding");
 }
 
 template <bool VEC4>
@@ -336,7 +279,7 @@ void mxfp4_moe_scale_to_mn_major(torch::Tensor& out, const torch::Tensor& in, co
       rows_per_expert.dim() == 1 && rows_per_expert.scalar_type() == at::kInt,
       "mxfp4_moe_scale_to_mn_major: rows_per_expert must be a 1D int32 tensor");
   TORCH_CHECK(rows_per_expert.is_contiguous(), "mxfp4_moe_scale_to_mn_major: rows_per_expert must be contiguous");
-  check_out_rows(rows_per_expert, out.size(0), in.size(0));
+  check_out_rows(out.size(0), in.size(0));
   // e8m0 scales are carried either as uint8 or as the typed view.
   auto is_e8m0 = [](const torch::Tensor& t) {
     return t.scalar_type() == at::kByte || t.scalar_type() == at::kFloat8_e8m0fnu;

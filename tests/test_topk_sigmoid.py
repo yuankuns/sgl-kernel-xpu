@@ -108,7 +108,7 @@ def test_topk_sigmoid(
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("n_token", [1, 7, 9, 17, 33, 129, 512, 2048, 4096])
 @pytest.mark.parametrize("n_expert", [32, 64, 128, 256])
-def test_muse_spark_topk8_fast_path(dtype, n_token, n_expert):
+def test_topk8_fast_path(dtype, n_token, n_expert):
     """Check all full subgroup vector tiles, allowing equal-score ID ties."""
     torch.manual_seed(20260916 + n_token + n_expert)
     gating_output = torch.empty(n_token, n_expert, dtype=dtype, device=device).uniform_(
@@ -152,7 +152,7 @@ def test_muse_spark_topk8_fast_path(dtype, n_token, n_expert):
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("n_expert", [32, 64, 128, 256])
-def test_muse_spark_topk8_ties_choose_lowest_expert(dtype, n_expert):
+def test_topk8_ties_choose_lowest_expert(dtype, n_expert):
     gating_output = torch.zeros(9, n_expert, dtype=dtype, device=device)
     correction_bias = torch.zeros(n_expert, dtype=torch.float32, device=device)
     actual_weights = torch.empty(9, 8, dtype=torch.float32, device=device)
