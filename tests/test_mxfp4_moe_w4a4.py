@@ -18,7 +18,9 @@ Layout contract under test (see src/sycl/xe35/moe_grouped_mm_mxfp4_w4a4.cpp):
 This extends the existing MXFP4 grouped GEMM coverage with the W4A4 path.
 """
 
+import importlib.util
 import math
+import pathlib
 
 import pytest
 import torch
@@ -29,6 +31,89 @@ from mxfp4_utils import MXFP4_BLOCK_SIZE, dequantize_mxfp4_2d, quantize_mxfp4_2d
 
 SCALE_ALIGN_ROWS = 4
 PTR_ALIGN_BYTES = 64
+
+
+def load_accuracy_reference():
+    source = (
+        pathlib.Path(__file__).resolve().parents[1] / "benchmark/accuracy_reference.py"
+    )
+    specification = importlib.util.spec_from_file_location(
+        "mxfp4_accuracy_reference", source
+    )
+    module = importlib.util.module_from_spec(specification)
+    specification.loader.exec_module(module)
+    return module
+
+
+def test_accuracy_gate_rejects_corrupt_zero():
+    with pytest.raises(AssertionError):
+        load_accuracy_reference().verify_grouped_output(
+            torch.ones(1, 32),
+            torch.zeros(1, 64, dtype=torch.uint8),
+            torch.full((4, 4), 127, dtype=torch.uint8),
+            torch.zeros(1, 32, 64, dtype=torch.uint8),
+            torch.full((1, 4, 32), 127, dtype=torch.uint8),
+            [1],
+        )
+
+
+@pytest.mark.long_test
+@pytest.mark.parametrize(
+    "allocated_rows,n",
+    [
+        (256, 8192),  # Muse B8 topk8 compressed gate/up: K4096, N8192.
+        (257, 4096),  # Generic allocated-row tail, not a serving batch.
+        (262144, 4096),  # Muse B8 ISL4096 topk8 prefill compressed down projection.
+    ],
+)
+def test_grouped_gemm_production_and_tails(allocated_rows, n):
+    if not is_cri_device():
+        pytest.skip("MXFP4 W4A4 requires Xe3.5 capability")
+    from sgl_kernel import moe_grouped_mm_nt_xe35_mxfp4_w4a4
+
+    torch.manual_seed(42)
+    experts, k = 256, 4096
+    if allocated_rows <= 257:
+        counts = [0] * experts
+        for expert in torch.randperm(experts)[: 8 * 8].tolist():
+            counts[expert] = 4
+    else:
+        counts = [allocated_rows // experts] * experts
+    rows = torch.tensor(counts, dtype=torch.int32, device="xpu")
+    activations = torch.randint(
+        0, 256, (allocated_rows, k // 2), dtype=torch.uint8, device="xpu"
+    )
+    weights = torch.randint(
+        0, 256, (experts, n, k // 2), dtype=torch.uint8, device="xpu"
+    )
+    activation_scales = torch.randint(
+        124, 130, (allocated_rows, k // 32), dtype=torch.uint8, device="xpu"
+    )
+    weight_scales = torch.randint(
+        124, 130, (experts, k // 32, n), dtype=torch.uint8, device="xpu"
+    )
+    output = torch.empty((allocated_rows, n), dtype=torch.bfloat16, device="xpu")
+    moe_grouped_mm_nt_xe35_mxfp4_w4a4(
+        output,
+        activations,
+        activation_scales,
+        weights,
+        weight_scales,
+        rows,
+        n,
+        k,
+        experts,
+    )
+    torch.xpu.synchronize()
+    load_accuracy_reference().verify_grouped_output(
+        output,
+        activations,
+        activation_scales,
+        weights,
+        weight_scales,
+        counts,
+        max_rows=4,
+    )
 
 
 def is_xpu_available() -> bool:
@@ -162,10 +247,7 @@ def assert_moe_close(got: torch.Tensor, want: torch.Tensor):
     assert got.shape == want.shape, f"{got.shape} vs {want.shape}"
     assert not torch.isnan(got).any(), "kernel produced NaN"
     assert not torch.isinf(got).any(), "kernel produced Inf"
-    # The kernel accumulates in fp32 and rounds the result to bfloat16 (8-bit
-    # mantissa), so tie the absolute tolerance to the magnitude of the reference.
-    atol = 0.02 * max(1.0, want.abs().max().item())
-    torch.testing.assert_close(got, want, rtol=2e-2, atol=atol)
+    torch.testing.assert_close(got, want, rtol=5e-3, atol=5e-3)
     if want.abs().max() > 0:
         correlation = torch.corrcoef(torch.stack([got.flatten(), want.flatten()]))[0, 1]
         assert correlation > 0.99, f"correlation too low: {correlation}"
@@ -469,7 +551,6 @@ class TestMoeGroupedMmNtXe35Mxfp4W4A4:
                     [4, 0, 4, 0], dtype=torch.int32, device=device
                 )[::2]
             )
-
 
 
 if __name__ == "__main__":

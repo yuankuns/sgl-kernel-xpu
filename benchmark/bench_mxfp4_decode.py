@@ -6,6 +6,7 @@ import json
 import statistics
 
 import torch
+from accuracy_reference import verify_grouped_output
 from sgl_kernel import is_xe3_arch, moe_grouped_mm_nt_xe35_mxfp4_w4a4
 
 BATCH = 8
@@ -114,6 +115,19 @@ def benchmark_projection(
             experts,
         )
 
+    launch()
+    torch.xpu.synchronize()
+    verify_grouped_output(
+        output,
+        a,
+        a_scale,
+        weights,
+        weight_scales,
+        counts,
+        max_rows=None,
+        atol=5e-3,
+        rtol=5e-2,
+    )
     bytes_per_call = logical_bytes(active_experts, padded_rows, n, k)
     samples = event_samples(launch, warmup, iterations)
     median_ms = statistics.median(samples)
@@ -147,6 +161,7 @@ def benchmark_projection(
 
 def main() -> None:
     parser = argparse.ArgumentParser()
+    parser.add_argument("--serving-batch", type=int, choices=(8,), default=8)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--allocated-rows", type=int, default=UPPER_BOUND_ROWS)
     parser.add_argument("--sweep-rows", type=int)
