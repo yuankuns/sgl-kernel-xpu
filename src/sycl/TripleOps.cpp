@@ -78,12 +78,12 @@ struct op_and_mul_functor {
   int64_t dim;
 };
 
-#define VEC_LAUNCH(KERNEL, N)                                                  \
-  case N: {                                                                    \
-    op_and_mul_functor<T_to, KERNEL<T_to, at::opmath_type<T_from>>, N> kfn = { \
-        .input_ptr = _input, .output_ptr = _out, .num_ = numel, .dim = dim};   \
-    sycl_kernel_submit(num_group* wg_size, wg_size, q, kfn);                   \
-    break;                                                                     \
+#define VEC_LAUNCH(KERNEL, N)                                                \
+  case N: {                                                                  \
+    op_and_mul_functor<T_to, KERNEL<T_to, accscalar_t>, N> kfn = {           \
+        .input_ptr = _input, .output_ptr = _out, .num_ = numel, .dim = dim}; \
+    sycl_kernel_submit(num_group* wg_size, wg_size, q, kfn);                 \
+    break;                                                                   \
   }
 
 template <typename T = float>

@@ -38,6 +38,7 @@ def verify_grouped_output(
     max_rows=8,
 ):
     counts = counts.cpu().tolist() if isinstance(counts, torch.Tensor) else counts
+    tolerance = 1e-3 if output.dtype == torch.float16 else 5e-3
     offset = checked = 0
     maximum_error = 0.0
     for expert, rows in enumerate(counts):
@@ -66,7 +67,7 @@ def verify_grouped_output(
             )
         expected = inputs @ weights.T
         actual = output[indices].float().cpu()
-        torch.testing.assert_close(actual, expected, rtol=5e-3, atol=5e-3)
+        torch.testing.assert_close(actual, expected, rtol=tolerance, atol=tolerance)
         maximum_error = max(maximum_error, (actual - expected).abs().max().item())
         checked += actual.numel()
         offset += rows
@@ -75,8 +76,8 @@ def verify_grouped_output(
         "mode": mode,
         "checked": checked,
         "max_abs": maximum_error,
-        "atol": 5e-3,
-        "rtol": 5e-3,
+        "atol": tolerance,
+        "rtol": tolerance,
     }
     print(json.dumps(report), flush=True)
     return report
