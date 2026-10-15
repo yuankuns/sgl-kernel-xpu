@@ -34,6 +34,7 @@ HOST_OPTIONS="-fPIC -std=c++20 \
 
 "$CXX" \
   -fsycl -fsycl-targets=spir64_gen \
+  -fsycl-max-parallel-link-jobs=1 \
   -fsycl-host-compiler=/usr/bin/x86_64-linux-gnu-g++ \
   "-fsycl-host-compiler-options=$HOST_OPTIONS" \
   -sycl-std=2020 -shared -fPIC -O2 -std=c++20 \

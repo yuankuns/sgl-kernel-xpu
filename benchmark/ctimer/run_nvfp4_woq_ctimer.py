@@ -4,11 +4,15 @@
 import argparse
 import importlib.util
 import pathlib
+import sys
 import sysconfig
 
 import torch
 
 HERE = pathlib.Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE.parent))
+from accuracy_reference import verify_grouped_output
+
 EXTENSION = HERE / f"nvfp4_ctimer_ext{sysconfig.get_config_var('EXT_SUFFIX')}"
 WORKSPACE_BYTES = 128 * 1024 * 1024
 
@@ -27,7 +31,13 @@ def load_extension():
 
 
 def make_inputs(
-    ext, groups: int, m: int, n: int, k: int, suite: str, randomize: bool = False,
+    ext,
+    groups: int,
+    m: int,
+    n: int,
+    k: int,
+    suite: str,
+    randomize: bool = False,
     routed_rows: int | None = None,
     match_weights: bool = False,
     shuffle_experts: bool = False,
@@ -83,17 +93,13 @@ def make_inputs(
         else:
             a_mxfp8 = torch.zeros((total_m, k), dtype=torch.float8_e4m3fn, device=dev)
         if match_weights:
-            b_mxfp8 = torch.empty(
-                (groups, n, k), dtype=torch.float8_e4m3fn, device=dev
-            )
+            b_mxfp8 = torch.empty((groups, n, k), dtype=torch.float8_e4m3fn, device=dev)
         elif randomize:
             b_mxfp8 = torch.randint(
                 -4, 5, (groups, n, k), dtype=torch.int8, device=dev
             ).to(torch.float8_e4m3fn)
         else:
-            b_mxfp8 = torch.zeros(
-                (groups, n, k), dtype=torch.float8_e4m3fn, device=dev
-            )
+            b_mxfp8 = torch.zeros((groups, n, k), dtype=torch.float8_e4m3fn, device=dev)
         inputs.update(
             a_mxfp8=a_mxfp8,
             scales_a=scales_a,
@@ -108,9 +114,9 @@ def make_inputs(
         )
         if match_weights:
             lut = torch.tensor(
-                [0, 0.5, 1, 1.5, 2, 3, 4, 6,
-                 -0.0, -0.5, -1, -1.5, -2, -3, -4, -6],
-                dtype=torch.float32, device=dev,
+                [0, 0.5, 1, 1.5, 2, 3, 4, 6, -0.0, -0.5, -1, -1.5, -2, -3, -4, -6],
+                dtype=torch.float32,
+                device=dev,
             )
             # Convert one expert at a time, outside the timed region. Both
             # kernels then multiply the same logical weights.
@@ -125,8 +131,9 @@ def make_inputs(
     if suite in ("bf16", "all"):
         inputs.update(
             a_bf16=(
-                torch.randint(-4, 5, (total_m, k), dtype=torch.int8, device=dev)
-                .to(torch.bfloat16)
+                torch.randint(-4, 5, (total_m, k), dtype=torch.int8, device=dev).to(
+                    torch.bfloat16
+                )
                 if randomize
                 else torch.zeros((total_m, k), dtype=torch.bfloat16, device=dev)
             ),
@@ -134,10 +141,11 @@ def make_inputs(
         )
         if not skip_bf16_copy:
             inputs["b_bf16"] = (
-                torch.randint(-4, 5, (groups, n, k), dtype=torch.int8, device=dev)
-                .to(torch.bfloat16)
+                torch.randint(-4, 5, (groups, k, n), dtype=torch.int8, device=dev).to(
+                    torch.bfloat16
+                )
                 if randomize
-                else torch.zeros((groups, n, k), dtype=torch.bfloat16, device=dev)
+                else torch.zeros((groups, k, n), dtype=torch.bfloat16, device=dev)
             )
     torch.xpu.synchronize()
     return inputs
@@ -180,9 +188,9 @@ def verify_bf16_reference(x, groups: int, n: int, k: int):
     if groups * n * k > 1 << 24:
         raise ValueError("--verify-bf16 is for small directed shapes")
     lut = torch.tensor(
-        [0, 0.5, 1, 1.5, 2, 3, 4, 6,
-         -0.0, -0.5, -1, -1.5, -2, -3, -4, -6],
-        dtype=torch.float32, device="xpu",
+        [0, 0.5, 1, 1.5, 2, 3, 4, 6, -0.0, -0.5, -1, -1.5, -2, -3, -4, -6],
+        dtype=torch.float32,
+        device="xpu",
     )
     total_rows = x["a_bf16"].size(0)
     counts = x["problem_sizes"][:, 0].cpu().tolist()
@@ -193,8 +201,8 @@ def verify_bf16_reference(x, groups: int, n: int, k: int):
         packed = x["b_nvfp4"][expert]
         codes = torch.stack((packed & 15, packed >> 4), dim=-1)
         weight = lut[codes.reshape(n, k).long()]
-        reference = x["a_bf16"][offset:offset + rows].float() @ weight.T
-        actual = x["output"][offset:offset + rows]
+        reference = x["a_bf16"][offset : offset + rows].float().cpu() @ weight.cpu().T
+        actual = x["output"][offset : offset + rows].cpu()
         torch.testing.assert_close(actual, reference, rtol=0, atol=0)
         offset += rows
     print(f"bf16_reference exact_match rows={total_rows} E={groups} N={n} K={k}")
@@ -220,6 +228,17 @@ def run_case_once(ext, args, case: str, m: int, n: int, k: int, x):
             args.iterations,
         )
         results.append(("main_mxfp8", mx))
+        torch.xpu.synchronize()
+        verify_grouped_output(
+            x["output_mxfp8"],
+            x["a_mxfp8"],
+            x["b_mxfp8"],
+            None,
+            x["scales_b_mxfp8"],
+            x["rows_per_expert"],
+            "plain_mxfp8",
+            x["scales_a"],
+        )
         woq_mxfp8 = ext.benchmark_nvfp4(
             x["output"],
             x["a_mxfp8"],
@@ -234,12 +253,21 @@ def run_case_once(ext, args, case: str, m: int, n: int, k: int, x):
             args.iterations,
         )
         results.append(("nvfp4_mxfp8", woq_mxfp8))
+        torch.xpu.synchronize()
+        verify_grouped_output(
+            x["output"],
+            x["a_mxfp8"],
+            x["b_nvfp4"],
+            x["c_b"],
+            x["sfmx_b"],
+            x["rows_per_expert"],
+            "mxfp8",
+            x["scales_a"],
+        )
         if args.verify_main:
             torch.xpu.synchronize()
             difference = (x["output"] - x["output_mxfp8"]).abs()
-            mismatches = torch.count_nonzero(
-                x["output"] != x["output_mxfp8"]
-            ).item()
+            mismatches = torch.count_nonzero(x["output"] != x["output_mxfp8"]).item()
             max_abs = difference.max().item()
             print(
                 f"main_equivalence mismatches={mismatches}/{difference.numel()} "
@@ -273,7 +301,27 @@ def run_case_once(ext, args, case: str, m: int, n: int, k: int, x):
         )
         if not args.skip_bf16_copy:
             results.append(("bf16_copy", bf16))
+            torch.xpu.synchronize()
+            verify_grouped_output(
+                x["output_bf16"],
+                x["a_bf16"],
+                x["b_bf16"].transpose(1, 2),
+                None,
+                None,
+                x["rows_per_expert"],
+                "plain_bf16",
+            )
         results.append(("nvfp4_bf16", woq_bf16))
+        torch.xpu.synchronize()
+        verify_grouped_output(
+            x["output"],
+            x["a_bf16"],
+            x["b_nvfp4"],
+            x["c_b"],
+            x["sfmx_b"],
+            x["rows_per_expert"],
+            "bf16",
+        )
         if args.verify_bf16:
             verify_bf16_reference(x, args.groups, n, k)
 
@@ -285,15 +333,22 @@ def run_case_once(ext, args, case: str, m: int, n: int, k: int, x):
         results,
         args.groups,
         (args.routed_rows / args.groups) if args.routed_rows is not None else m,
-        n, k,
+        n,
+        k,
     )
 
 
 def run_case(ext, args, case: str, m: int, n: int, k: int):
     suite = "bf16" if args.only_bf16 else args.suite
     x = make_inputs(
-        ext, args.groups, m, n, k, suite,
-        randomize=args.randomize, routed_rows=args.routed_rows,
+        ext,
+        args.groups,
+        m,
+        n,
+        k,
+        suite,
+        randomize=args.randomize,
+        routed_rows=args.routed_rows,
         match_weights=args.match_weights,
         shuffle_experts=args.shuffle_experts,
         skip_bf16_copy=args.skip_bf16_copy,
@@ -307,30 +362,44 @@ def run_case(ext, args, case: str, m: int, n: int, k: int):
 
 def main():
     parser = argparse.ArgumentParser()
+    parser.add_argument("--serving-batch", type=int, choices=(8,), default=8)
     parser.add_argument("--case", choices=("decode", "prefill", "both"), default="both")
     parser.add_argument("--groups", type=int, default=2)
     parser.add_argument(
-        "--randomize", action="store_true",
+        "--randomize",
+        action="store_true",
+        default=True,
         help="Use nontrivial payloads for memory traffic measurements",
     )
     parser.add_argument(
-        "--match-weights", action="store_true",
+        "--zero-inputs",
+        action="store_false",
+        dest="randomize",
+        help="Synthetic zero-input diagnostic only",
+    )
+    parser.add_argument(
+        "--match-weights",
+        action="store_true",
         help="Expand the same E2M1 weights for the main MXFP8 path before timing",
     )
     parser.add_argument(
-        "--verify-main", action="store_true",
+        "--verify-main",
+        action="store_true",
         help="Assert exact output agreement with main MXFP8 on matched weights",
     )
     parser.add_argument(
-        "--verify-bf16", action="store_true",
+        "--verify-bf16",
+        action="store_true",
         help="Assert exact BF16 WOQ agreement with direct dequantization",
     )
     parser.add_argument(
-        "--routed-rows", type=int,
+        "--routed-rows",
+        type=int,
         help="Total routed rows, including sparse expert counts (Muse B8 is 64)",
     )
     parser.add_argument(
-        "--shuffle-experts", action="store_true",
+        "--shuffle-experts",
+        action="store_true",
         help="Spread sparse routed rows across experts with a fixed seed",
     )
     parser.add_argument("--decode-m", type=int, default=1, help="decode M per group")
@@ -341,7 +410,8 @@ def main():
     parser.add_argument("--iterations", type=int, default=3)
     parser.add_argument("--repeats", type=int, default=1)
     parser.add_argument(
-        "--skip-bf16-copy", action="store_true",
+        "--skip-bf16-copy",
+        action="store_true",
         help="Omit non-equivalent BF16 copy-policy weights to reduce peak memory",
     )
     parser.add_argument(

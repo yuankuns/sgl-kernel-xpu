@@ -26,6 +26,7 @@ import statistics
 from typing import List, Tuple
 
 import torch
+from accuracy_reference import verify_grouped_output
 
 MXFP8_BLOCK_SIZE = 32
 NVFP4_BLOCK_SIZE = 16
@@ -209,6 +210,16 @@ def bench_one(
     flops = 2.0 * m_total * n * k
     res = {"groups": groups, "m_per_group": m_per_group, "n": n, "k": k}
     for name, fn in (("mxfp8", mxfp8_gemm), ("woq", woq_gemm)):
+        fn()
+        torch.xpu.synchronize()
+        if name == "woq":
+            verify_grouped_output(
+                out, a_q, b_fp4, c_b, sfmx_b, [m_per_group] * groups, "mxfp8", a_s
+            )
+        else:
+            verify_grouped_output(
+                out, a_q, b_mx, None, b_smx, [m_per_group] * groups, "plain_mxfp8", a_s
+            )
         us = timeit(fn, num_warmup, num_run)
         res[f"{name}_us"] = us
         res[f"{name}_tflops"] = flops / (us * 1e-6) / 1e12
@@ -280,9 +291,7 @@ def bench_config_projection(
     # Materialize packed weights directly on device to avoid a many-GB FP32
     # host tensor while retaining nontrivial, incompressible payload traffic.
     torch.manual_seed(groups + n + k)
-    b_fp4 = torch.randint(
-        0, 256, (groups, n, k // 2), dtype=torch.uint8, device=device
-    )
+    b_fp4 = torch.randint(0, 256, (groups, n, k // 2), dtype=torch.uint8, device=device)
     sfmx_b = torch.full(
         (groups, k // MXFP8_BLOCK_SIZE, n), UE8M0_BIAS, dtype=torch.uint8, device=device
     )
@@ -298,15 +307,17 @@ def bench_config_projection(
         routed_rows = tokens * topk
         base_rows, extra_rows = divmod(routed_rows, groups)
         generator = torch.Generator().manual_seed(20261015 + routed_rows)
-        extra_experts = set(torch.randperm(groups, generator=generator)[:extra_rows].tolist())
+        extra_experts = set(
+            torch.randperm(groups, generator=generator)[:extra_rows].tolist()
+        )
         counts = [base_rows + int(expert in extra_experts) for expert in range(groups)]
         m_per_group = max(counts)
         total_m = routed_rows
         a_dtype = torch.float8_e4m3fn if compute == "mxfp8" else torch.bfloat16
         torch.manual_seed(total_m + k)
-        a_q = torch.randint(
-            -4, 5, (total_m, k), dtype=torch.int8, device=device
-        ).to(a_dtype)
+        a_q = torch.randint(-4, 5, (total_m, k), dtype=torch.int8, device=device).to(
+            a_dtype
+        )
         a_s = (
             torch.full(
                 (total_m, k // MXFP8_BLOCK_SIZE),
@@ -353,6 +364,9 @@ def bench_config_projection(
                     workspace,
                 )
 
+        grouped_gemm()
+        torch.xpu.synchronize()
+        verify_grouped_output(out, a_q, b_fp4, c_b, sfmx_b, counts, compute, a_s)
         samples_us = timeit_samples(grouped_gemm, num_warmup, num_run)
         us = statistics.median(samples_us)
         metrics = effective_metrics(groups, total_m, n, k, us, compute)
@@ -438,6 +452,7 @@ def bench_from_config(args) -> None:
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--groups", type=int, default=None)
+    ap.add_argument("--serving-batch", type=int, choices=(8,), default=8)
     ap.add_argument("--m", type=int, default=None, help="M per group")
     ap.add_argument("--n", type=int, default=None)
     ap.add_argument("--k", type=int, default=None)
@@ -474,6 +489,10 @@ def main():
             ap.error("--tokens must be a comma-separated list of integers")
         if not token_counts or any(value <= 0 for value in token_counts):
             ap.error("--tokens must contain positive token counts")
+        if any(value not in (8, 8 * 4096) for value in token_counts):
+            ap.error(
+                "Muse config mode requires B8 decode tokens=8 or ISL4096 prefill tokens=32768"
+            )
 
     if not is_cri_device():
         print("NVFP4 WoQ kernels require an Xe3P (CRI) XPU; skipping.")
@@ -497,13 +516,7 @@ def main():
     for index, (groups, m, n, k) in enumerate(shapes):
         if index:
             synchronize_before_shape()
-        try:
-            rows.append(bench_one(groups, m, n, k, args.warmup, args.runs))
-        except Exception as exc:  # noqa: BLE001
-            print(
-                f"groups={groups} m={m} n={n} k={k}: FAILED {type(exc).__name__}: {exc}"
-            )
-            continue
+        rows.append(bench_one(groups, m, n, k, args.warmup, args.runs))
         r = rows[-1]
         print(
             f"groups={r['groups']} m/g={r['m_per_group']} n={r['n']} k={r['k']}  "

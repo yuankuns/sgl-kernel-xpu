@@ -14,6 +14,8 @@ fused kernel *bit-for-bit*, because both then multiply the same E4M3 values by
 the same UE8M0 scales.  Any difference is a layout or race bug, not rounding.
 """
 
+import importlib.util
+import pathlib
 
 import pytest
 import torch
@@ -30,8 +32,109 @@ from nvfp4_utils import (
     quantize_nvfp4,
 )
 
-
 WORKSPACE_BYTES = 64 * 1024 * 1024
+
+
+def load_accuracy_reference():
+    source = (
+        pathlib.Path(__file__).resolve().parents[1] / "benchmark/accuracy_reference.py"
+    )
+    specification = importlib.util.spec_from_file_location(
+        "nvfp4_accuracy_reference", source
+    )
+    module = importlib.util.module_from_spec(specification)
+    specification.loader.exec_module(module)
+    return module
+
+
+def test_accuracy_gate_rejects_corrupt_zero():
+    oracle = load_accuracy_reference()
+    with pytest.raises(AssertionError):
+        oracle.verify_grouped_output(
+            torch.ones(1, 32),
+            torch.ones(1, 64, dtype=torch.bfloat16),
+            torch.zeros(1, 32, 32, dtype=torch.uint8),
+            torch.ones(1, 32, 4, dtype=torch.bfloat16),
+            torch.full((1, 2, 32), 127, dtype=torch.uint8),
+            [1],
+            "bf16",
+        )
+
+
+@pytest.mark.long_test
+@pytest.mark.parametrize("mode", ["bf16", "mxfp8"])
+@pytest.mark.parametrize(
+    "routed_rows,n,k",
+    [
+        (64, 8192, 8192),  # Muse B8 topk8 gate/up: 64 routed rows, hidden K8192.
+        (64, 8192, 4096),  # Muse B8 topk8 down: intermediate K4096, hidden N8192.
+        (65, 8192, 4096),  # Generic routed-row tail, not another serving batch.
+        (262144, 8192, 4096),  # Muse B8 ISL4096 topk8 prefill down projection.
+    ],
+)
+def test_grouped_gemm_production_and_tails(mode, routed_rows, n, k):
+    skip_if_no_cri()
+    from sgl_kernel import nvfp4_woq_bf16_grouped_mm, nvfp4_woq_mxfp8_scaled_grouped_mm
+
+    torch.manual_seed(42)
+    experts = 256
+    base, extra = divmod(routed_rows, experts)
+    counts = [base] * experts
+    for expert in torch.randperm(experts)[:extra].tolist():
+        counts[expert] += 1
+    problem_sizes, offsets = make_grouped_layout(counts, n, k, "xpu")
+    weights = torch.randint(
+        0, 256, (experts, n, k // 2), dtype=torch.uint8, device="xpu"
+    )
+    scales = torch.randint(
+        124, 130, (experts, k // 32, n), dtype=torch.uint8, device="xpu"
+    )
+    multipliers = torch.ones((experts, n, k // 16), dtype=torch.bfloat16, device="xpu")
+    dtype = torch.bfloat16 if mode == "bf16" else torch.float8_e4m3fn
+    activations = torch.randint(
+        -4, 5, (routed_rows, k), dtype=torch.int8, device="xpu"
+    ).to(dtype)
+    activation_scales = None
+    output = torch.empty((routed_rows, n), dtype=torch.float32, device="xpu")
+    workspace = torch.empty((WORKSPACE_BYTES,), dtype=torch.uint8, device="xpu")
+    if mode == "bf16":
+        nvfp4_woq_bf16_grouped_mm(
+            output,
+            activations,
+            weights,
+            scales,
+            multipliers,
+            problem_sizes,
+            offsets,
+            workspace,
+        )
+    else:
+        activation_scales = torch.randint(
+            125, 130, (routed_rows, k // 32), dtype=torch.uint8, device="xpu"
+        )
+        nvfp4_woq_mxfp8_scaled_grouped_mm(
+            output,
+            activations,
+            weights,
+            activation_scales,
+            scales,
+            multipliers,
+            problem_sizes,
+            offsets,
+            workspace,
+        )
+    torch.xpu.synchronize()
+    load_accuracy_reference().verify_grouped_output(
+        output,
+        activations,
+        weights,
+        multipliers,
+        scales,
+        counts,
+        mode,
+        activation_scales,
+        max_rows=3,
+    )
 
 
 @pytest.mark.parametrize(
@@ -384,6 +487,7 @@ def test_fused_woq_matches_host_requantized_mxfp8(ms, n, k):
         )
         row += expert_m
     mismatch_count = (actual != oracle).sum().item()
+    torch.testing.assert_close(actual, direct, rtol=1e-5, atol=1e-6)
     assert torch.equal(actual, oracle), (
         f"fused WoQ != host-requantized MXFP8; max diff "
         f"{(actual - oracle).abs().max().item()}, mismatches {mismatch_count}; "
@@ -693,7 +797,7 @@ def test_bf16_grouped_gemm_matches_direct_dequant(ms, n, k):
             a_cpu[start : start + expert_m].float() @ weights[expert].float().T
         )
         start += expert_m
-    torch.testing.assert_close(out.cpu(), ref, rtol=0.02, atol=0.02)
+    torch.testing.assert_close(out.cpu(), ref, rtol=5e-3, atol=5e-3)
 
 
 def test_unaligned_scale_stride_is_rejected():
@@ -782,8 +886,8 @@ def test_grouped_gemms_reject_cpu_problem_sizes():
 def _moe_reference(a, w1_eff, w2_eff, topk_weights, topk_ids, n_inter, mode):
     """Fused-MoE reference over already-dequantized (emulated) weights.
 
-    Mirrors the kernel path: MXFP8-quantize the activations, SiLU-and-mul in the
-    activation dtype, MXFP8-quantize the intermediate, accumulate in fp32.
+    Mirrors the production BF16 or MXFP8 operand precision, SiLU-and-mul in
+    the activation dtype, and unrounded fp32 output accumulation.
     """
     m, _ = a.shape
     dt = a.dtype
@@ -890,7 +994,4 @@ def test_fused_experts_nvfp4_woq(mode, monkeypatch):
         )
     ref = _moe_reference(a, w1_eff, w2_eff, topk_weights, topk_ids, n_inter, mode)
 
-    rel = ((out.float().cpu() - ref).norm() / ref.norm()).item()
-    # Residual is BF16 output rounding plus accumulation order; the requantization
-    # itself is covered bit-exactly by test_fused_woq_matches_host_requantized_mxfp8.
-    assert rel < 0.02, f"relative error {rel} too large"
+    torch.testing.assert_close(out.float().cpu(), ref, rtol=5e-3, atol=5e-3)

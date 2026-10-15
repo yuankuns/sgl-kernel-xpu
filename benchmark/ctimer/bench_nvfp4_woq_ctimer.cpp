@@ -86,8 +86,8 @@ struct XPUStreamRestore {
 void launch_bf16_reference(
     const torch::Tensor& output, const torch::Tensor& a, const torch::Tensor& b, const torch::Tensor& rows_per_expert) {
   const int groups = static_cast<int>(b.size(0));
-  const int n = static_cast<int>(b.size(1));
-  const int k = static_cast<int>(b.size(2));
+  const int n = static_cast<int>(b.size(2));
+  const int k = static_cast<int>(b.size(1));
   const int avg_m = static_cast<int>(a.size(0) / groups);
   auto& queue = at::xpu::getCurrentXPUStream(a.get_device()).queue();
 
