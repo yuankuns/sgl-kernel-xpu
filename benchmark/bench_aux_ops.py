@@ -1,15 +1,14 @@
-"""Compare Muse Spark memory kernels at B8 shapes."""
+"""Compare memory kernels at Muse Spark B8 shapes."""
 
 import argparse
 import json
-import os
 import tempfile
-import time
 from pathlib import Path
 from statistics import median
 
-import sgl_kernel  # noqa: F401
 import torch
+
+from bench_memory_compare import MEMORY_SETUP_PARSER, main_memory_ops
 
 
 def measure(label, run_triton, run_sycl, old_name, new_name, check, samples, only):
@@ -56,18 +55,11 @@ def measure(label, run_triton, run_sycl, old_name, new_name, check, samples, onl
             f"{label} samples: Triton_min={min(old):.3f} p25={sorted(old)[len(old)//4]:.3f} p75={sorted(old)[3*len(old)//4]:.3f} max={max(old):.3f}; SYCL_min={min(new):.3f} p25={sorted(new)[len(new)//4]:.3f} p75={sorted(new)[3*len(new)//4]:.3f} max={max(new):.3f}",
             flush=True,
         )
-    # Let the card settle before changing to the next production shape.
     torch.xpu.synchronize()
-    time.sleep(2)
 
 
 def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--serving-batch", type=int, default=8)
-    parser.add_argument("--isl", type=int, default=4096)
-    parser.add_argument("--osl", type=int, default=16)
-    parser.add_argument("--tp", type=int, default=1)
-    parser.add_argument("--ep", type=int, default=1)
+    parser = argparse.ArgumentParser(description=__doc__, parents=[MEMORY_SETUP_PARSER])
     parser.add_argument("--samples", type=int, default=30)
     parser.add_argument(
         "--only",
@@ -75,21 +67,7 @@ def main():
         default="all",
     )
     args = parser.parse_args()
-    if (args.serving_batch, args.isl, args.osl, args.tp, args.ep) != (
-        8,
-        4096,
-        16,
-        1,
-        1,
-    ) or os.environ.get("BATCHES", "8") != "8":
-        parser.error("Muse-Spark serving scope requires B=8, ISL=4096, OSL=16, TP1/EP1")
-    from sglang.kernels.ops.memory.allocator import (
-        alloc_decode,
-        alloc_decode_kernel,
-        alloc_extend,
-        alloc_extend_kernel,
-    )
-    from sglang.kernels.ops.memory.common import write_req_to_token_pool_triton
+    alloc_extend_kernel, alloc_decode_kernel, write_req_to_token_pool_triton = main_memory_ops()
 
     device = "xpu"
 
@@ -105,10 +83,10 @@ def main():
     measure(
         "alloc_decode",
         lambda: alloc_decode_kernel[(8,)](seq, last, free_pages, old_out, 8, 64),
-        lambda: alloc_decode(seq, last, free_pages, new_out, 8, 64),
+        lambda: torch.ops.sgl_kernel.paged_alloc_decode(seq, last, free_pages, new_out, 64),
         "alloc_decode_kernel",
-        "MuseAllocDecodeKernel",
-        lambda: torch.testing.assert_close(new_out, old_out),
+        "PagedAllocDecodeKernel",
+        lambda: torch.testing.assert_close(new_out.cpu(), old_out.cpu(), rtol=0, atol=0),
         args.samples,
         args.only,
     )
@@ -123,10 +101,10 @@ def main():
         lambda: alloc_extend_kernel[(7,)](
             prefix, lengths, extend_last, free_pages, old_out, 8, 64
         ),
-        lambda: alloc_extend(prefix, lengths, extend_last, free_pages, new_out, 8, 64),
+        lambda: torch.ops.sgl_kernel.paged_alloc_extend(prefix, lengths, extend_last, free_pages, new_out, 64),
         "alloc_extend_kernel",
-        "MuseAllocExtendKernel",
-        lambda: torch.testing.assert_close(new_out, old_out),
+        "PagedAllocExtendKernel",
+        lambda: torch.testing.assert_close(new_out.cpu(), old_out.cpu(), rtol=0, atol=0),
         args.samples,
         args.only,
     )
@@ -151,7 +129,7 @@ def main():
             out_cache_loc,
             old_pool.stride(0),
         ),
-        lambda: torch.ops.sgl_kernel.muse_write_req_to_token_pool(
+        lambda: torch.ops.sgl_kernel.write_req_to_token_pool(
             new_pool,
             req_indices,
             prefix_pointers,
@@ -161,8 +139,8 @@ def main():
             out_cache_loc,
         ),
         "write_req_to_token_pool_triton",
-        "MuseWriteReqToTokenPoolKernel",
-        lambda: torch.testing.assert_close(new_pool, old_pool),
+        "WriteReqToTokenPoolKernel",
+        lambda: torch.testing.assert_close(new_pool.cpu(), old_pool.cpu(), rtol=0, atol=0),
         args.samples,
         args.only,
     )

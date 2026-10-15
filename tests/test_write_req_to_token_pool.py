@@ -1,13 +1,6 @@
-import time
-
 import pytest
 import torch
 import sgl_kernel  # noqa: F401
-
-
-@pytest.fixture(autouse=True)
-def cool_between_device_shapes():
-    time.sleep(2)
 
 
 def test_write_req_to_token_pool_prefix_and_extension():

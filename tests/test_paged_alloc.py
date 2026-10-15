@@ -1,13 +1,6 @@
-import time
-
 import pytest
 import torch
 import sgl_kernel  # noqa: F401
-
-
-@pytest.fixture(autouse=True)
-def cool_between_device_shapes():
-    time.sleep(2)
 
 
 @pytest.mark.parametrize("last_dtype", [torch.int32, torch.int64])
