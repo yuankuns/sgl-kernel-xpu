@@ -3,12 +3,11 @@
 import argparse
 import importlib
 import json
-import os
 import tempfile
-import time
 from pathlib import Path
 from statistics import median
 
+import sgl_kernel  # noqa: F401
 import torch
 
 
@@ -71,9 +70,8 @@ def main():
     parser.add_argument("--reverse-order", action="store_true")
     parser.add_argument("--prefix-mode", choices=["zero", "staggered"], default="zero")
     args = parser.parse_args()
-    importlib.import_module(os.environ.get("POSITION_EXTENSION_NAME", "sgl_kernel"))
     position_module = importlib.import_module(
-        os.environ.get("POSITION_MAIN_MODULE", "sglang.kernels.ops.attention.position")
+        "sglang.kernels.ops.attention.position"
     )
     compute_position_kernel = position_module.compute_position_kernel
     length_dtype = getattr(torch, args.length_dtype)
@@ -173,7 +171,6 @@ def main():
             flush=True,
         )
         torch.xpu.synchronize()
-        time.sleep(2)
 
 
 if __name__ == "__main__":

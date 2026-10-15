@@ -3,7 +3,7 @@ import sgl_kernel  # noqa: F401
 import torch
 
 
-def test_muse_compute_position_with_prefix():
+def test_compute_position_with_prefix():
     if not torch.xpu.is_available():
         pytest.skip("XPU unavailable")
     seq = torch.tensor([2, 0, 3], device="xpu", dtype=torch.int32)
@@ -19,7 +19,7 @@ def test_muse_compute_position_with_prefix():
     )
 
 
-def test_muse_compute_position_multiple_workgroups_irregular():
+def test_compute_position_multiple_workgroups_irregular():
     if not torch.xpu.is_available():
         pytest.skip("XPU unavailable")
     lengths = torch.tensor([1, 4097, 33], device="xpu", dtype=torch.int64)
@@ -39,7 +39,7 @@ def test_muse_compute_position_multiple_workgroups_irregular():
     )
 
 
-def test_muse_compute_position_multiple_workgroups_no_prefix():
+def test_compute_position_multiple_workgroups_no_prefix():
     if not torch.xpu.is_available():
         pytest.skip("XPU unavailable")
     lengths = torch.tensor([2049, 1], device="xpu", dtype=torch.int32)
@@ -57,7 +57,7 @@ def test_muse_compute_position_multiple_workgroups_no_prefix():
 
 
 @pytest.mark.parametrize("long_request", [4096, 8193])
-def test_muse_compute_position_with_host_max_hint_skew_b8(long_request):
+def test_compute_position_with_host_max_hint_skew_b8(long_request):
     if not torch.xpu.is_available():
         pytest.skip("XPU unavailable")
     lengths = torch.tensor([long_request] + [0] * 7, device="xpu", dtype=torch.int32)
