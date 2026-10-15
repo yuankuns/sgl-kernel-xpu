@@ -1,16 +1,11 @@
 """CRI Muse-Spark B8 FMHA benchmark with production-path event timing."""
 
 import argparse
-import os
 import statistics
-import time
 
 import sgl_kernel  # noqa: F401
 import torch
 from sgl_kernel.flash_attn import flash_attn_with_kvcache
-
-COOLDOWN_SECONDS = 2
-
 
 def make_case(batch: int, seqlen_q: int, seqlen_k: int, window: int, page_size: int):
     device = "xpu"
@@ -76,7 +71,7 @@ def main():
         "decode-b8-global-p64,decode-b8-swa2047-p64",
     )
     args = parser.parse_args()
-    if args.serving_batch != 8 or os.environ.get("BATCHES", "8") != "8":
+    if args.serving_batch != 8:
         parser.error("Muse-Spark serving benchmark requires B=8")
 
     cases = {
@@ -132,12 +127,8 @@ def main():
             f"{name}: median={median_ms:.4f} ms "
             f"min={min(samples):.4f} ms max={max(samples):.4f} ms "
             f"logical_kv={logical_kv_gbps:.1f} GB/s "
-            f"samples={len(samples)} shape_cooldown={COOLDOWN_SECONDS}s"
+            f"samples={len(samples)}"
         )
-        # Shape sweeps must cool between cases. Keep this outside the measured
-        # interval so each case still represents steady-state decode.
-        torch.xpu.synchronize()
-        time.sleep(COOLDOWN_SECONDS)
 
 
 if __name__ == "__main__":

@@ -2,8 +2,6 @@
 
 import argparse
 import json
-import os
-import time
 
 import sgl_kernel  # noqa: F401 - registers the production attention op
 import torch
@@ -20,7 +18,6 @@ def check_tail_shapes():
     for dtype in (torch.bfloat16,):
         for length in (33, 129, 257):
             torch.xpu.synchronize()
-            time.sleep(2)
             torch.manual_seed(42)
             batch = 8
             page, hq, hkv, dim = 64, 128, 16, 64
@@ -86,8 +83,6 @@ def main():
     args = parser.parse_args()
     if args.serving_batch != 8:
         parser.error("Muse-Spark serving workload requires B=8")
-    if os.environ.get("BATCHES", "8") != "8":
-        parser.error("Muse-Spark serving workload requires BATCHES=8")
     if args.warmup_ms < 1 or args.rep_ms < 1:
         parser.error("warmup and repetition time must be positive")
     if torch.xpu.get_device_properties(0).device_id != 0x674F:
@@ -96,7 +91,6 @@ def main():
         check_tail_shapes()
     for requests in (1, 7):
         torch.xpu.synchronize()
-        time.sleep(2)
         torch.manual_seed(42)
         length, page, hq, hkv, dim = 4096, 64, 128, 16, 64
         pages = requests * length // page

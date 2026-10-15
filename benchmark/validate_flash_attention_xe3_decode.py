@@ -1,8 +1,6 @@
 #!/usr/bin/env python3
 """Validate the production Muse Spark decode FMHA shapes against FP32."""
 
-import time
-
 import sgl_kernel  # noqa: F401
 import torch
 from sgl_kernel.flash_attn import flash_attn_with_kvcache
@@ -83,7 +81,6 @@ def main():
             f"mean_abs={mean_abs:.6f}"
         )
         torch.xpu.synchronize()
-        time.sleep(2)
 
 
 if __name__ == "__main__":

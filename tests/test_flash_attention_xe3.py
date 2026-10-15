@@ -5,8 +5,6 @@ This covers the Xe3P/Xe35 flash-attention entry via flash_attn_with_kvcache
 and keeps shapes intentionally tiny so it can run on simulator hardware.
 """
 
-import time
-
 import pytest
 import sgl_kernel  # noqa: F401 - registers torch.ops.sgl_kernel.* custom ops
 import torch
@@ -216,7 +214,6 @@ def test_flash_attention_xe3_prefill_local_window_boundary(window_left, page_siz
         out.float().cpu().reshape_as(expected), expected.float(), rtol=2e-2, atol=2e-2
     )
     torch.xpu.synchronize()
-    time.sleep(2)
 
 
 @pytest.mark.skipif(not is_xpu_available(), reason="Intel XPU not available")

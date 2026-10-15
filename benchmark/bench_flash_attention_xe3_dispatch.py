@@ -10,7 +10,6 @@ import argparse
 import json
 import re
 import statistics
-import time
 from dataclasses import dataclass
 
 import sgl_kernel  # noqa: F401 - registers the production attention op
@@ -217,10 +216,7 @@ def main():
     ]
     if not selected:
         parser.error("case filter selected no shapes")
-    for index, case in enumerate(selected):
-        if index:
-            torch.xpu.synchronize()
-            time.sleep(2)
+    for case in selected:
         launch = make_launch(case)
         samples = measure(
             launch,

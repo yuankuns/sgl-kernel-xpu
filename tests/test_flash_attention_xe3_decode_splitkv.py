@@ -11,8 +11,6 @@ single split and the small-slot cases exercise the multi-split merge.
 
 """
 
-import time
-
 import pytest
 import sgl_kernel  # noqa: F401 - registers torch.ops.sgl_kernel.* custom ops
 import torch
@@ -97,18 +95,10 @@ def run_case(
     return out.float().cpu(), ref
 
 
-@pytest.fixture(autouse=True)
-def cool_between_cases():
-    yield
-    if is_xpu_available():
-        torch.xpu.synchronize()
-        time.sleep(2)
-
-
 CASES = [
     # Muse Spark production decode shape: B=8, 4096 prefill + 1 token.
-    pytest.param([4097] * 8, 128, 16, 64, 64, (-1, -1), id="muse-b8-global"),
-    pytest.param([4097] * 8, 128, 16, 64, 64, (2047, 0), id="muse-b8-swa2047"),
+    pytest.param([4097] * 8, 128, 16, 64, 64, (-1, -1), id="b8-global"),
+    pytest.param([4097] * 8, 128, 16, 64, 64, (2047, 0), id="b8-swa2047"),
     # Ragged lengths, tile and page tails, windows that start mid tile.
     pytest.param([1, 63, 64, 65, 129], 128, 16, 64, 64, (-1, -1), id="ragged-global"),
     pytest.param([1, 63, 64, 65, 129], 128, 16, 64, 64, (63, 0), id="ragged-swa63"),
