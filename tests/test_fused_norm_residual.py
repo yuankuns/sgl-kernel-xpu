@@ -1,6 +1,5 @@
 import argparse
 import json
-import os
 import statistics
 import tempfile
 from pathlib import Path
@@ -273,11 +272,6 @@ def benchmark(
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--serving-batch", type=int, default=8)
-    parser.add_argument("--isl", type=int, default=4096)
-    parser.add_argument("--osl", type=int, default=16)
-    parser.add_argument("--tp", type=int, default=1)
-    parser.add_argument("--ep", type=int, default=1)
     parser.add_argument("--rows", type=int, default=32768)
     parser.add_argument("--hidden-size", type=int, default=8192)
     parser.add_argument("--warmup", type=int, default=10)
@@ -290,14 +284,8 @@ if __name__ == "__main__":
         parser.error(
             "rows must be positive and hidden-size must be a positive multiple of 8"
         )
-    if (args.serving_batch, args.isl, args.osl, args.tp, args.ep) != (
-        8,
-        4096,
-        16,
-        1,
-        1,
-    ) or os.environ.get("BATCHES", "8") != "8":
-        parser.error("Muse-Spark serving scope requires B=8, ISL=4096, OSL=16, TP1/EP1")
+    if args.warmup < 0 or args.iterations <= 0:
+        parser.error("warmup must be nonnegative and iterations must be positive")
     benchmark(
         args.rows,
         args.hidden_size,
