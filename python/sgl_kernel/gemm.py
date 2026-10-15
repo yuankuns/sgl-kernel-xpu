@@ -1,22 +1,15 @@
-from functools import lru_cache
 from typing import List, Optional, Tuple
 
 import torch
 from sgl_kernel.utils import _get_cache_buf, get_xpu_stream
 
 
-@lru_cache(maxsize=None)
-def _bf16_gemm_nt_is_profiled_device(index: int) -> bool:
-    return "0x674f" in torch.xpu.get_device_name(index).lower()
-
-
 def _bf16_gemm_nt_use_cute(
     mat_a: torch.Tensor, m: int, n: int, k: int, packed_weight: bool
 ) -> bool:
-    if not _bf16_gemm_nt_is_profiled_device(mat_a.device.index or 0):
-        # Preserve the original native-weight path on devices without paired
-        # crossover measurements.
-        return not packed_weight
+    major, minor = torch.ops.sgl_kernel.query_device.default(mat_a.device.index or 0)
+    if (major, minor) != (3, 5):
+        return False
     if not packed_weight:
         # Paired native-B timings cross sharply at M=8/9. Around 4K, the
         # crossover also follows K tile alignment and weight size; use the
@@ -168,21 +161,14 @@ def pack_bf16_gemm_weight(weight: torch.Tensor) -> torch.Tensor:
     assert weight.is_contiguous()
     n, k = weight.shape
     padded_n = (n + 255) // 256 * 256
-    # Keep device-specific packing choices on the device where they were
-    # measured. Other devices retain the ordinary transposed layout.
-    tuned_device = weight.device.type == "xpu" and _bf16_gemm_nt_is_profiled_device(
-        weight.device.index or 0
-    )
     # Power-of-two row strides from 16K onward show a repeatable packed GEMM
     # throughput cliff on this Xe35 device. One more block avoids it.
-    power_of_two_stride = (
-        tuned_device and padded_n >= 16384 and padded_n & (padded_n - 1) == 0
-    )
+    power_of_two_stride = padded_n >= 16384 and padded_n & (padded_n - 1) == 0
     if power_of_two_stride:
         padded_n += 256
     # For very large weights with an N that is not 32-aligned, writing into a
     # sliced packed tensor is much slower than padding before the transpose.
-    if power_of_two_stride or (tuned_device and n * k >= 1 << 30 and n % 32 != 0):
+    if power_of_two_stride or (n * k >= 1 << 30 and n % 32 != 0):
         return torch.nn.functional.pad(weight, (0, 0, 0, padded_n - n)).T.contiguous()
     # Materialize the transpose before writing into a padded slice. XPU
     # copy_ from a transposed source can leave isolated columns unwritten.

@@ -38,6 +38,7 @@ def measure(graph, calls):
 
 def main():
     parser = argparse.ArgumentParser()
+    parser.add_argument("--serving-batch", type=int, choices=(8,), default=8)
     parser.add_argument("--shape", nargs=2, action="append", type=int, required=True)
     parser.add_argument("--m", nargs="+", type=int, required=True)
     parser.add_argument("--calls", type=int, default=50)
@@ -50,9 +51,7 @@ def main():
         or args.calls <= 0
         or args.repeats <= 0
     ):
-        parser.error(
-            "positive aligned shapes and positive counts are required"
-        )
+        parser.error("positive aligned shapes and positive counts are required")
 
     print(
         f"device={torch.xpu.get_device_name(0)} torch={torch.__version__} "
@@ -86,12 +85,14 @@ def main():
                         packed_out, a, packed_b, 2
                     ),
                 }
-                reference = functions["native_mm"]()
+                reference = torch.mm(a.float().cpu(), b.float().cpu().T)
                 functions["native_cute"]()
                 functions["packed_cute"]()
-                torch.testing.assert_close(native_out, reference, rtol=0.02, atol=0.02)
                 torch.testing.assert_close(
-                    packed_out[:, :n], reference, rtol=0.02, atol=0.02
+                    native_out.float().cpu(), reference, rtol=5e-3, atol=5e-3
+                )
+                torch.testing.assert_close(
+                    packed_out[:, :n].float().cpu(), reference, rtol=5e-3, atol=5e-3
                 )
                 graphs = {
                     name: capture(fn, args.calls) for name, fn in functions.items()

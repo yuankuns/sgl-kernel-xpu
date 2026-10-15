@@ -45,6 +45,7 @@ def force_native_kernel(a, b):
 
 def main():
     parser = argparse.ArgumentParser()
+    parser.add_argument("--serving-batch", type=int, choices=(8,), default=8)
     parser.add_argument(
         # M is the GEMM row count, not the serving batch size.
         "--m",
@@ -75,24 +76,24 @@ def main():
         if index:
             torch.xpu.synchronize()
         a = torch.randn((m, args.k), dtype=torch.bfloat16, device="xpu")
-        reference = torch.mm(a, b.T)
+        reference = torch.mm(a.float().cpu(), b.float().cpu().T)
         torch.testing.assert_close(
-            force_packed_kernel(a, packed_b)[:, : args.n],
+            force_packed_kernel(a, packed_b)[:, : args.n].float().cpu(),
             reference,
-            rtol=0.02,
-            atol=0.02,
+            rtol=5e-3,
+            atol=5e-3,
         )
         torch.testing.assert_close(
-            force_native_kernel(a, b),
+            force_native_kernel(a, b).float().cpu(),
             reference,
-            rtol=0.02,
-            atol=0.02,
+            rtol=5e-3,
+            atol=5e-3,
         )
         torch.testing.assert_close(
-            torch.mm(a, packed_b)[:, : args.n],
+            torch.mm(a, packed_b)[:, : args.n].float().cpu(),
             reference,
-            rtol=0.02,
-            atol=0.02,
+            rtol=5e-3,
+            atol=5e-3,
         )
         reference_ms = measure(
             lambda: torch.mm(a, b.T), args.warmup, args.repeat, args.calls
