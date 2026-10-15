@@ -1,6 +1,7 @@
 """Validate the full Muse B8 prefill launch at batch and tail boundaries."""
 
 import argparse
+import json
 
 import torch
 from sgl_kernel import fused_qk_norm_rope
@@ -22,7 +23,10 @@ def main():
     torch.manual_seed(42)
     tokens = args.tokens
     heads_q, heads_k, heads_v, dim = (
-        args.q_heads, args.k_heads, args.tail_heads, args.head_dim
+        args.q_heads,
+        args.k_heads,
+        args.tail_heads,
+        args.head_dim,
     )
     dtype = torch.bfloat16 if args.dtype == "bf16" else torch.float16
     eps, base = 1e-5, 500000.0
@@ -33,46 +37,14 @@ def main():
         device="xpu:0",
         dtype=dtype,
     )
-    original = qkv.clone()
+    # Muse-Spark B8: T8 decode/T32768 prefill, Q128/K16/D64, gated tail144.
+    original = qkv.cpu()
     q_weight = torch.full((dim,), scale, device="xpu:0", dtype=dtype)
     k_weight = torch.ones(dim, device="xpu:0", dtype=dtype)
     positions = torch.arange(tokens, device="xpu:0", dtype=torch.int32) % 4096
-    boundary_rows = [
-        0,
-        1,
-        4095,
-        4096,
-        8191,
-        8192,
-        16383,
-        16384,
-        tokens // 2 - 1,
-        tokens // 2,
-        tokens - 2,
-        tokens - 1,
-    ]
-    selected = torch.tensor(
-        sorted({row for row in boundary_rows if 0 <= row < tokens}), device="xpu:0"
-    )
-
-    rows = original[selected].reshape(-1, heads_q + heads_k + heads_v, dim).float()
-    q = rows[:, :heads_q]
-    k = rows[:, heads_q : heads_q + heads_k]
-    q = q * torch.rsqrt(q.square().mean(dim=-1, keepdim=True) + eps) * q_weight.float()
-    k = k * torch.rsqrt(k.square().mean(dim=-1, keepdim=True) + eps) * k_weight.float()
     inv_freq = base ** (
-        -torch.arange(0, dim, 2, device="xpu:0", dtype=torch.float32) / dim
+        -torch.arange(0, dim, 2, dtype=torch.float64, device="cpu") / dim
     )
-    theta = positions[selected].float()[:, None] * inv_freq[None, :]
-    cos, sin = theta.cos()[:, None, :], theta.sin()[:, None, :]
-
-    def rotate(x):
-        even, odd = x[..., ::2], x[..., 1::2]
-        return torch.stack(
-            (even * cos - odd * sin, odd * cos + even * sin), dim=-1
-        ).flatten(-2)
-
-    expected = torch.cat((rotate(q), rotate(k)), dim=1).to(dtype)
     fused_qk_norm_rope(
         qkv,
         heads_q,
@@ -88,16 +60,83 @@ def main():
         rotary_dim=dim,
     )
     torch.xpu.synchronize()
-    actual = qkv[selected, : (heads_q + heads_k) * dim].reshape_as(expected)
-    difference = (actual.float() - expected.float()).abs()
-    torch.testing.assert_close(actual, expected, rtol=8e-3, atol=4e-3)
-    assert torch.equal(
-        qkv[:, (heads_q + heads_k) * dim :], original[:, (heads_q + heads_k) * dim :]
+    actual = qkv.cpu()
+    positions_cpu = positions.cpu()
+    tolerance = 5e-3 if dtype == torch.bfloat16 else 1e-3
+    max_abs, sum_abs, elements, violations = 0.0, 0.0, 0, 0
+    error_bins = {bound: 0 for bound in (1e-5, 1e-4, 1e-3, 5e-3, 1e-2, 5e-2)}
+    for start in range(0, tokens, 512):
+        rows = (
+            original[start : start + 512]
+            .reshape(-1, heads_q + heads_k + heads_v, dim)
+            .float()
+        )
+        q, k = rows[:, :heads_q], rows[:, heads_q : heads_q + heads_k]
+        q = (
+            q
+            * torch.rsqrt(q.square().mean(dim=-1, keepdim=True) + eps)
+            * q_weight.float().cpu()
+        )
+        k = (
+            k
+            * torch.rsqrt(k.square().mean(dim=-1, keepdim=True) + eps)
+            * k_weight.float().cpu()
+        )
+        theta = (
+            positions_cpu[start : start + 512].float()[:, None]
+            * inv_freq.float()[None, :]
+        )
+        cos, sin = theta.cos()[:, None, :], theta.sin()[:, None, :]
+
+        def rotate(values):
+            even, odd = values[..., ::2], values[..., 1::2]
+            return torch.stack(
+                (even * cos - odd * sin, odd * cos + even * sin), dim=-1
+            ).flatten(-2)
+
+        expected = torch.cat((rotate(q), rotate(k)), dim=1)
+        got = actual[start : start + 512, : (heads_q + heads_k) * dim].reshape_as(
+            expected
+        )
+        difference = (got.float() - expected.float()).abs()
+        max_abs = max(max_abs, difference.max().item())
+        sum_abs += difference.sum().item()
+        elements += difference.numel()
+        for bound in error_bins:
+            error_bins[bound] += (difference <= bound).sum().item()
+        violations += (
+            (
+                (~torch.isfinite(got))
+                | (~torch.isfinite(expected))
+                | (difference > tolerance + tolerance * expected.float().abs())
+            )
+            .sum()
+            .item()
+        )
+    tail_equal = torch.equal(
+        actual[:, (heads_q + heads_k) * dim :], original[:, (heads_q + heads_k) * dim :]
     )
     print(
-        f"PASS tokens={tokens} {args.dtype} heads={heads_q},{heads_k},{heads_v} "
-        f"dim={dim} rows={selected.tolist()} max_abs={difference.max().item():.6f}"
+        json.dumps(
+            {
+                "tokens": tokens,
+                "dtype": args.dtype,
+                "heads": [heads_q, heads_k, heads_v],
+                "head_dim": dim,
+                "reference": "independent CPU FP32 with FP64 frequency rounded to FP32",
+                "atol": tolerance,
+                "rtol": tolerance,
+                "elements": elements,
+                "max_abs": max_abs,
+                "mean_abs": sum_abs / elements,
+                "error_cumulative_bins": error_bins,
+                "violations": violations,
+                "tail_equal": tail_equal,
+            }
+        ),
+        flush=True,
     )
+    assert violations == 0 and tail_equal
 
 
 if __name__ == "__main__":

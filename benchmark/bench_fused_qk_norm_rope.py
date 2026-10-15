@@ -234,7 +234,10 @@ for batch_size, seq_len, (nq, nk, nv, hd), is_neox, dtype in itertools.product(
 
 parser = argparse.ArgumentParser()
 parser.add_argument(
-    "--production-shapes", "--production-shape", dest="production_shape", action="store_true",
+    "--production-shapes",
+    "--production-shape",
+    dest="production_shape",
+    action="store_true",
     help="MUSE Spark B8/ISL4096/OSL16 TP1/EP1 BF16 QK workload",
 )
 parser.add_argument(
@@ -243,7 +246,10 @@ parser.add_argument(
 parser.add_argument("--num-chunks", type=int, default=1)
 parser.add_argument("--chunk-idx", type=int, default=0)
 parser.add_argument(
-    "--single-config", "--config", dest="config", default="",
+    "--single-config",
+    "--config",
+    dest="config",
+    default="",
     help="batch,seq,nq,nk,nv,head_dim,is_neox,dtype; separate multiple configs with ';'",
 )
 parser.add_argument("--profile", action="store_true")
@@ -252,6 +258,7 @@ if args.num_chunks <= 0 or not 0 <= args.chunk_idx < args.num_chunks:
     parser.error("num-chunks must be positive and 0 <= chunk-idx < num-chunks")
 production_shape = args.production_shape
 if production_shape:
+    # Muse-Spark B8 prefill: T32768, Q128/K16/V16, D64; positions repeat 0..4095.
     configs = [
         (batch_size, seq_len, 128, 16, 16, 64, False, "bf16")
         for batch_size, seq_len in itertools.product([8], [4096])

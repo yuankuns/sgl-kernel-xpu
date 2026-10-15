@@ -1,7 +1,7 @@
 """Device-event timing of repeated QK norm/RoPE XPU graph replay."""
 
-import hashlib
 import argparse
+import hashlib
 import statistics
 from pathlib import Path
 
@@ -28,9 +28,13 @@ def main():
         parser.error("counts must be positive; warmup and tail-heads may be zero")
     torch.manual_seed(42)
     tokens, repeats, samples, warmup = (
-        args.tokens, args.repeats, args.samples, args.warmup
+        args.tokens,
+        args.repeats,
+        args.samples,
+        args.warmup,
     )
     nq, nk, nv, hd = args.q_heads, args.k_heads, args.tail_heads, args.head_dim
+    # Muse-Spark B8 uses T8/T32768, Q128/K16/D64 and gated tail144; other dimensions are generic corners.
     dtype = torch.bfloat16 if args.dtype == "bf16" else torch.float16
     scale = 43.7840518911 / (hd**0.5)
     qkv = torch.randn(tokens, (nq + nk + nv) * hd, device="xpu:0", dtype=dtype)

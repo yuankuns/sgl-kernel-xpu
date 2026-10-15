@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <type_traits>
 
+#include "FusedQKNormRopeFrequency.h"
 #include "MemoryAccess.h"
 #include "SYCLHelpers.h"
 #include "Utils.h"
@@ -59,9 +60,8 @@ inline LaunchConfig choose_launch(int64_t num_tokens, int total_qk_heads, int la
     const bool sparse_row = row_heads >= 2 * total_qk_heads;
     const bool original_split = lanes_per_head == 4 && traffic > kDramTrafficBytes;
     const int64_t row_bytes = static_cast<int64_t>(row_heads) * HeadDim * sizeof(scalar_t);
-    const bool bf16_128d_split =
-        std::is_same_v<scalar_t, sycl::ext::oneapi::bfloat16> && HeadDim == 128 &&
-        row_bytes % kSparseRowAlignmentBytes == 0 && traffic >= kSparseRowSplitBytes;
+    const bool bf16_128d_split = std::is_same_v<scalar_t, sycl::ext::oneapi::bfloat16> && HeadDim == 128 &&
+                                 row_bytes % kSparseRowAlignmentBytes == 0 && traffic >= kSparseRowSplitBytes;
     if (sparse_row && (original_split || bf16_128d_split)) {
       return make_launch(num_tokens, total_qk_heads, lanes_per_head, 192, 1, 2);
     }
@@ -117,7 +117,7 @@ inline bool prefer_baseline(int64_t num_tokens, int total_qk_heads, int lanes_pe
   return subgroups * 4 < wave;
 }
 
-template <typename scalar_t, int HeadDim, bool Interleave>
+template <typename scalar_t, int HeadDim, bool Interleave, bool UseTable>
 struct Kernel {
   static constexpr int kElementsPerLane = kBytesPerLane / sizeof(scalar_t);
   static constexpr int kLanesPerHead = HeadDim / kElementsPerLane;
@@ -143,19 +143,7 @@ struct Kernel {
   int total_qk_heads;
   LaunchConfig config;
   int partner_lanes;
-
-  static float frequency(float base, int rotary_dim, int half_dim, float factor, float low, float high) {
-    float freq = sycl::pow(base, -2.0f * static_cast<float>(half_dim) / static_cast<float>(rotary_dim));
-    if (factor != 1.0f) {
-      const float interpolated = freq / factor;
-      float high_adj = high;
-      if (sycl::fabs(low - high_adj) <= 1e-6f) high_adj += 0.001f;
-      const float linear = (2.0f * static_cast<float>(half_dim) - low) / (high_adj - low);
-      const float ramp = sycl::fmin(sycl::fmax(linear, 0.0f), 1.0f);
-      freq = interpolated * (1.0f - ramp) + freq * ramp;
-    }
-    return freq;
-  }
+  QKRopeFrequencyStorage<HeadDim, UseTable> frequencies;
 
   template <int Delta>
   void rotate_neox(
@@ -200,7 +188,7 @@ struct Kernel {
       const int table_token = std::min(token_group * config.tokens_per_wg + local_table_token, num_tokens - 1);
       const int half_dim = Interleave ? dim / 2 : (dim < half_rotary ? dim : dim - half_rotary);
       const float theta =
-          static_cast<float>(position_ids[table_token]) * frequency(base, rotary_dim, half_dim, factor, low, high);
+          dim < rotary_dim ? static_cast<float>(position_ids[table_token]) * frequencies[half_dim] : 0.0f;
       table[local_table_token * 2 * HeadDim + dim] = sycl::sin(theta);
       table[local_table_token * 2 * HeadDim + HeadDim + dim] = sycl::cos(theta);
     }
@@ -331,28 +319,36 @@ void launch(
     float attention_factor,
     int rotary_dim,
     sycl::queue& queue) {
-  constexpr int lanes = Kernel<scalar_t, HeadDim, Interleave>::kLanesPerHead;
+  constexpr int lanes = Kernel<scalar_t, HeadDim, Interleave, true>::kLanesPerHead;
   const LaunchConfig config = choose_launch<scalar_t, HeadDim, Interleave>(
       num_tokens, num_heads_q + num_heads_k, lanes, num_heads_q + num_heads_k + num_heads_v);
-  Kernel<scalar_t, HeadDim, Interleave> kernel{
-      qkv,
-      q_weight,
-      k_weight,
-      position_ids,
-      eps,
-      base,
-      factor,
-      low,
-      high,
-      attention_factor,
-      rotary_dim,
-      num_tokens,
-      num_heads_q,
-      num_heads_q + num_heads_k + num_heads_v,
-      num_heads_q + num_heads_k,
-      config,
-      partner_lanes_for(rotary_dim, Kernel<scalar_t, HeadDim, Interleave>::kElementsPerLane)};
-  sycl_kernel_submit(sycl::range<1>(config.groups * config.wg_lanes), sycl::range<1>(config.wg_lanes), queue, kernel);
+  const float* table = qk_rope_cached_frequencies(queue, base, rotary_dim, factor, low, high);
+  auto submit = [&]<bool UseTable>() {
+    Kernel<scalar_t, HeadDim, Interleave, UseTable> kernel{
+        qkv,
+        q_weight,
+        k_weight,
+        position_ids,
+        eps,
+        base,
+        factor,
+        low,
+        high,
+        attention_factor,
+        rotary_dim,
+        num_tokens,
+        num_heads_q,
+        num_heads_q + num_heads_k + num_heads_v,
+        num_heads_q + num_heads_k,
+        config,
+        partner_lanes_for(rotary_dim, Kernel<scalar_t, HeadDim, Interleave, UseTable>::kElementsPerLane),
+        qk_rope_frequency_storage<HeadDim, UseTable>(table, base, rotary_dim, factor, low, high)};
+    sycl_kernel_submit(sycl::range<1>(config.groups * config.wg_lanes), sycl::range<1>(config.wg_lanes), queue, kernel);
+  };
+  if (table)
+    submit.template operator()<true>();
+  else
+    submit.template operator()<false>();
 }
 
 }  // namespace at::native::xpu::fused_qk_norm_rope_xe35

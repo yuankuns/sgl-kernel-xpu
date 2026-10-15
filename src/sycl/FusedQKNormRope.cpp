@@ -37,33 +37,8 @@ inline T subGroupReduceSum(T val, const sycl::sub_group& sg) {
   return val;
 }
 
-inline float compute_freq_yarn(float base, int rotary_dim, int half_dim, float factor, float low, float high) {
-  // freq_idx is the value from arange(0, rotary_dim, 2): i.e., 0, 2, 4, 6, ...
-  float freq = sycl::pow(base, -2.0f * static_cast<float>(half_dim) / static_cast<float>(rotary_dim));
-
-  if (factor != 1.0f) {
-    float inv_freq_extrapolation = freq;
-    float inv_freq_interpolation = freq / factor;
-
-    float high_adj = high;
-    if (sycl::fabs(low - high_adj) <= 1e-6f) {
-      high_adj += 0.001f;
-    }
-
-    // Match Python: dim_range is [0, 2, 4, 6, ...], so use 2*half_dim
-    float dim_value = 2.0f * static_cast<float>(half_dim);
-    float linear_func = (dim_value - low) / (high_adj - low);
-    float ramp_func = sycl::fmin(sycl::fmax(linear_func, 0.0f), 1.0f);
-
-    // Match Python formula exactly
-    freq = inv_freq_interpolation * (1.0f - ramp_func) + inv_freq_extrapolation * ramp_func;
-  }
-
-  return freq;
-}
-
 // SYCL Kernel for Fused QK Norm and RoPE
-template <int head_dim, bool interleave, typename scalar_t>
+template <int head_dim, bool interleave, typename scalar_t, bool UseTable>
 struct FusedQKNormRopeKernel {
   scalar_t* qkv;
   int num_heads_q;
@@ -80,6 +55,7 @@ struct FusedQKNormRopeKernel {
   float high;
   float attention_factor;
   int rotary_dim;
+  QKRopeFrequencyStorage<head_dim, UseTable> frequencies;
 
   void operator()(sycl::nd_item<1> item) const {
     // Always use float for accumulation, regardless of scalar_t
@@ -151,7 +127,7 @@ struct FusedQKNormRopeKernel {
 
           int dim_idx = laneId * numElemsPerThread + i;
           int half_dim = dim_idx / 2;
-          float freq = compute_freq_yarn(base, rotary_dim, half_dim, factor, low, high);
+          float freq = frequencies[half_dim];
           float theta = pos_id * freq;
           sin_vals[i] = sycl::sin(theta);
           cos_vals[i] = sycl::cos(theta);
@@ -171,7 +147,7 @@ struct FusedQKNormRopeKernel {
           int dim_idx = laneId * numElemsPerThread + i;
           dim_idx = (dim_idx * 2) % rotary_dim;
           int half_dim = dim_idx / 2;
-          float freq = compute_freq_yarn(base, rotary_dim, half_dim, factor, low, high);
+          float freq = frequencies[half_dim];
           float theta = pos_id * freq;
           sin_vals[i] = sycl::sin(theta);
           cos_vals[i] = sycl::cos(theta);
@@ -215,24 +191,32 @@ void launchFusedQKNormRopeImpl(
   const int totalWarps = num_tokens * totalQKHeads;
   const int gridSize = divUp(totalWarps, warpsPerBlock);
 
-  FusedQKNormRopeKernel<head_dim, interleave, scalar_t> kernel{
-      static_cast<scalar_t*>(qkv),
-      num_heads_q,
-      num_heads_k,
-      num_heads_v,
-      eps,
-      static_cast<const scalar_t*>(q_weight),
-      static_cast<const scalar_t*>(k_weight),
-      base,
-      position_ids,
-      num_tokens,
-      factor,
-      low,
-      high,
-      attention_factor,
-      rotary_dim};
+  const float* table = qk_rope_cached_frequencies(q, base, rotary_dim, factor, low, high);
+  auto submit = [&]<bool UseTable>() {
+    FusedQKNormRopeKernel<head_dim, interleave, scalar_t, UseTable> kernel{
+        static_cast<scalar_t*>(qkv),
+        num_heads_q,
+        num_heads_k,
+        num_heads_v,
+        eps,
+        static_cast<const scalar_t*>(q_weight),
+        static_cast<const scalar_t*>(k_weight),
+        base,
+        position_ids,
+        num_tokens,
+        factor,
+        low,
+        high,
+        attention_factor,
+        rotary_dim,
+        qk_rope_frequency_storage<head_dim, UseTable>(table, base, rotary_dim, factor, low, high)};
 
-  sycl_kernel_submit(sycl::range<1>(gridSize * blockSize), sycl::range<1>(blockSize), q, kernel);
+    sycl_kernel_submit(sycl::range<1>(gridSize * blockSize), sycl::range<1>(blockSize), q, kernel);
+  };
+  if (table)
+    submit.template operator()<true>();
+  else
+    submit.template operator()<false>();
 }
 
 void fused_qk_norm_rope(

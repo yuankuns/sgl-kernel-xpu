@@ -10,7 +10,7 @@ import torch
 import utils
 
 precision = {
-    torch.bfloat16: 1e-2,
+    torch.bfloat16: 5e-3,
     torch.float16: 1e-3,
     torch.float32: 1e-5,
 }
@@ -70,20 +70,22 @@ def compute_inv_freq_yarn(
     low_freq_factor: float,
     high_freq_factor: float,
 ):
-    """Compute inverse frequencies for YARN RoPE."""
-    inv_freq = 1.0 / (
+    """Evaluate CUDA's negative-exponent frequency formula, rounded once to FP32."""
+    inv_freq = (
         base
         ** (
-            torch.arange(0, rotary_dim, 2, dtype=torch.float32, device="cpu")
+            -torch.arange(0, rotary_dim, 2, dtype=torch.float64, device="cpu")
             / rotary_dim
         )
-    )
+    ).float()
 
     if factor != 1.0:
         # YARN scaling
         dim_range = torch.arange(0, rotary_dim, 2, dtype=torch.float32, device="cpu")
 
         # Compute linear interpolation factor
+        if abs(low_freq_factor - high_freq_factor) <= 1e-6:
+            high_freq_factor += 0.001
         linear_func = (dim_range - low_freq_factor) / (
             high_freq_factor - low_freq_factor
         )
@@ -228,7 +230,7 @@ def test_fused_qk_norm_rope_basic(
         high,
         attention_factor,
         rotary_dim,
-    ).to(dtype)
+    )
 
     # Run kernel (in-place operation)
     sgl_kernel.fused_qk_norm_rope(
@@ -252,7 +254,7 @@ def test_fused_qk_norm_rope_basic(
 
     # Compare results
     torch.testing.assert_close(
-        qkv.to("cpu"), output_ref, rtol=precision[dtype], atol=precision[dtype]
+        qkv.float().cpu(), output_ref, rtol=precision[dtype], atol=precision[dtype]
     )
 
 
@@ -260,7 +262,8 @@ def test_fused_qk_norm_rope_basic(
 @pytest.mark.parametrize("is_neox", [True, False])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 def test_fused_qk_norm_rope_production_shapes(num_tokens, is_neox, dtype):
-    """Test the decode and prefill shapes used by MUSE Spark."""
+    """Cover production head counts with generic weights, lengths and rotary styles."""
+    # Muse-Spark Q128/K16/V16, D64; actual B8 prefill has T32768, not T4096.
     torch.random.manual_seed(42)
     num_heads_q = 128
     num_heads_k = 16
@@ -297,7 +300,7 @@ def test_fused_qk_norm_rope_production_shapes(num_tokens, is_neox, dtype):
         high,
         attention_factor,
         rotary_dim,
-    ).to(dtype)
+    )
 
     sgl_kernel.fused_qk_norm_rope(
         qkv,
@@ -318,7 +321,126 @@ def test_fused_qk_norm_rope_production_shapes(num_tokens, is_neox, dtype):
         rotary_dim,
     )
 
-    torch.testing.assert_close(qkv.cpu(), output_ref, rtol=8e-3, atol=4e-3)
+    torch.testing.assert_close(
+        qkv.float().cpu(), output_ref, rtol=precision[dtype], atol=precision[dtype]
+    )
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("execution", ["cold_graph", "streams"])
+def test_fused_qk_norm_rope_frequency_table_lifetime(dtype, execution):
+    torch.manual_seed(127)
+    head_dim, heads_q, heads_k, tail, tokens = 64, 8, 4, 4, 7
+    base = (130003.0 if execution == "cold_graph" else 140009.0) + (
+        16 if dtype == torch.float16 else 0
+    )
+    original = torch.randn(tokens, 16 * head_dim, device=device, dtype=dtype)
+    q_weight = torch.randn(head_dim, device=device, dtype=dtype)
+    k_weight = torch.randn(head_dim, device=device, dtype=dtype)
+    positions = torch.tensor(
+        [0, 1, 255, 1023, 2047, 4094, 4095], device=device, dtype=torch.int32
+    )
+    expected = fused_qk_norm_rope_reference(
+        original.float().cpu(),
+        heads_q,
+        heads_k,
+        tail,
+        head_dim,
+        1e-6,
+        q_weight.float().cpu(),
+        k_weight.float().cpu(),
+        base,
+        False,
+        positions.cpu(),
+    )
+
+    def invoke(buffer):
+        sgl_kernel.fused_qk_norm_rope(
+            buffer,
+            heads_q,
+            heads_k,
+            tail,
+            head_dim,
+            1e-6,
+            q_weight,
+            k_weight,
+            base,
+            False,
+            positions,
+            rotary_dim=head_dim,
+        )
+
+    buffers = [original.clone(), original.clone()]
+    if execution == "cold_graph":
+        graph = torch.xpu.XPUGraph()
+        with torch.xpu.graph(graph):
+            invoke(buffers[0])
+        graph.replay()
+        invoke(buffers[1])
+    else:
+        streams = [torch.xpu.Stream(), torch.xpu.Stream()]
+        for stream, buffer in zip(streams, buffers):
+            stream.wait_stream(torch.xpu.current_stream())
+            with torch.xpu.stream(stream):
+                invoke(buffer)
+    torch.xpu.synchronize()
+    for buffer in buffers:
+        torch.testing.assert_close(
+            buffer.float().cpu(), expected, rtol=precision[dtype], atol=precision[dtype]
+        )
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("num_tokens", [8, 32768, 32769])
+def test_fused_qk_norm_rope_full_prefill(num_tokens, dtype):
+    # Muse-Spark B8: decode T8, ISL4096 prefill T32768; Q128/K16/D64 plus gated tail144.
+    # T32769 is a generic launch tail, not another serving batch configuration.
+    torch.manual_seed(42)
+    num_heads_q, num_heads_k, tail_heads, head_dim = 128, 16, 144, 64
+    qkv = torch.randn(num_tokens, 288 * head_dim, dtype=dtype, device=device)
+    initial = qkv.cpu()
+    q_weight = torch.full(
+        (head_dim,), 43.7840518911 / math.sqrt(head_dim), dtype=dtype, device=device
+    )
+    k_weight = torch.ones(head_dim, dtype=dtype, device=device)
+    positions = torch.arange(num_tokens, dtype=torch.int32, device=device) % 4096
+    sgl_kernel.fused_qk_norm_rope(
+        qkv,
+        num_heads_q,
+        num_heads_k,
+        tail_heads,
+        head_dim,
+        1e-5,
+        q_weight,
+        k_weight,
+        500000.0,
+        False,
+        positions,
+        rotary_dim=head_dim,
+    )
+    actual = qkv.cpu()
+    for start in range(0, num_tokens, 512):
+        expected = fused_qk_norm_rope_reference(
+            initial[start : start + 512].float(),
+            num_heads_q,
+            num_heads_k,
+            tail_heads,
+            head_dim,
+            1e-5,
+            q_weight.float().cpu(),
+            k_weight.float().cpu(),
+            500000.0,
+            False,
+            positions[start : start + 512].cpu(),
+            rotary_dim=head_dim,
+        )
+        torch.testing.assert_close(
+            actual[start : start + 512].float(),
+            expected,
+            rtol=precision[dtype],
+            atol=precision[dtype],
+        )
+    assert torch.equal(actual[:, 144 * head_dim :], initial[:, 144 * head_dim :])
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
@@ -355,7 +477,7 @@ def test_fused_qk_norm_rope_gated_stride(dtype):
         False,
         position_ids.cpu(),
         rotary_dim=head_dim,
-    ).to(dtype)
+    )
 
     sgl_kernel.fused_qk_norm_rope(
         qkv,
@@ -372,7 +494,9 @@ def test_fused_qk_norm_rope_gated_stride(dtype):
         rotary_dim=head_dim,
     )
 
-    torch.testing.assert_close(qkv.cpu(), output_ref, rtol=8e-3, atol=4e-3)
+    torch.testing.assert_close(
+        qkv.float().cpu(), output_ref, rtol=precision[dtype], atol=precision[dtype]
+    )
 
 
 @pytest.mark.parametrize("num_tokens", [32, 128])
@@ -425,7 +549,7 @@ def test_fused_qk_norm_rope_yarn(num_tokens, head_dim, is_neox, dtype):
         high,
         attention_factor,
         rotary_dim,
-    ).to(dtype)
+    )
 
     # Run kernel (in-place operation)
     sgl_kernel.fused_qk_norm_rope(
@@ -449,7 +573,7 @@ def test_fused_qk_norm_rope_yarn(num_tokens, head_dim, is_neox, dtype):
 
     # Compare results - use slightly relaxed tolerance for YARN
     torch.testing.assert_close(
-        qkv.to("cpu"), output_ref, rtol=precision[dtype] * 2, atol=precision[dtype] * 2
+        qkv.float().cpu(), output_ref, rtol=precision[dtype], atol=precision[dtype]
     )
 
 
@@ -503,7 +627,7 @@ def test_fused_qk_norm_rope_partial_rotary(num_tokens, head_dim, rotary_dim, dty
         high,
         attention_factor,
         rotary_dim,
-    ).to(dtype)
+    )
 
     # Run kernel (in-place operation)
     sgl_kernel.fused_qk_norm_rope(
@@ -527,7 +651,7 @@ def test_fused_qk_norm_rope_partial_rotary(num_tokens, head_dim, rotary_dim, dty
 
     # Compare results
     torch.testing.assert_close(
-        qkv.to("cpu"), output_ref, rtol=precision[dtype], atol=precision[dtype]
+        qkv.float().cpu(), output_ref, rtol=precision[dtype], atol=precision[dtype]
     )
 
 
@@ -601,7 +725,7 @@ def test_fused_qk_norm_rope_fp8_e4m3(
         high,
         attention_factor,
         rotary_dim,
-    ).to(device)
+    )
 
     # Run kernel (in-place operation)
     sgl_kernel.fused_qk_norm_rope(
@@ -625,7 +749,7 @@ def test_fused_qk_norm_rope_fp8_e4m3(
 
     # Compare results - use relaxed tolerance for FP8
     # FP8 has limited precision, so we need higher tolerance
-    torch.testing.assert_close(qkv.to(torch.float32), output_ref, rtol=5e-2, atol=5e-2)
+    torch.testing.assert_close(qkv.float().cpu(), output_ref, rtol=5e-2, atol=5e-2)
 
 
 if __name__ == "__main__":
