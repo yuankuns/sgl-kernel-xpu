@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <type_traits>
 
 #include "MemoryAccess.h"
 #include "SYCLHelpers.h"
@@ -16,6 +17,9 @@ constexpr int kMaxWorkgroup = 256;
 constexpr int kMaxTokensPerWg = 4;
 constexpr int64_t kCacheTrafficBytes = 48ll << 20;
 constexpr int64_t kDramTrafficBytes = 100ll << 20;
+// The first repeatable BF16 128D sparse-row split gain starts at 300 MiB.
+constexpr int64_t kSparseRowSplitBytes = 300ll << 20;
+constexpr int64_t kSparseRowAlignmentBytes = 4ll << 10;
 constexpr int kCacheRoundCap = 9;
 constexpr int kDramRoundCap = 3;
 
@@ -43,18 +47,24 @@ make_launch(int64_t num_tokens, int total_qk_heads, int lanes_per_head, int wg_l
   return config;
 }
 
-inline LaunchConfig
-choose_launch(int64_t num_tokens, int total_qk_heads, int lanes_per_head, int row_heads, bool interleave) {
+template <typename scalar_t, int HeadDim, bool Interleave>
+inline LaunchConfig choose_launch(int64_t num_tokens, int total_qk_heads, int lanes_per_head, int row_heads) {
   const int64_t slots_per_sg = std::max<int64_t>(kSubgroupSize / lanes_per_head, 1);
   const int64_t wave = std::max<int64_t>(dpcppGpuEuCount() * dpcppGpuHWThreadsPerEU(), 1);
   const int64_t work = num_tokens * total_qk_heads;
   const int rounds = static_cast<int>(std::max<int64_t>(1, (work + slots_per_sg * wave - 1) / (slots_per_sg * wave)));
   const int64_t traffic = 2 * work * lanes_per_head * kBytesPerLane;
-  // Gated QKV projections can leave a large untouched tail between adjacent
-  // tokens. For DRAM-sized interleaved rows, split Q/K into two chunks so
-  // independent workgroups can keep requests in flight across that stride.
-  if (interleave && traffic > kDramTrafficBytes && row_heads >= 2 * total_qk_heads && lanes_per_head == 4) {
-    return make_launch(num_tokens, total_qk_heads, lanes_per_head, 192, 1, 2);
+  if constexpr (Interleave) {
+    // Keep the existing 64D split. Extend it only to measured BF16 128D rows.
+    const bool sparse_row = row_heads >= 2 * total_qk_heads;
+    const bool original_split = lanes_per_head == 4 && traffic > kDramTrafficBytes;
+    const int64_t row_bytes = static_cast<int64_t>(row_heads) * HeadDim * sizeof(scalar_t);
+    const bool bf16_128d_split =
+        std::is_same_v<scalar_t, sycl::ext::oneapi::bfloat16> && HeadDim == 128 &&
+        row_bytes % kSparseRowAlignmentBytes == 0 && traffic >= kSparseRowSplitBytes;
+    if (sparse_row && (original_split || bf16_128d_split)) {
+      return make_launch(num_tokens, total_qk_heads, lanes_per_head, 192, 1, 2);
+    }
   }
   const int round_cap = traffic > kDramTrafficBytes    ? kDramRoundCap
                         : traffic > kCacheTrafficBytes ? kCacheRoundCap
@@ -322,8 +332,8 @@ void launch(
     int rotary_dim,
     sycl::queue& queue) {
   constexpr int lanes = Kernel<scalar_t, HeadDim, Interleave>::kLanesPerHead;
-  const LaunchConfig config =
-      choose_launch(num_tokens, num_heads_q + num_heads_k, lanes, num_heads_q + num_heads_k + num_heads_v, Interleave);
+  const LaunchConfig config = choose_launch<scalar_t, HeadDim, Interleave>(
+      num_tokens, num_heads_q + num_heads_k, lanes, num_heads_q + num_heads_k + num_heads_v);
   Kernel<scalar_t, HeadDim, Interleave> kernel{
       qkv,
       q_weight,

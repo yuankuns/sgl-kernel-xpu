@@ -1,3 +1,4 @@
+import argparse
 import itertools
 import json
 import os
@@ -231,39 +232,38 @@ for batch_size, seq_len, (nq, nk, nv, hd), is_neox, dtype in itertools.product(
 ):
     configs.append((batch_size, seq_len, nq, nk, nv, hd, is_neox, dtype))
 
-muse_spark_mode = os.environ.get("MUSE_SPARK", "0") == "1"
-if muse_spark_mode:
-    for name, required in (
-        ("BATCHES", "8"),
-        ("ISL", "4096"),
-        ("OSL", "16"),
-        ("TP", "1"),
-        ("EP", "1"),
-    ):
-        if os.environ.get(name, required) != required:
-            raise ValueError(f"Muse-Spark serving workload requires {name}={required}")
+parser = argparse.ArgumentParser()
+parser.add_argument(
+    "--production-shapes", "--production-shape", dest="production_shape", action="store_true",
+    help="MUSE Spark B8/ISL4096/OSL16 TP1/EP1 BF16 QK workload",
+)
+parser.add_argument(
+    "--providers", nargs="+", choices=("torch", "torch_cached", "unfused", "sglang")
+)
+parser.add_argument("--num-chunks", type=int, default=1)
+parser.add_argument("--chunk-idx", type=int, default=0)
+parser.add_argument(
+    "--single-config", "--config", dest="config", default="",
+    help="batch,seq,nq,nk,nv,head_dim,is_neox,dtype; separate multiple configs with ';'",
+)
+parser.add_argument("--profile", action="store_true")
+args = parser.parse_args()
+if args.num_chunks <= 0 or not 0 <= args.chunk_idx < args.num_chunks:
+    parser.error("num-chunks must be positive and 0 <= chunk-idx < num-chunks")
+production_shape = args.production_shape
+if production_shape:
     configs = [
         (batch_size, seq_len, 128, 16, 16, 64, False, "bf16")
         for batch_size, seq_len in itertools.product([8], [4096])
     ]
-default_providers = "muse_spark_unfused,sglang" if muse_spark_mode else "torch,sglang"
+default_providers = ["unfused", "sglang"] if production_shape else ["torch", "sglang"]
 all_results = []
-providers = [
-    p.strip()
-    for p in os.environ.get("PROVIDERS", default_providers).split(",")
-    if p.strip()
-]
+providers = args.providers or default_providers
 
 
-# Support running the benchmark in "chunked" mode by setting environment variables:
-# - NUM_CHUNKS: total number of chunks
-# - CHUNK_IDX: index of this chunk (0-based)
-num_chunks = int(os.environ.get("NUM_CHUNKS", "1"))
-chunk_idx = int(os.environ.get("CHUNK_IDX", "0"))
-# Support selecting explicit configs via env var SINGLE_CONFIG with CSV:
-# "batch_size,seq_len,nq,nk,nv,head_dim,is_neox,dtype"
-# Multiple configs may be given, separated by ";".
-single_cfg = os.environ.get("SINGLE_CONFIG", "")
+num_chunks = args.num_chunks
+chunk_idx = args.chunk_idx
+single_cfg = args.config
 if single_cfg:
     selected = []
     for entry in single_cfg.split(";"):
@@ -273,7 +273,7 @@ if single_cfg:
         parts = [p.strip() for p in entry.split(",")]
         if len(parts) != 8:
             raise RuntimeError(
-                "SINGLE_CONFIG entries must have 8 comma-separated fields"
+                "--single-config entries must have 8 comma-separated fields"
             )
         bsz = int(parts[0])
 
@@ -285,13 +285,13 @@ if single_cfg:
         is_neox_val = parts[6].lower() in ("1", "true", "yes")
         dtype_val = parts[7]
         config = (bsz, sl, nq, nk, nv, hd, is_neox_val, dtype_val)
-        if muse_spark_mode and config != (8, 4096, 128, 16, 16, 64, False, "bf16"):
+        if production_shape and config != (8, 4096, 128, 16, 16, 64, False, "bf16"):
             raise ValueError(
-                "Muse-Spark requires B8 ISL4096 OSL16 TP1 EP1 BF16 QK configuration"
+                "--production-shapes requires B8 ISL4096 BF16 QK configuration"
             )
         selected.append(config)
     if not selected:
-        raise RuntimeError("SINGLE_CONFIG was set but contained no config")
+        raise RuntimeError("--single-config was set but contained no config")
     configs = selected
     num_chunks = 1
     chunk_idx = 0
@@ -441,14 +441,14 @@ def benchmark(
 
     position_ids = (
         torch.arange(seq_len, device=device, dtype=torch.int32).repeat(batch_size)
-        if muse_spark_mode
+        if production_shape
         else torch.arange(num_tokens, device=device, dtype=torch.int32)
     )
 
-    if muse_spark_mode:
+    if production_shape:
         if dtype != "bf16" or head_dim != 64 or is_neox:
             raise RuntimeError(
-                "MUSE_SPARK=1 requires bf16, head_dim=64, and is_neox=False"
+                "--production-shapes requires bf16, head_dim=64, and is_neox=False"
             )
         eps = 1e-5
         base = 500000.0
@@ -462,9 +462,9 @@ def benchmark(
 
     quantiles = [0.5, 0.2, 0.8]
 
-    if provider == "muse_spark_unfused":
-        if not muse_spark_mode:
-            raise RuntimeError("provider=muse_spark_unfused requires MUSE_SPARK=1")
+    if provider == "unfused":
+        if not production_shape:
+            raise RuntimeError("provider=unfused requires --production-shapes")
 
         # Exact pre-fusion Muse Spark path:
         #   _per_head_norm(Q/K) -> Q scalar scale
@@ -480,7 +480,7 @@ def benchmark(
         )
         rope_positions = position_ids.to(torch.long)
 
-        def muse_spark_unfused():
+        def unfused():
             q_size = num_heads_q * head_dim
             k_size = num_heads_k * head_dim
             q = qkv[:, :q_size]
@@ -505,7 +505,7 @@ def benchmark(
                 is_neox,
             )
 
-        fn = muse_spark_unfused
+        fn = unfused
     elif provider == "torch_cached":
         inv_freq = compute_inv_freq_yarn(
             head_dim, rotary_dim, base, 1.0, 1.0, 1.0, device
@@ -582,7 +582,7 @@ def benchmark(
             rotary_dim=rotary_dim,
         )
 
-    if os.environ.get("MUSE_SPARK_PROFILE") == "1" and provider == "sglang":
+    if args.profile and provider == "sglang":
         ms, min_ms, max_ms = profile_fused_qk_norm_rope(fn)
     else:
         ms, min_ms, max_ms = triton.testing.do_bench(fn, quantiles=quantiles)
@@ -630,9 +630,7 @@ if __name__ == "__main__":
     # Ensure results dir exists and write per-chunk CSV
     os.makedirs("benchmark/results", exist_ok=True)
     df = pd.DataFrame(all_results)
-    chunk_label = (
-        f"chunk_{os.environ.get('CHUNK_IDX','0')}_of_{os.environ.get('NUM_CHUNKS','1')}"
-    )
+    chunk_label = f"chunk_{chunk_idx}_of_{num_chunks}"
     out_csv = os.path.join("benchmark/results", f"results_{chunk_label}.csv")
     df.to_csv(out_csv, index=False)
     print(f"Wrote results CSV: {out_csv}")
@@ -683,7 +681,7 @@ if __name__ == "__main__":
         values="time_us",
     )
 
-    for baseline in ("torch", "torch_cached", "muse_spark_unfused"):
+    for baseline in ("torch", "torch_cached", "unfused"):
         if baseline not in pivot.columns or "sglang" not in pivot.columns:
             continue
         col = f"speedup_vs_{baseline}"

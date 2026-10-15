@@ -183,3 +183,10 @@ All raw `.log` files, `raw-logs.tar.gz`, local run scripts, binaries,
 `split-300-aligned-uncommitted.patch` are local
 persistent evidence, **not included in this Git commit**. Worktree WIP and
 all original logs remain intact.
+# Current validation entry points (2026-10-16)
+
+For the cleanup baseline, explicit benchmark CLI, renamed test nodes, and
+no-sleep validation commands, see
+[`../../README_cleanup_20261016.md`](../../README_cleanup_20261016.md).
+The results and untracked scripts below are historical evidence; their old
+environment-driven invocations must not be used with the current scripts.

@@ -259,7 +259,7 @@ def test_fused_qk_norm_rope_basic(
 @pytest.mark.parametrize("num_tokens", [1, 8, 64, 129, 1024, 2048, 4096])
 @pytest.mark.parametrize("is_neox", [True, False])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-def test_fused_qk_norm_rope_muse_spark(num_tokens, is_neox, dtype):
+def test_fused_qk_norm_rope_production_shapes(num_tokens, is_neox, dtype):
     """Test the decode and prefill shapes used by MUSE Spark."""
     torch.random.manual_seed(42)
     num_heads_q = 128
@@ -321,7 +321,8 @@ def test_fused_qk_norm_rope_muse_spark(num_tokens, is_neox, dtype):
     torch.testing.assert_close(qkv.cpu(), output_ref, rtol=8e-3, atol=4e-3)
 
 
-def test_fused_qk_norm_rope_muse_spark_gated_stride():
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_fused_qk_norm_rope_gated_stride(dtype):
     """Cover the DRAM-sized, two-chunk interleaved launch with a large untouched tail."""
     torch.random.manual_seed(42)
     num_tokens = 4096
@@ -329,7 +330,6 @@ def test_fused_qk_norm_rope_muse_spark_gated_stride():
     num_heads_k = 16
     num_heads_v = 144
     head_dim = 64
-    dtype = torch.bfloat16
     eps = 1e-6
     base = 500000.0
     position_ids = torch.arange(num_tokens, dtype=torch.int32, device=device)
