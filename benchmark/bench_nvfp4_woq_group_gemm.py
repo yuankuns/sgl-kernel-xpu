@@ -22,8 +22,7 @@ Usage:
 
 import argparse
 import json
-import os
-import time
+import statistics
 from typing import List, Tuple
 
 import torch
@@ -35,9 +34,8 @@ E2M1_MAX = 6.0
 UE8M0_BIAS = 127
 
 
-def cool_down_before_shape() -> None:
+def synchronize_before_shape() -> None:
     torch.xpu.synchronize()
-    time.sleep(2)
 
 
 def is_cri_device() -> bool:
@@ -133,7 +131,7 @@ def build_inputs(groups: int, m_per_group: int, n: int, k: int, device: str):
     )
 
 
-def timeit(fn, num_warmup: int, num_run: int) -> float:
+def timeit_samples(fn, num_warmup: int, num_run: int) -> List[float]:
     for _ in range(num_warmup):
         fn()
     torch.xpu.synchronize()
@@ -144,9 +142,11 @@ def timeit(fn, num_warmup: int, num_run: int) -> float:
         fn()
         end.record()
     torch.xpu.synchronize()
-    return (
-        sum(start.elapsed_time(end) for start, end in zip(starts, ends)) / num_run * 1e3
-    )
+    return [start.elapsed_time(end) * 1e3 for start, end in zip(starts, ends)]
+
+
+def timeit(fn, num_warmup: int, num_run: int) -> float:
+    return statistics.mean(timeit_samples(fn, num_warmup, num_run))
 
 
 def bench_one(
@@ -229,24 +229,24 @@ def effective_metrics(
 ) -> dict:
     """Logical GEMM traffic and FLOPs for a prepared grouped-GEMM path.
 
-    Traffic counts each unique tensor surface once. The figure is therefore an
-    effective bandwidth, not a hardware-counter measurement of cache/DRAM
-    transactions.
+    Traffic counts tensors used by active experts once. The figure is an
+    effective bandwidth, not a hardware-counter measurement of cache/DRAM.
     """
+    active_groups = min(groups, total_m)
     if compute == "mxfp8":
         a_bytes = total_m * k
         a_scale_bytes = total_m * (k // MXFP8_BLOCK_SIZE)
-        b_mult_bytes = groups * n * (k // NVFP4_BLOCK_SIZE) * 2
+        b_mult_bytes = active_groups * n * (k // NVFP4_BLOCK_SIZE) * 2
         output_bytes = total_m * n * 4
     elif compute == "bf16":
         a_bytes = total_m * k * 2
         a_scale_bytes = 0
-        b_mult_bytes = groups * n * (k // NVFP4_BLOCK_SIZE) * 2
+        b_mult_bytes = active_groups * n * (k // NVFP4_BLOCK_SIZE) * 2
         output_bytes = total_m * n * 4
     else:
         raise ValueError(f"unknown compute path: {compute}")
-    b_bytes = groups * n * k // 2
-    b_sfmx_bytes = groups * n * (k // MXFP8_BLOCK_SIZE)
+    b_bytes = active_groups * n * k // 2
+    b_sfmx_bytes = active_groups * n * (k // MXFP8_BLOCK_SIZE)
     total_bytes = (
         a_bytes + a_scale_bytes + b_bytes + b_sfmx_bytes + b_mult_bytes + output_bytes
     )
@@ -275,12 +275,14 @@ def bench_config_projection(
     from sgl_kernel import nvfp4_woq_bf16_grouped_mm, nvfp4_woq_mxfp8_scaled_grouped_mm
 
     if cooldown_before_first:
-        cool_down_before_shape()
+        synchronize_before_shape()
     device = "xpu"
-    # These tensors are prepared weights, so zeros/identity scales exercise the
-    # same memory and conversion path without first materializing a many-GB FP32
-    # weight tensor on the host.
-    b_fp4 = torch.zeros((groups, n, k // 2), dtype=torch.uint8, device=device)
+    # Materialize packed weights directly on device to avoid a many-GB FP32
+    # host tensor while retaining nontrivial, incompressible payload traffic.
+    torch.manual_seed(groups + n + k)
+    b_fp4 = torch.randint(
+        0, 256, (groups, n, k // 2), dtype=torch.uint8, device=device
+    )
     sfmx_b = torch.full(
         (groups, k // MXFP8_BLOCK_SIZE, n), UE8M0_BIAS, dtype=torch.uint8, device=device
     )
@@ -292,14 +294,19 @@ def bench_config_projection(
     rows = []
     for index, tokens in enumerate(token_counts):
         if index:
-            cool_down_before_shape()
+            synchronize_before_shape()
         routed_rows = tokens * topk
         base_rows, extra_rows = divmod(routed_rows, groups)
-        counts = [base_rows + int(expert < extra_rows) for expert in range(groups)]
+        generator = torch.Generator().manual_seed(20261015 + routed_rows)
+        extra_experts = set(torch.randperm(groups, generator=generator)[:extra_rows].tolist())
+        counts = [base_rows + int(expert in extra_experts) for expert in range(groups)]
         m_per_group = max(counts)
         total_m = routed_rows
         a_dtype = torch.float8_e4m3fn if compute == "mxfp8" else torch.bfloat16
-        a_q = torch.zeros((total_m, k), dtype=a_dtype, device=device)
+        torch.manual_seed(total_m + k)
+        a_q = torch.randint(
+            -4, 5, (total_m, k), dtype=torch.int8, device=device
+        ).to(a_dtype)
         a_s = (
             torch.full(
                 (total_m, k // MXFP8_BLOCK_SIZE),
@@ -346,7 +353,8 @@ def bench_config_projection(
                     workspace,
                 )
 
-        us = timeit(grouped_gemm, num_warmup, num_run)
+        samples_us = timeit_samples(grouped_gemm, num_warmup, num_run)
+        us = statistics.median(samples_us)
         metrics = effective_metrics(groups, total_m, n, k, us, compute)
         row = {
             "compute": compute,
@@ -358,6 +366,10 @@ def bench_config_projection(
             "active_experts": min(groups, routed_rows),
             "n": n,
             "k": k,
+            "samples_us": samples_us,
+            "p50_us": us,
+            "min_us": min(samples_us),
+            "max_us": max(samples_us),
             "us": us,
             **metrics,
         }
@@ -365,7 +377,9 @@ def bench_config_projection(
         print(
             f"{compute:5s} {name:7s} tokens={tokens:5d} "
             f"E={groups} m/g={m_per_group:3d} "
-            f"N={n} K={k}  {us:9.1f} us  "
+            f"N={n} K={k}  p50={us:9.1f} us "
+            f"range=[{min(samples_us):.1f},{max(samples_us):.1f}] us "
+            f"raw_us={samples_us}  "
             f"{metrics['bandwidth_gbs']:8.2f} effective GB/s  "
             f"{metrics['tflops']:8.2f} TFLOP/s",
             flush=True,
@@ -451,8 +465,6 @@ def main():
         help="NVFP4 compute path(s) to run in --config mode",
     )
     args = ap.parse_args()
-    if os.environ.get("BATCHES", "8") != "8":
-        ap.error("Muse-Spark serving workload requires BATCHES=8")
     if args.warmup < 0 or args.runs <= 0:
         ap.error("--warmup must be nonnegative and --runs must be positive")
     if args.config:
@@ -460,12 +472,8 @@ def main():
             token_counts = [int(value) for value in args.tokens.split(",")]
         except ValueError:
             ap.error("--tokens must be a comma-separated list of integers")
-        if not token_counts or any(
-            value not in (8, 8 * 4096) for value in token_counts
-        ):
-            ap.error(
-                "Muse-Spark config mode supports only B8 decode or B8 ISL4096 prefill tokens"
-            )
+        if not token_counts or any(value <= 0 for value in token_counts):
+            ap.error("--tokens must contain positive token counts")
 
     if not is_cri_device():
         print("NVFP4 WoQ kernels require an Xe3P (CRI) XPU; skipping.")
@@ -488,7 +496,7 @@ def main():
     rows: List[dict] = []
     for index, (groups, m, n, k) in enumerate(shapes):
         if index:
-            cool_down_before_shape()
+            synchronize_before_shape()
         try:
             rows.append(bench_one(groups, m, n, k, args.warmup, args.runs))
         except Exception as exc:  # noqa: BLE001

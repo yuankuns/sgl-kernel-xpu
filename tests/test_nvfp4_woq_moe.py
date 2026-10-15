@@ -14,7 +14,6 @@ fused kernel *bit-for-bit*, because both then multiply the same E4M3 values by
 the same UE8M0 scales.  Any difference is a layout or race bug, not rounding.
 """
 
-import os
 
 import pytest
 import torch
@@ -31,24 +30,25 @@ from nvfp4_utils import (
     quantize_nvfp4,
 )
 
-# The 512-N / 1024-K shapes take tens of minutes on the CRI simulator.
-LONG_TESTS = os.getenv("LONG_TESTS") == "1"
 
 WORKSPACE_BYTES = 64 * 1024 * 1024
 
 
-def test_compute_mode_environment(monkeypatch):
+@pytest.mark.parametrize(
+    "mode,expected", [("auto", "bf16"), (" BF16 ", "bf16"), (" MXFP8 ", "mxfp8")]
+)
+def test_compute_mode_argument(mode, expected):
     from sgl_kernel.cutlass_moe import _nvfp4_woq_compute_mode
 
-    monkeypatch.delenv("SGLANG_NVFP4_WOQ_COMPUTE", raising=False)
     assert _nvfp4_woq_compute_mode() == "bf16"
-    monkeypatch.setenv("SGLANG_NVFP4_WOQ_COMPUTE", " BF16 ")
-    assert _nvfp4_woq_compute_mode() == "bf16"
-    monkeypatch.setenv("SGLANG_NVFP4_WOQ_COMPUTE", " MXFP8 ")
-    assert _nvfp4_woq_compute_mode() == "mxfp8"
-    monkeypatch.setenv("SGLANG_NVFP4_WOQ_COMPUTE", "invalid")
+    assert _nvfp4_woq_compute_mode(mode) == expected
+
+
+def test_compute_mode_rejects_invalid_argument():
+    from sgl_kernel.cutlass_moe import _nvfp4_woq_compute_mode
+
     with pytest.raises(ValueError, match="must be 'auto', 'mxfp8', or 'bf16'"):
-        _nvfp4_woq_compute_mode()
+        _nvfp4_woq_compute_mode("invalid")
 
 
 @pytest.mark.parametrize("separate_gate_up", [False, True])
@@ -95,17 +95,18 @@ def test_prepare_weights_accepts_checkpoint_global_scales(
 
 
 @pytest.mark.parametrize("mode", ["auto", "bf16", "mxfp8"])
-def test_fused_experts_rejects_fp16_before_device_work(monkeypatch, mode):
+def test_fused_experts_rejects_fp16_before_device_work(mode):
     from sgl_kernel import cutlass_fused_experts_nvfp4_woq
 
-    monkeypatch.setenv("SGLANG_NVFP4_WOQ_COMPUTE", mode)
     a = torch.empty((1, 64), dtype=torch.float16)
     w1_q = torch.empty((1, 8, 32), dtype=torch.uint8)
     w2_q = torch.empty((1, 64, 2), dtype=torch.uint8)
     topk_weights = torch.ones((1, 1), dtype=torch.float16)
     topk_ids = torch.zeros((1, 1), dtype=torch.int32)
     with pytest.raises(TypeError, match="FP16 activation precision is unsupported"):
-        cutlass_fused_experts_nvfp4_woq(a, w1_q, w2_q, {}, topk_weights, topk_ids)
+        cutlass_fused_experts_nvfp4_woq(
+            a, w1_q, w2_q, {}, topk_weights, topk_ids, compute_mode=mode
+        )
 
 
 def is_xpu_available() -> bool:
@@ -329,13 +330,13 @@ def test_prep_kernel_rejects_cpu_global_scales():
             [256, 256],
             512,
             512,
-            marks=pytest.mark.skipif(not LONG_TESTS, reason="set LONG_TESTS=1"),
+            marks=pytest.mark.long_test,
         ),
         pytest.param(
             [64, 64],
             128,
             1024,
-            marks=pytest.mark.skipif(not LONG_TESTS, reason="set LONG_TESTS=1"),
+            marks=pytest.mark.long_test,
         ),
     ],
 )
@@ -660,7 +661,7 @@ def test_bf16_gemm_covers_all_e2m1_codes():
             [64, 64],
             128,
             1024,
-            marks=pytest.mark.skipif(not LONG_TESTS, reason="set LONG_TESTS=1"),
+            marks=pytest.mark.long_test,
         ),
     ],
 )
@@ -814,7 +815,6 @@ def test_fused_experts_nvfp4_woq(mode, monkeypatch):
     import sgl_kernel.cutlass_moe as cutlass_moe
     from sgl_kernel import cutlass_fused_experts_nvfp4_woq, nvfp4_woq_prepare_weights
 
-    monkeypatch.setenv("SGLANG_NVFP4_WOQ_COMPUTE", mode)
     if mode == "bf16":
 
         def unexpected_quantization(*args, **kwargs):
@@ -852,6 +852,7 @@ def test_fused_experts_nvfp4_woq(mode, monkeypatch):
         prepared,
         topk_weights.to(dt).to(dev),
         topk_ids.to(dev),
+        compute_mode=mode,
     )
     torch.xpu.synchronize()
 

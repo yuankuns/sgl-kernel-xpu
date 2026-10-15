@@ -6,7 +6,6 @@ between DSV3-style FP8 (BS=128, fp32 scales) and OCP MXFP8 (BS=32, UE8M0
 uint8 scales); C++ dispatches on scales_a dtype.
 """
 
-import os
 from typing import Optional, Tuple
 
 import torch
@@ -27,14 +26,13 @@ _FP8_E4M3_MIN = -448.0
 _FP8_E4M3_MAX = 448.0
 
 _MXFP8_BLOCK_SIZE = 32
-_NVFP4_WOQ_COMPUTE_ENV = "SGLANG_NVFP4_WOQ_COMPUTE"
 
 
-def _nvfp4_woq_compute_mode() -> str:
-    mode = os.getenv(_NVFP4_WOQ_COMPUTE_ENV, "auto").strip().lower()
+def _nvfp4_woq_compute_mode(mode: str = "auto") -> str:
+    mode = mode.strip().lower()
     if mode not in ("auto", "mxfp8", "bf16"):
         raise ValueError(
-            f"{_NVFP4_WOQ_COMPUTE_ENV} must be 'auto', 'mxfp8', or 'bf16', "
+            "compute_mode must be 'auto', 'mxfp8', or 'bf16', "
             f"got {mode!r}"
         )
     return "bf16" if mode == "auto" else mode
@@ -501,11 +499,12 @@ def cutlass_fused_experts_nvfp4_woq(
     topk_ids: torch.Tensor,
     output: Optional[torch.Tensor] = None,
     workspace: Optional[torch.Tensor] = None,
+    compute_mode: str = "auto",
 ) -> torch.Tensor:
     """Fused MoE with NVFP4 weights and MXFP8 or BF16 computation.
 
     The weights stay 4-bit in memory. Auto mode uses BF16 computation.
-    ``SGLANG_NVFP4_WOQ_COMPUTE`` can select ``auto``, ``mxfp8``, or ``bf16``.
+    The explicit ``compute_mode`` argument selects ``auto``, ``mxfp8``, or ``bf16``.
     For MXFP8, each 32-wide MMA-K slice is converted immediately before BDPAS.
 
     Args:
@@ -517,6 +516,7 @@ def cutlass_fused_experts_nvfp4_woq(
         topk_weights, topk_ids: routing results.
         output: optional (M, K) output buffer.
         workspace: optional uint8 scratch for the grouped GEMMs.
+        compute_mode: computation precision; ``auto`` (default) uses BF16.
 
     Returns:
         (M, K) tensor in ``a.dtype``.
@@ -544,7 +544,7 @@ def cutlass_fused_experts_nvfp4_woq(
     n = w2_q.size(2) * 2  # w2_q is (E, k, n/2)
     topk = topk_ids.size(1)
     device = a.device
-    compute_mode = _nvfp4_woq_compute_mode()
+    compute_mode = _nvfp4_woq_compute_mode(compute_mode)
 
     assert (
         w1_q.size(2) * 2 == k

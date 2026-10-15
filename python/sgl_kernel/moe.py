@@ -751,8 +751,9 @@ def mxfp4_moe_scale_to_mn_major(out, input, rows_per_expert):
     M-padded-to-4 surface the grouped GEMM reads, and needs
     `sum(round_up(rows_i, 4))` rows (zero it first if any row count is not a
     multiple of 4). `rows_per_expert` must be contiguous int32 on device.
-    Exact row-count validation is opt-in with
-    `SGL_KERNEL_MXFP4_CHECK_ROW_COUNTS=1`; it synchronizes device to host.
+    The caller must provide nonnegative counts whose sum fits the input and
+    size the padded output accordingly. Only shape metadata is checked; device
+    counts are not copied to the host, preserving graph capture and collectives.
     """
     torch.ops.sgl_kernel.mxfp4_moe_scale_to_mn_major.default(
         out, input, rows_per_expert
