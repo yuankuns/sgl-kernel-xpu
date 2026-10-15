@@ -9,6 +9,8 @@ from pathlib import Path
 import sgl_kernel as sgl_kernel
 import torch
 
+# Muse-Spark B8 uses rows8 decode/rows32768 ISL4096 prefill, hidden8192, BF16 with FP32 stream.
+
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
@@ -50,9 +52,19 @@ def main():
 
         def invoke():
             torch.ops.sgl_kernel.fused_post_norm_residual_pre_norm(
-                branch, stream, post_weight, pre_weight, alpha, beta,
-                output, new_stream, 1e-8, 1e-5,
-                args.post_mode == "input_scale", args.round_pre_norm_input, output_fp32,
+                branch,
+                stream,
+                post_weight,
+                pre_weight,
+                alpha,
+                beta,
+                output,
+                new_stream,
+                1e-8,
+                1e-5,
+                args.post_mode == "input_scale",
+                args.round_pre_norm_input,
+                output_fp32,
             )
 
         for _ in range(args.warmup):
@@ -75,23 +87,28 @@ def main():
             end.record()
             end.synchronize()
             values.append(start.elapsed_time(end) * 1000 / args.iterations)
-        print(json.dumps({
-            "rows": rows,
-            "hidden_size": args.hidden_size,
-            "device": torch.xpu.get_device_name(0),
-            "dtype": "branch/weights/output BF16; stream/alpha/beta FP32",
-            "layout": "contiguous row-major",
-            "post_mode": args.post_mode,
-            "round_pre_norm_input": args.round_pre_norm_input,
-            "output_fp32": args.output_fp32,
-            "eps": [1e-8, 1e-5],
-            "timing": "XPU event / graph replay iterations; setup outside timing",
-            "iterations": args.iterations,
-            "warmup": args.warmup,
-            "samples_us": values,
-            "p50_us": statistics.median(values),
-            "range_us": [min(values), max(values)],
-        }), flush=True)
+        print(
+            json.dumps(
+                {
+                    "rows": rows,
+                    "hidden_size": args.hidden_size,
+                    "device": torch.xpu.get_device_name(0),
+                    "dtype": "branch/weights/output BF16; stream/alpha/beta FP32",
+                    "layout": "contiguous row-major",
+                    "post_mode": args.post_mode,
+                    "round_pre_norm_input": args.round_pre_norm_input,
+                    "output_fp32": args.output_fp32,
+                    "eps": [1e-8, 1e-5],
+                    "timing": "XPU event / graph replay iterations; setup outside timing",
+                    "iterations": args.iterations,
+                    "warmup": args.warmup,
+                    "samples_us": values,
+                    "p50_us": statistics.median(values),
+                    "range_us": [min(values), max(values)],
+                }
+            ),
+            flush=True,
+        )
         del graph
 
     paths = {

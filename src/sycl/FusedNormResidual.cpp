@@ -2,6 +2,8 @@
 #include <c10/xpu/XPUStream.h>
 #include <torch/all.h>
 
+#include <cstdint>
+#include <limits>
 #include <sycl/sycl.hpp>
 
 #include "MemoryAccess.h"
@@ -13,6 +15,17 @@ namespace {
 constexpr int kVecSize = 8;
 using fp32_vec_t = aligned_vector_loop<float, kVecSize>;
 using bf16_vec_t = aligned_vector_loop<at::BFloat16, kVecSize>;
+
+inline at::BFloat16 accurate_bfloat16(double value) {
+  float high = static_cast<float>(value);
+  if ((sycl::bit_cast<uint32_t>(high) & 0xffffu) == 0x8000u && value != static_cast<double>(high)) {
+    high = sycl::nextafter(
+        high,
+        value > static_cast<double>(high) ? std::numeric_limits<float>::infinity()
+                                          : -std::numeric_limits<float>::infinity());
+  }
+  return static_cast<at::BFloat16>(high);
+}
 
 struct NormArgs {
   const at::BFloat16* __restrict__ branch;
@@ -42,7 +55,7 @@ struct FusedPostNormResidualPreNorm {
     const int64_t lane = item.get_local_id(0);
 
     bf16_vec_t branch_reg[MaxIters];
-    float branch_sum_sq = 0.0f;
+    double branch_sum_sq = 0.0;
 
 #pragma unroll
     for (int it = 0; it < MaxIters; ++it) {
@@ -50,20 +63,21 @@ struct FusedPostNormResidualPreNorm {
       if (offset >= args.hidden_size) {
         continue;
       }
-      const bf16_vec_t value = *reinterpret_cast<const bf16_vec_t*>(args.branch + row_offset + offset);
-      branch_reg[it] = value;
+      bf16_vec_t value = *reinterpret_cast<const bf16_vec_t*>(args.branch + row_offset + offset);
 #pragma unroll
       for (int v = 0; v < kVecSize; ++v) {
         float x = static_cast<float>(value[v]);
         if (args.has_post_weight && args.post_norm_input_scale) {
-          x *= static_cast<float>(args.post_weight[offset + v]);
+          value[v] = static_cast<at::BFloat16>(x * static_cast<float>(args.post_weight[offset + v]));
+          x = static_cast<float>(value[v]);
         }
-        branch_sum_sq += x * x;
+        branch_sum_sq += static_cast<double>(x) * static_cast<double>(x);
       }
+      branch_reg[it] = value;
     }
 
-    branch_sum_sq = sycl::reduce_over_group(item.get_group(), branch_sum_sq, sycl::plus<float>());
-    const float post_rstd = sycl::native::rsqrt(branch_sum_sq / static_cast<float>(args.hidden_size) + args.post_eps);
+    branch_sum_sq = sycl::reduce_over_group(item.get_group(), branch_sum_sq, sycl::plus<double>());
+    const double post_rstd = sycl::rsqrt(branch_sum_sq / static_cast<double>(args.hidden_size) + args.post_eps);
 
     fp32_vec_t new_stream_reg[MaxIters];
     float stream_sum_sq = 0.0f;
@@ -83,15 +97,14 @@ struct FusedPostNormResidualPreNorm {
       for (int v = 0; v < kVecSize; ++v) {
         // Match the model's BF16 post-norm output before the FP32 residual add.
         float post_norm_value = static_cast<float>(branch_reg[it][v]);
-        if (args.has_post_weight && args.post_norm_input_scale) {
-          post_norm_value *= static_cast<float>(args.post_weight[offset + v]);
-        }
-        post_norm_value *= post_rstd;
+        double normalized_post = static_cast<double>(post_norm_value) * post_rstd;
         if (args.has_post_weight && !args.post_norm_input_scale) {
-          post_norm_value *= static_cast<float>(args.post_weight[offset + v]);
+          normalized_post *= static_cast<double>(static_cast<float>(args.post_weight[offset + v]));
         }
-        const at::BFloat16 normed_bf16 = static_cast<at::BFloat16>(post_norm_value);
-        const float value = alpha_value[v] * stream_value[v] + beta_value[v] * static_cast<float>(normed_bf16);
+        const at::BFloat16 normed_bf16 = accurate_bfloat16(normalized_post);
+        const float value = static_cast<float>(
+            static_cast<double>(alpha_value[v]) * static_cast<double>(stream_value[v]) +
+            static_cast<double>(beta_value[v]) * static_cast<double>(static_cast<float>(normed_bf16)));
         updated[v] = value;
         const float pre_norm_value =
             args.round_pre_norm_input ? static_cast<float>(static_cast<at::BFloat16>(value)) : value;
@@ -101,7 +114,7 @@ struct FusedPostNormResidualPreNorm {
     }
 
     stream_sum_sq = sycl::reduce_over_group(item.get_group(), stream_sum_sq, sycl::plus<float>());
-    const float pre_rstd = sycl::native::rsqrt(stream_sum_sq / static_cast<float>(args.hidden_size) + args.pre_eps);
+    const float pre_rstd = sycl::rsqrt(stream_sum_sq / static_cast<float>(args.hidden_size) + args.pre_eps);
 
 #pragma unroll
     for (int it = 0; it < MaxIters; ++it) {
@@ -220,6 +233,8 @@ void fused_post_norm_residual_pre_norm(
   }
 
   auto queue = at::xpu::getCurrentXPUStream().queue();
+  TORCH_CHECK(
+      queue.get_device().has(sycl::aspect::fp64), "Accurate fused residual normalization requires FP64 capability");
   NormArgs args{
       branch.data_ptr<at::BFloat16>(),
       stream.data_ptr<float>(),

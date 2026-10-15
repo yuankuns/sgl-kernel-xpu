@@ -12,6 +12,18 @@ POST_EPS = 1e-8
 PRE_EPS = 1e-5
 
 
+def round_bfloat16(values: torch.Tensor) -> torch.Tensor:
+    """Round an independent FP64 oracle directly to BF16, without an FP32 double-round."""
+    high = values.float()
+    midpoint = ((high.view(torch.int32) & 0xFFFF) == 0x8000) & (values != high.double())
+    if midpoint.any():
+        direction = torch.where(
+            values[midpoint] > high[midpoint].double(), float("inf"), float("-inf")
+        ).float()
+        high[midpoint] = torch.nextafter(high[midpoint], direction)
+    return high.bfloat16()
+
+
 def reference(
     branch: torch.Tensor,
     stream: torch.Tensor,
@@ -22,21 +34,26 @@ def reference(
     post_norm_input_scale: bool,
     round_pre_norm_input: bool,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    post_input = branch.float()
+    """Independent FP64 mathematics with the model's BF16 boundaries and FP32 stream store."""
+    post_input = branch.double()
     if post_weight.numel() and post_norm_input_scale:
-        post_input = post_input * post_weight.float()
-    post_rstd = torch.rsqrt(post_input.square().mean(dim=-1, keepdim=True) + POST_EPS)
+        post_input = round_bfloat16(post_input * post_weight.double()).double()
+    post_eps = torch.tensor(POST_EPS, dtype=torch.float32, device="cpu").double()
+    pre_eps = torch.tensor(PRE_EPS, dtype=torch.float32, device="cpu").double()
+    post_rstd = torch.rsqrt(post_input.square().mean(dim=-1, keepdim=True) + post_eps)
     normed_branch = post_input * post_rstd
     if post_weight.numel() and not post_norm_input_scale:
-        normed_branch = normed_branch * post_weight.float()
-    normed_branch = normed_branch.bfloat16()
+        normed_branch = normed_branch * post_weight.double()
+    normed_branch = round_bfloat16(normed_branch)
     rounded_post_norm = normed_branch.float()
-    new_stream = alpha * stream + beta * rounded_post_norm
+    new_stream = (
+        alpha.double() * stream.double() + beta.double() * rounded_post_norm.double()
+    ).float()
     pre_norm_input = (
-        new_stream.bfloat16().float() if round_pre_norm_input else new_stream
+        new_stream.bfloat16().double() if round_pre_norm_input else new_stream.double()
     )
-    pre_rstd = torch.rsqrt(pre_norm_input.square().mean(dim=-1, keepdim=True) + PRE_EPS)
-    output = (pre_norm_input * pre_rstd * pre_weight.float()).bfloat16()
+    pre_rstd = torch.rsqrt(pre_norm_input.square().mean(dim=-1, keepdim=True) + pre_eps)
+    output = (pre_norm_input * pre_rstd * pre_weight.double()).float()
     return output, new_stream, normed_branch
 
 
@@ -71,6 +88,30 @@ def run_op(
     return output, new_stream
 
 
+def test_round_bfloat16_reference_midpoints():
+    midpoint = 1.30859375
+    values = torch.tensor(
+        [midpoint - 2**-40, midpoint, midpoint + 2**-40], dtype=torch.float64
+    )
+    expected = torch.tensor([1.3046875, 1.3125, 1.3125], dtype=torch.bfloat16)
+    torch.testing.assert_close(round_bfloat16(values), expected, rtol=0, atol=0)
+    torch.testing.assert_close(round_bfloat16(-values), -expected, rtol=0, atol=0)
+
+
+def test_fused_norm_residual_fp32_fma_boundary():
+    device = torch.device("xpu")
+    branch = -torch.ones(1, 8, dtype=torch.bfloat16, device=device)
+    stream = torch.full((1, 8), 1 - 2**-23, dtype=torch.float32, device=device)
+    alpha = torch.full((8,), 1 + 2**-23, dtype=torch.float32, device=device)
+    beta = torch.ones_like(alpha)
+    post = torch.empty(0, dtype=torch.bfloat16, device=device)
+    pre = torch.ones(8, dtype=torch.bfloat16, device=device)
+    _, updated = run_op(branch, stream, post, pre, alpha, beta)
+    torch.testing.assert_close(
+        updated.cpu(), torch.full((1, 8), -(2**-46)), rtol=0, atol=0
+    )
+
+
 @pytest.mark.parametrize("rows", [1, 37, 257])
 @pytest.mark.parametrize("hidden_size", [4096, 8192, 16384])
 @pytest.mark.parametrize("post_mode", ["none", "weight", "input_scale"])
@@ -94,16 +135,9 @@ def test_fused_norm_residual(
     # The XPU elementwise reference can produce incorrect values on CRI for
     # these shapes. Compute the independent reference from the same inputs on
     # CPU and compare there so the test checks the fused kernel itself.
-    expected_output, expected_stream, rounded_post_norm = reference(
-        branch.cpu(),
-        stream.cpu(),
-        post_weight.cpu(),
-        pre_weight.cpu(),
-        alpha.cpu(),
-        beta.cpu(),
-        post_mode == "input_scale",
-        round_pre_norm_input,
-    )
+    branch_cpu, stream_cpu = branch.cpu(), stream.cpu()
+    post_weight_cpu, pre_weight_cpu = post_weight.cpu(), pre_weight.cpu()
+    alpha_cpu, beta_cpu = alpha.cpu(), beta.cpu()
     actual_output, actual_stream = run_op(
         branch,
         stream,
@@ -115,28 +149,31 @@ def test_fused_norm_residual(
         round_pre_norm_input,
     )
 
-    torch.testing.assert_close(
-        actual_output.cpu(), expected_output, rtol=2e-2, atol=2e-2
-    )
+    actual_output_cpu = actual_output.float().cpu()
     actual_stream_cpu = actual_stream.cpu()
-    upper = torch.nextafter(
-        rounded_post_norm, torch.full_like(rounded_post_norm, float("inf"))
-    ).float()
-    lower = torch.nextafter(
-        rounded_post_norm, torch.full_like(rounded_post_norm, float("-inf"))
-    ).float()
-    post_norm_ulp = torch.maximum(
-        upper - rounded_post_norm.float(), rounded_post_norm.float() - lower
-    )
-    # A tiny FP32 reduction change can flip a BF16 value at a rounding
-    # midpoint. Its effect on the residual add is at most |beta| * one ULP.
-    stream_error = (actual_stream_cpu - expected_stream).abs()
-    stream_bound = 1e-5 + beta.cpu().abs() * post_norm_ulp
-    violations = stream_error > stream_bound
-    assert not violations.any(), (
-        f"{violations.sum().item()} residual elements exceed the BF16 ULP bound; "
-        f"max excess {(stream_error - stream_bound).max().item()}"
-    )
+    for start in range(0, rows, 512):
+        expected_output, expected_stream, _ = reference(
+            branch_cpu[start : start + 512],
+            stream_cpu[start : start + 512],
+            post_weight_cpu,
+            pre_weight_cpu,
+            alpha_cpu,
+            beta_cpu,
+            post_mode == "input_scale",
+            round_pre_norm_input,
+        )
+        torch.testing.assert_close(
+            actual_output_cpu[start : start + 512],
+            expected_output,
+            rtol=5e-3,
+            atol=5e-3,
+        )
+        torch.testing.assert_close(
+            actual_stream_cpu[start : start + 512],
+            expected_stream,
+            rtol=1e-5,
+            atol=1e-5,
+        )
 
     output_fp32 = torch.empty_like(stream)
     widened_output, widened_stream = run_op(
@@ -164,6 +201,14 @@ def test_fused_norm_residual(
 def test_fused_norm_residual_hidden_tail_rows_boundary() -> None:
     # H=8200 uses a partial final vector; rows=385 borders a workgroup change.
     test_fused_norm_residual(385, 8200, "none", True)
+
+
+@pytest.mark.parametrize("rows", [8, 32768])
+@pytest.mark.parametrize("post_mode", ["none", "weight", "input_scale"])
+@pytest.mark.parametrize("round_pre_norm_input", [False, True])
+def test_fused_norm_residual_production_shapes(rows, post_mode, round_pre_norm_input):
+    # Muse-Spark B8: decode T8, ISL4096 prefill T32768, hidden8192, BF16/FP32 stream.
+    test_fused_norm_residual(rows, 8192, post_mode, round_pre_norm_input)
 
 
 def benchmark(
