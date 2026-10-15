@@ -145,11 +145,6 @@ def main():
     if not torch.xpu.is_available():
         raise RuntimeError("an XPU is required")
     device = torch.xpu.get_device_properties(0)
-    if device.device_id != 0x674F:
-        raise RuntimeError(
-            "this benchmark requires the CRI 0x674f device, "
-            f"but XPU 0 is 0x{device.device_id:04x}"
-        )
     print(
         f"device={device.name} device_id=0x{device.device_id:04x} "
         f"B={args.serving_batch} ISL={args.isl} OSL={args.osl} TP={args.tp} EP={args.ep}"

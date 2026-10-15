@@ -106,12 +106,11 @@ inline uint8_t quantize_to_e2m1(float val) {
 template <typename T, uint32_t N>
 using vec_t = sycl::vec<T, N>;
 
-// Match TripleOps.cpp's silu_and_mul arithmetic and intermediate dtype.
-// Its SYCL BF16 opmath type can round the division before multiplication.
 template <typename T>
 inline T silu_mul(T a, T b) {
-  using AccT = at::opmath_type<T>;
-  return AccT(a) / (1.0f + expf(AccT(-a))) * AccT(b);
+  float gate = static_cast<float>(a);
+  float up = static_cast<float>(b);
+  return static_cast<T>(gate / (1.0f + expf(-gate)) * up);
 }
 
 // `LANES_PER_GROUP` work items cooperate on one quantization group, each moving

@@ -41,6 +41,29 @@ def fused_topk_sigmoid_torch_native(
     return topk_weights, topk_ids
 
 
+def assert_topk_sigmoid_contract(
+    weights, indices, gating_output, renormalize, correction_bias, *, atol, rtol
+):
+    scores = torch.sigmoid(gating_output.float())
+    ranking_scores = scores if correction_bias is None else scores + correction_bias
+    assert indices.dtype == torch.int32
+    assert weights.shape == indices.shape
+    assert bool(((indices >= 0) & (indices < gating_output.size(1))).all())
+    sorted_indices = torch.sort(indices, dim=-1).values
+    assert bool((torch.diff(sorted_indices, dim=-1) != 0).all())
+    selected_ranking_scores = ranking_scores.gather(1, indices.long())
+    expected_ranking_scores = torch.topk(
+        ranking_scores, indices.size(1), dim=-1, sorted=True
+    ).values
+    torch.testing.assert_close(
+        selected_ranking_scores, expected_ranking_scores, atol=0, rtol=0
+    )
+    expected_weights = scores.gather(1, indices.long())
+    if renormalize:
+        expected_weights = expected_weights / expected_weights.sum(dim=-1, keepdim=True)
+    torch.testing.assert_close(weights, expected_weights, atol=atol, rtol=rtol)
+
+
 # float32 covers the fp32 gating-logits path: some models (e.g.
 # Nemotron-3-Nano MoE) emit float32 router logits. Before the kernel dispatch
 # was widened from AT_DISPATCH_REDUCED_FLOATING_TYPES to also cover Float, this
@@ -66,14 +89,6 @@ def test_topk_sigmoid(
     if with_correction_bias:
         correction_bias = torch.randn((n_expert), dtype=torch.float32, device=device)
 
-    ref_token_weights, ref_topk_indices = fused_topk_sigmoid_torch_native(
-        hidden_states.float(),
-        gating_output.float(),
-        n_topk,
-        renormalize,
-        correction_bias,
-    )
-
     assert hidden_states.shape[0] == gating_output.shape[0], "Number of tokens mismatch"
 
     M, _ = hidden_states.shape
@@ -93,16 +108,52 @@ def test_topk_sigmoid(
         correction_bias,
     )
 
-    # Compare the results
-    res = torch.zeros(n_token, n_expert, dtype=torch.float, device=hidden_states.device)
-    ref = torch.zeros(n_token, n_expert, dtype=torch.float, device=hidden_states.device)
-    res.scatter_(1, topk_indices.long(), topk_weights)
-    ref.scatter_(1, ref_topk_indices.long(), ref_token_weights)
+    assert_topk_sigmoid_contract(
+        topk_weights,
+        topk_indices,
+        gating_output,
+        renormalize,
+        correction_bias,
+        atol=1e-3,
+        rtol=1e-3,
+    )
 
-    # Increase the tolerance for this kernel for bf16 and fp16 inputs
-    atol = 3e-3
-    rtol = 1e-3
-    torch.testing.assert_close(res, ref, atol=atol, rtol=rtol)
+
+@pytest.mark.parametrize("renormalize", [False, True])
+def test_topk_sigmoid_oracle_accepts_equal_score_alternatives(renormalize):
+    logits = torch.tensor([[-2.0, -1.0, 0.0, 1.0]])
+    scores = torch.sigmoid(logits)
+    bias = 1.0 - scores[0]
+    for indices in (torch.tensor([[0, 2]]), torch.tensor([[3, 1]])):
+        weights = scores.gather(1, indices)
+        if renormalize:
+            weights = weights / weights.sum(dim=-1, keepdim=True)
+        assert_topk_sigmoid_contract(
+            weights, indices.int(), logits, renormalize, bias, atol=1e-3, rtol=1e-3
+        )
+
+
+@pytest.mark.parametrize(
+    "invalid", ["negative", "out_of_range", "duplicate", "non_topk", "weight"]
+)
+def test_topk_sigmoid_oracle_rejects_invalid_outputs(invalid):
+    logits = torch.tensor([[0.0, 1.0, 2.0, 3.0]])
+    indices = torch.tensor([[3, 2]], dtype=torch.int32)
+    weights = torch.sigmoid(logits).gather(1, indices.long())
+    if invalid == "negative":
+        indices[0, 1] = -1
+    elif invalid == "out_of_range":
+        indices[0, 1] = 4
+    elif invalid == "duplicate":
+        indices[0, 1] = 3
+    elif invalid == "non_topk":
+        indices[0, 1] = 1
+    else:
+        weights[0, 1] = 0.0
+    with pytest.raises(AssertionError):
+        assert_topk_sigmoid_contract(
+            weights, indices, logits, False, None, atol=1e-3, rtol=1e-3
+        )
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])

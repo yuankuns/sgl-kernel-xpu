@@ -122,10 +122,11 @@ def check_routing(
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
-@pytest.mark.parametrize("num_tokens", [1, 7, 33, 129, 1024])
+@pytest.mark.parametrize("num_tokens", [1, 7, 8, 33, 129, 1024])
 @pytest.mark.parametrize("num_experts", [128, 256])
 def test_moe_routing_production_shape(dtype, num_tokens, num_experts):
     """256 experts / top-k 8 is the production shape; 128 uses the same path."""
+    # Muse decode is B8/E256/topk8; other rows and E128 are generic edge cases.
     torch.manual_seed(1024)
     gating_output = torch.randn(num_tokens, num_experts, dtype=dtype, device=device)
     bias = torch.randn(num_experts, dtype=torch.float32, device=device)
@@ -158,6 +159,34 @@ def test_moe_routing_generic_shapes(dtype, num_experts, topk):
         router_output_multiplier=1.0,
         division_eps=0.0,
     )
+
+
+def test_moe_routing_prefill():
+    # Muse prefill is B8/ISL4096/E256/topk8/TP1/EP1 with an FP32 router.
+    torch.manual_seed(20261016)
+    tokens, experts, topk = 8 * 4096, 256, 8
+    logits = torch.randn(tokens, experts, dtype=torch.float32, device=device)
+    bias = torch.randn(experts, dtype=torch.float32, device=device)
+    weights = torch.empty(tokens, topk, dtype=torch.float32, device=device)
+    indices = torch.empty(tokens, topk, dtype=torch.int32, device=device)
+    multiplier = 0.3535533905932738
+    sgl_kernel.muse_spark_moe_routing(
+        weights, indices, logits, bias, multiplier, 1.0, 1e-15
+    )
+    _, _, scores, ranking_scores = routing_torch_native(
+        logits, bias, topk, 1.0, multiplier, 1e-15
+    )
+    assert bool(((indices >= 0) & (indices < experts)).all())
+    assert bool((torch.diff(torch.sort(indices, dim=-1).values, dim=-1) != 0).all())
+    torch.testing.assert_close(
+        ranking_scores.gather(1, indices.long()),
+        torch.topk(ranking_scores, topk, dim=-1, sorted=True).values,
+        rtol=0,
+        atol=0,
+    )
+    selected = scores.gather(1, indices.long())
+    expected_weights = selected / (selected.sum(dim=-1, keepdim=True) + 1e-15)
+    torch.testing.assert_close(weights, expected_weights, rtol=0, atol=2.5e-4)
 
 
 @pytest.mark.parametrize("num_experts", [96, 256])

@@ -115,16 +115,15 @@ def _float_to_e2m1_code(val: torch.Tensor) -> torch.Tensor:
     E2M1 magnitudes: {0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0}.
     This maps them to 4-bit codes (sign in bit 3, magnitude in bits 0-2).
     """
-    sign = (val < 0).to(torch.uint8)
+    sign = torch.signbit(val).to(torch.uint8)
     abs_val = val.abs()
 
     # Map representable magnitudes to 3-bit indices via the kE2M1ToFloat LUT.
-    # Use a tolerance-based comparison since values are exact after quantization.
     indices = torch.zeros_like(abs_val, dtype=torch.uint8)
     lut = kE2M1ToFloat.to(device=val.device)
     for i in range(8):
         indices = torch.where(
-            torch.isclose(abs_val, lut[i].expand_as(abs_val), atol=1e-6, rtol=0),
+            abs_val == lut[i],
             torch.tensor(i, dtype=torch.uint8, device=val.device),
             indices,
         )
@@ -152,24 +151,6 @@ def pack_fp4(tensor: torch.Tensor) -> torch.Tensor:
     paired = tensor.reshape(shape)
     packed = (paired[..., 0] & 0x0F) | ((paired[..., 1] & 0x0F) << 4)
     return packed.to(torch.uint8)
-
-
-def _normalize_packed_fp4_signed_zero(packed: torch.Tensor) -> torch.Tensor:
-    """Canonicalize signed zeros in packed FP4 bytes.
-
-    In E2M1, code 0x0 is +0.0 and code 0x8 is -0.0.  Both represent
-    the same value, but different implementations may emit either form.
-    This helper rewrites every -0.0 nibble (0x8) to +0.0 (0x0) so that
-    byte-level comparisons are not tripped up by this harmless difference.
-    """
-    # For each nibble, 0x8 is the only code that equals -0.0
-    # (sign=1, exponent=0, mantissa=0).  Clear bit 3 whenever the
-    # lower 3 bits (magnitude) are zero — i.e. the nibble is 0x0 or 0x8.
-    lo = packed & 0x0F
-    hi = (packed >> 4) & 0x0F
-    lo = torch.where(lo == 0x08, torch.zeros_like(lo), lo)
-    hi = torch.where(hi == 0x08, torch.zeros_like(hi), hi)
-    return (lo | (hi << 4)).to(torch.uint8)
 
 
 def unpack_fp4(packed: torch.Tensor) -> torch.Tensor:
@@ -289,6 +270,11 @@ def dequantize_mxfp4(
 
 
 class TestMXFP4ReferenceQuantization:
+    def test_e2m1_zero_codes_exact(self):
+        values = torch.tensor([-0.25, -0.125, -0.0, 0.0, 0.125, 0.25])
+        expected = torch.tensor([8, 8, 0, 0, 0, 0], dtype=torch.uint8)
+        torch.testing.assert_close(quantize_to_e2m1(values), expected, rtol=0, atol=0)
+
     @pytest.mark.parametrize(
         "dtype,gate,up",
         [
@@ -437,15 +423,44 @@ class TestPerTokenGroupQuantFP4XPU:
         activated = torch.empty(1, 32, dtype=dtype, device=self.device)
         silu_and_mul(x, out=activated)
         quant = self._import_kernel()
-        expected_q, expected_s = quant(activated)
+        values_cpu = x.cpu().float()
+        expected_activation = (
+            torch.nn.functional.silu(values_cpu[:, :32]) * values_cpu[:, 32:]
+        ).to(dtype)
+        expected_q, expected_s = quantize_to_mxfp4(expected_activation)
+        separate_q, separate_s = quant(activated)
         actual_q, actual_s = quant(x, fuse_silu_and_mul=True)
-        torch.testing.assert_close(actual_s, expected_s, rtol=0, atol=0)
+        torch.testing.assert_close(separate_q.cpu(), expected_q, rtol=0, atol=0)
+        torch.testing.assert_close(separate_s.cpu(), expected_s, rtol=0, atol=0)
+        torch.testing.assert_close(actual_s.cpu(), expected_s, rtol=0, atol=0)
         torch.testing.assert_close(
-            _normalize_packed_fp4_signed_zero(actual_q),
-            _normalize_packed_fp4_signed_zero(expected_q),
+            actual_q.cpu(),
+            expected_q,
             rtol=0,
             atol=0,
         )
+
+    @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+    @pytest.mark.parametrize("hidden", [256, 8192])
+    def test_fused_swiglu_cpu_reference(self, dtype, hidden):
+        # Muse decode is B8/hidden8192; hidden256 exercises a generic small surface.
+        from sgl_kernel import silu_and_mul
+
+        generator = torch.Generator().manual_seed(20261016 + hidden)
+        values = torch.randn(8, 2 * hidden, generator=generator).to(dtype)
+        activation = (
+            torch.nn.functional.silu(values[:, :hidden].float())
+            * values[:, hidden:].float()
+        ).to(dtype)
+        expected_q, expected_s = quantize_to_mxfp4(activation)
+        values_xpu = values.to(self.device)
+        separate_activation = silu_and_mul(values_xpu)
+        quant = self._import_kernel()
+        separate_q, separate_s = quant(separate_activation)
+        fused_q, fused_s = quant(values_xpu, fuse_silu_and_mul=True)
+        for actual_q, actual_s in ((separate_q, separate_s), (fused_q, fused_s)):
+            torch.testing.assert_close(actual_q.cpu(), expected_q, rtol=0, atol=0)
+            torch.testing.assert_close(actual_s.cpu(), expected_s, rtol=0, atol=0)
 
     def _test_against_reference(
         self,
@@ -481,22 +496,8 @@ class TestPerTokenGroupQuantFP4XPU:
         assert x_q_xpu_cpu.dtype == torch.uint8
         assert scales_xpu_cpu.dtype == torch.uint8
 
-        # Compare quantized values directly (packed uint8).
-        # Normalise signed zeros first: in E2M1 code 0x0 (+0.0) and 0x8
-        # (-0.0) are semantically identical.  The kernel may preserve the
-        # sign of the original float while the reference always emits +0.0,
-        # so we canonicalise before comparing.
-        x_q_xpu_norm = _normalize_packed_fp4_signed_zero(x_q_xpu_cpu)
-        x_q_ref_norm = _normalize_packed_fp4_signed_zero(x_q_ref)
-        q_match = torch.equal(x_q_xpu_norm, x_q_ref_norm)
-        if not q_match:
-            q_mismatches = (x_q_xpu_norm != x_q_ref_norm).sum().item()
-            total = x_q_ref_norm.numel()
-            assert (
-                q_mismatches / total < 0.05
-            ), f"Too many quantized value mismatches: {q_mismatches}/{total}"
+        torch.testing.assert_close(x_q_xpu_cpu, x_q_ref, rtol=0, atol=0)
 
-        # Compare scale exponents (allow ±1 difference due to rounding)
         scale_exp_ref = scales_ref.to(torch.int32) - 127
         scale_exp_xpu = scales_xpu_cpu.to(torch.int32) - 127
         exp_diff = (scale_exp_ref - scale_exp_xpu).abs()
@@ -512,6 +513,8 @@ class TestPerTokenGroupQuantFP4XPU:
     @pytest.mark.parametrize(
         "num_tokens,hidden_dim,src_dtype",
         [
+            # Muse BF16 decode surface is B8/hidden8192; other shapes are generic edges.
+            (8, 8192, torch.bfloat16),
             (128, 256, torch.bfloat16),
             (64, 128, torch.float16),
             (64, 128, torch.float32),
@@ -535,6 +538,9 @@ class TestPerTokenGroupQuantFP4XPU:
         x_q, scales = sgl_per_token_group_quant_fp4(
             x=x_xpu, group_size=MXFP4_BLOCK_SIZE
         )
+        expected_q, expected_scales = quantize_to_mxfp4(x_cpu, MXFP4_BLOCK_SIZE)
+        torch.testing.assert_close(x_q.cpu(), expected_q, rtol=0, atol=0)
+        torch.testing.assert_close(scales.cpu(), expected_scales, rtol=0, atol=0)
 
         x_dq = dequantize_mxfp4(
             x_q.cpu(), scales.cpu(), torch.float32, MXFP4_BLOCK_SIZE
@@ -665,6 +671,8 @@ class TestPerTokenGroupQuantFP4XPU:
         x_q_ref, scales_ref = quantize_to_mxfp4(
             x.cpu().float(), MXFP4_BLOCK_SIZE, eps=self.eps
         )
+        torch.testing.assert_close(x_q.cpu(), x_q_ref, rtol=0, atol=0)
+        torch.testing.assert_close(scales.cpu(), scales_ref, rtol=0, atol=0)
 
         x_dq_xpu = dequantize_mxfp4(
             x_q.cpu(), scales.cpu(), torch.float32, MXFP4_BLOCK_SIZE

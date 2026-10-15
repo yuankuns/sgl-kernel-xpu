@@ -19,7 +19,7 @@ def check_route(weights, ids, logits, bias, multiplier):
         rank_scores.gather(1, ids.long()),
         torch.topk(rank_scores, ids.size(1), dim=-1, sorted=True).values,
         rtol=0,
-        atol=3e-4,
+        atol=0,
     )
     selected = scores.gather(1, ids.long())
     torch.testing.assert_close(
@@ -281,6 +281,8 @@ def main():
                         args.warmup,
                         args.rep,
                     )
+                except AssertionError:
+                    raise
                 except Exception as exc:
                     print(
                         json.dumps(
