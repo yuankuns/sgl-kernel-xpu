@@ -16,7 +16,10 @@ def test_silu_and_mul_cpu_fp32(dtype, columns):
         * values[:, columns:].float()
     )
     actual = sgl_kernel.silu_and_mul(values.to("xpu"))
-    torch.testing.assert_close(actual.cpu().float(), expected, atol=5e-3, rtol=5e-3)
+    tolerance = {torch.float16: 1e-3, torch.bfloat16: 5e-3}[actual.dtype]
+    torch.testing.assert_close(
+        actual.cpu().float(), expected, atol=tolerance, rtol=tolerance
+    )
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
@@ -45,4 +48,7 @@ def test_silu_and_mul_cpu_fp32_rounding_boundary(dtype, gate, up):
     values[:, 1], values[:, 33] = 4.0, 1.25
     expected = torch.nn.functional.silu(values[:, :32].float()) * values[:, 32:].float()
     actual = sgl_kernel.silu_and_mul(values.to("xpu"))
-    torch.testing.assert_close(actual.cpu().float(), expected, atol=5e-3, rtol=5e-3)
+    tolerance = {torch.float16: 1e-3, torch.bfloat16: 5e-3}[actual.dtype]
+    torch.testing.assert_close(
+        actual.cpu().float(), expected, atol=tolerance, rtol=tolerance
+    )

@@ -1,13 +1,79 @@
-"""Paired XPU device-time probes for routing and MXFP4 quantization."""
+"""B8 routing and MXFP4 device-time probes through one CLI."""
 
 import argparse
 import json
 import statistics
 
-import torch
-from sgl_kernel import sgl_per_token_group_quant_fp4, silu_and_mul, topk_sigmoid
-
 GRAPH_REPLAY = 1
+
+
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--mode", choices=("audit", "padded-gather"), default="audit")
+    parser.add_argument("--op", choices=("all", "quant", "route"), default="all")
+    parser.add_argument(
+        "--serving-batch", "--batch", dest="serving_batch", type=int, default=8
+    )
+    parser.add_argument("--isl", type=int, default=4096)
+    parser.add_argument("--osl", type=int, default=16)
+    parser.add_argument("--tp", type=int, default=1)
+    parser.add_argument("--ep", type=int, default=1)
+    parser.add_argument("--branch", action="store_true")
+    parser.add_argument("--triton-route", action="store_true")
+    parser.add_argument("--quant-only", action="store_true")
+    parser.add_argument("--lane-only", action="store_true")
+    parser.add_argument("--fused-only", action="store_true")
+    parser.add_argument("--warmup", type=int)
+    parser.add_argument("--rep", type=int, default=21)
+    parser.add_argument("--repeat", type=int, default=10)
+    parser.add_argument("--graph-replay", type=int, default=1)
+    parser.add_argument(
+        "--shapes",
+        nargs="+",
+        type=int,
+        default=(64, 128, 252, 256, 260, 368, 372, 376, 512, 1024),
+    )
+    parser.add_argument("--tokens", nargs="+", type=int)
+    parser.add_argument("--hidden", type=int, default=4096)
+    parser.add_argument("--topk", type=int, default=8)
+    parser.add_argument("--experts", type=int, default=256)
+    parser.add_argument("--alignment", type=int, default=4)
+    args = parser.parse_args(argv)
+    if args.serving_batch != 8:
+        parser.error("Muse-Spark serving benchmarks require --serving-batch 8")
+    if (args.isl, args.osl, args.tp, args.ep) != (4096, 16, 1, 1):
+        parser.error("serving scope requires ISL4096/OSL16/TP1/EP1")
+    if args.warmup is None:
+        args.warmup = 3 if args.mode == "padded-gather" else 5
+    if args.warmup < 0 or args.rep < 1 or args.repeat < 1 or args.graph_replay < 1:
+        parser.error("warmup must be nonnegative; repeat counts must be positive")
+    if args.hidden < 1 or args.hidden % 32 or any(rows < 1 for rows in args.shapes):
+        parser.error(
+            "hidden must be positive and divisible by32; shapes must be positive"
+        )
+    if args.tokens is None:
+        args.tokens = (8, 8 * args.isl)
+    if any(tokens < 1 for tokens in args.tokens):
+        parser.error("--tokens values must be positive")
+    if (
+        args.topk < 1
+        or args.experts < 1
+        or args.alignment < 1
+        or args.topk > args.experts
+    ):
+        parser.error("topk/alignment must be positive, with topk <= experts")
+    if args.mode == "padded-gather" and args.op == "route":
+        parser.error("padded-gather mode does not benchmark routing")
+    if args.mode == "audit" and (args.topk, args.experts, args.alignment) != (
+        8,
+        256,
+        4,
+    ):
+        parser.error("audit mode requires topk8/experts256/alignment4")
+    if args.op == "route" and (args.quant_only or args.lane_only or args.fused_only):
+        parser.error("quantization-only flags are incompatible with --op route")
+    args.quant_only = args.quant_only or args.op == "quant"
+    return args
 
 
 def check_route(weights, ids, logits, bias, multiplier):
@@ -69,24 +135,195 @@ def bench(name, fn, warmup, rep):
     )
 
 
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--branch", action="store_true")
-    parser.add_argument("--triton-route", action="store_true")
-    parser.add_argument("--quant-only", action="store_true")
-    parser.add_argument("--lane-only", action="store_true")
-    parser.add_argument("--fused-only", action="store_true")
-    parser.add_argument("--warmup", type=int, default=5)
-    parser.add_argument("--rep", type=int, default=21)
-    parser.add_argument("--graph-replay", type=int, default=1)
-    parser.add_argument(
-        "--shapes",
-        nargs="+",
-        type=int,
-        default=[64, 128, 252, 256, 260, 368, 372, 376, 512, 1024],
+def measure_padded(fn, warmup, repeat):
+    for _ in range(warmup):
+        fn()
+    torch.xpu.synchronize()
+
+    samples = []
+    for _ in range(repeat):
+        start = torch.xpu.Event(enable_timing=True)
+        end = torch.xpu.Event(enable_timing=True)
+        start.record()
+        fn()
+        end.record()
+        end.synchronize()
+        samples.append(start.elapsed_time(end))
+    return statistics.median(samples)
+
+
+def baseline(hidden_states, row_map, rows_per_expert):
+    gathered = hidden_states.index_select(0, row_map)
+    output_q, scales_rm = sgl_per_token_group_quant_fp4(gathered, group_size=32)
+    scales_mn = torch.empty_like(scales_rm)
+    mxfp4_moe_scale_to_mn_major(scales_mn, scales_rm, rows_per_expert)
+    return output_q, scales_mn
+
+
+def gather_quant_relayout(hidden_states, row_map, rows_per_expert):
+    output_q, scales_rm = sgl_padded_gather_per_token_group_quant_fp4(
+        hidden_states, row_map, group_size=32
     )
-    parser.add_argument("--hidden", type=int, default=4096)
-    args = parser.parse_args()
+    scales_mn = torch.empty_like(scales_rm)
+    mxfp4_moe_scale_to_mn_major(scales_mn, scales_rm, rows_per_expert)
+    return output_q, scales_mn
+
+
+def gather_quant_only(hidden_states, row_map):
+    return sgl_padded_gather_per_token_group_quant_fp4(
+        hidden_states, row_map, group_size=32
+    )
+
+
+def relayout_only(scales_rm, rows_per_expert):
+    scales_mn = torch.empty_like(scales_rm)
+    mxfp4_moe_scale_to_mn_major(scales_mn, scales_rm, rows_per_expert)
+    return scales_mn
+
+
+def swiglu_quant_relayout(gate_up, rows_per_expert):
+    output_q, scales_rm = sgl_per_token_group_quant_fp4(
+        gate_up, group_size=32, fuse_silu_and_mul=True
+    )
+    scales_mn = torch.empty_like(scales_rm)
+    mxfp4_moe_scale_to_mn_major(scales_mn, scales_rm, rows_per_expert)
+    return output_q, scales_mn
+
+
+def logical_bytes(rows, hidden, path):
+    # Count each logical stream once. The baseline first reads and writes a
+    # gathered BF16 surface, then reads it for quantization. Both paths write
+    # packed FP4 values and one UE8M0 byte per group of 32 values. The legacy
+    # paths additionally read and rewrite the row-major scale surface.
+    bf16_bytes = 2
+    fp4_bytes = 0.5
+    scale_bytes = 1 / 32
+    if path == "baseline":
+        streams_per_element = 3 * bf16_bytes + fp4_bytes + 3 * scale_bytes
+    elif path == "gather_relayout":
+        streams_per_element = bf16_bytes + fp4_bytes + 3 * scale_bytes
+    elif path == "swiglu_relayout":
+        streams_per_element = 2 * bf16_bytes + fp4_bytes + 3 * scale_bytes
+    else:
+        raise ValueError(f"unknown path: {path}")
+    return rows * hidden * streams_per_element
+
+
+def routing_metadata(routed_rows, experts, alignment, rows, device):
+    active_experts = min(experts, routed_rows)
+    base, remainder = divmod(routed_rows, active_experts)
+    counts = torch.zeros(experts, dtype=torch.int32)
+    counts[:active_experts] = base
+    counts[:remainder] += 1
+    padded_counts = (
+        torch.div(counts + alignment - 1, alignment, rounding_mode="floor") * alignment
+    )
+    used_rows = int(padded_counts.sum())
+    assert used_rows <= rows
+    return padded_counts.to(device), used_rows
+
+
+def run_padded_gather(args):
+    if not torch.xpu.is_available():
+        raise RuntimeError("an XPU is required")
+    device = torch.xpu.get_device_properties(0)
+    print(
+        f"device={device.name} device_id=0x{device.device_id:04x} "
+        f"B={args.serving_batch} ISL={args.isl} OSL={args.osl} TP={args.tp} EP={args.ep}"
+    )
+
+    for token_count in args.tokens:
+        routed_rows = token_count * args.topk
+        rows = routed_rows + (args.alignment - 1) * min(args.experts, routed_rows)
+        hidden_states = torch.randn(
+            (token_count, args.hidden), dtype=torch.bfloat16, device="xpu"
+        )
+        gate_up = torch.randn(
+            (rows, 2 * args.hidden), dtype=torch.bfloat16, device="xpu"
+        )
+        padded_counts, used_rows = routing_metadata(
+            routed_rows,
+            args.experts,
+            args.alignment,
+            rows,
+            hidden_states.device,
+        )
+        row_map_i32 = torch.arange(rows, dtype=torch.int32, device="xpu") % token_count
+        expected_q, expected_s = baseline(hidden_states, row_map_i32, padded_counts)
+        gather_q, gather_s = gather_quant_relayout(
+            hidden_states, row_map_i32, padded_counts
+        )
+        used_scale_bytes = used_rows * (args.hidden // 32)
+        if not torch.equal(expected_q, gather_q) or not torch.equal(
+            expected_s.view(-1)[:used_scale_bytes],
+            gather_s.view(-1)[:used_scale_bytes],
+        ):
+            raise AssertionError(
+                f"optimized output differs for tokens={token_count}, rows={rows}"
+            )
+        del expected_q, expected_s, gather_q, gather_s
+        torch.xpu.synchronize()
+
+        baseline_ms = measure_padded(
+            lambda: baseline(hidden_states, row_map_i32, padded_counts),
+            args.warmup,
+            args.repeat,
+        )
+        gather_relayout_ms = measure_padded(
+            lambda: gather_quant_relayout(hidden_states, row_map_i32, padded_counts),
+            args.warmup,
+            args.repeat,
+        )
+        _, scales_rm = gather_quant_only(hidden_states, row_map_i32)
+        gather_quant_ms = measure_padded(
+            lambda: gather_quant_only(hidden_states, row_map_i32),
+            args.warmup,
+            args.repeat,
+        )
+        relayout_ms = measure_padded(
+            lambda: relayout_only(scales_rm, padded_counts),
+            args.warmup,
+            args.repeat,
+        )
+        swiglu_relayout_ms = measure_padded(
+            lambda: swiglu_quant_relayout(gate_up, padded_counts),
+            args.warmup,
+            args.repeat,
+        )
+        baseline_gbps = logical_bytes(rows, args.hidden, "baseline") / baseline_ms / 1e6
+        gather_relayout_gbps = (
+            logical_bytes(rows, args.hidden, "gather_relayout")
+            / gather_relayout_ms
+            / 1e6
+        )
+        swiglu_relayout_gbps = (
+            logical_bytes(rows, args.hidden, "swiglu_relayout")
+            / swiglu_relayout_ms
+            / 1e6
+        )
+
+        print(
+            f"tokens={token_count} routed_rows={routed_rows} "
+            f"used_rows={used_rows} padded_upper_rows={rows}: "
+            f"index_select+quant+relayout={baseline_ms:.4f} ms/"
+            f"{baseline_gbps:.1f} logical GB/s, "
+            f"gather+quant+relayout={gather_relayout_ms:.4f} ms/"
+            f"{gather_relayout_gbps:.1f} logical GB/s, "
+            f"gather+quant={gather_quant_ms:.4f} ms, "
+            f"scale_relayout={relayout_ms:.4f} ms, "
+            f"speedup={baseline_ms / gather_relayout_ms:.3f}x"
+        )
+        print(
+            f"  swiglu+quant+relayout={swiglu_relayout_ms:.4f} ms/"
+            f"{swiglu_relayout_gbps:.1f} logical GB/s"
+        )
+
+        del gate_up, hidden_states, row_map_i32, scales_rm
+        del padded_counts
+        torch.xpu.synchronize()
+
+
+def run_audit(args):
     global GRAPH_REPLAY
     GRAPH_REPLAY = args.graph_replay
     if args.branch:
@@ -113,98 +350,105 @@ def main():
         if args.graph_replay > 1:
             torch.manual_seed(7000 + rows)
         source_rows = 32768 if rows >= 32768 * 8 else 8
-        x = torch.randn((source_rows, args.hidden), device="xpu", dtype=torch.bfloat16)
-        index = torch.arange(rows, device="xpu", dtype=torch.int32) % source_rows
-        gathered = x.index_select(0, index)
-        q_ref, s_ref = sgl_per_token_group_quant_fp4(gathered)
-        if args.branch:
-            q, s = sgl_padded_gather_per_token_group_quant_fp4(x, index)
-            assert torch.equal(q, q_ref) and torch.equal(s, s_ref)
-        if not args.lane_only:
-            bench(
-                f"index_quant_rows{rows}",
-                lambda: sgl_per_token_group_quant_fp4(x.index_select(0, index)),
-                args.warmup,
-                args.rep,
+        if args.op != "route":
+            x = torch.randn(
+                (source_rows, args.hidden), device="xpu", dtype=torch.bfloat16
             )
-        if not args.fused_only:
-            bench(
-                f"plain_quant_rows{rows}",
-                lambda: sgl_per_token_group_quant_fp4(gathered),
-                args.warmup,
-                args.rep,
-            )
-        if args.branch:
-            if not args.fused_only:
-                bench(
-                    f"gather_quant_rows{rows}",
-                    lambda: sgl_padded_gather_per_token_group_quant_fp4(x, index),
-                    args.warmup,
-                    args.rep,
-                )
-            routed_rows = source_rows * 8
-            active_experts = min(256, routed_rows)
-            counts = torch.zeros(256, dtype=torch.int32)
-            base, rem = divmod(routed_rows, active_experts)
-            counts[:active_experts] = base
-            counts[:rem] += 1
-            counts = (counts + 3) // 4 * 4
-            used_rows = int(counts.sum())
-            if used_rows <= rows and not args.lane_only:
-                counts_xpu = counts.to("xpu")
-
-                def index_quant_relayout():
-                    q, s = sgl_per_token_group_quant_fp4(x.index_select(0, index))
-                    s_mn = torch.empty_like(s)
-                    mxfp4_moe_scale_to_mn_major(s_mn, s, counts_xpu)
-                    return q, s_mn
-
-                def gather_quant_relayout():
-                    q, s = sgl_padded_gather_per_token_group_quant_fp4(x, index)
-                    s_mn = torch.empty_like(s)
-                    mxfp4_moe_scale_to_mn_major(s_mn, s, counts_xpu)
-                    return q, s_mn
-
-                iq, is_mn = index_quant_relayout()
-                gq, gs_mn = gather_quant_relayout()
-                assert torch.equal(iq, gq) and torch.equal(
-                    is_mn.flatten()[: used_rows * (args.hidden // 32)],
-                    gs_mn.flatten()[: used_rows * (args.hidden // 32)],
-                )
-                bench(
-                    f"index_quant_relayout_rows{rows}",
-                    index_quant_relayout,
-                    args.warmup,
-                    args.rep,
-                )
-                bench(
-                    f"gather_quant_relayout_rows{rows}",
-                    gather_quant_relayout,
-                    args.warmup,
-                    args.rep,
-                )
-            gate_up = torch.randn(
-                (rows, 2 * args.hidden), device="xpu", dtype=torch.bfloat16
-            )
-            activated = silu_and_mul(gate_up)
-            fused_q, fused_s = sgl_per_token_group_quant_fp4(
-                gate_up, fuse_silu_and_mul=True
-            )
-            separate_q, separate_s = sgl_per_token_group_quant_fp4(activated)
-            assert torch.equal(fused_q, separate_q) and torch.equal(fused_s, separate_s)
+            index = torch.arange(rows, device="xpu", dtype=torch.int32) % source_rows
+            gathered = x.index_select(0, index)
+            q_ref, s_ref = sgl_per_token_group_quant_fp4(gathered)
+            if args.branch:
+                q, s = sgl_padded_gather_per_token_group_quant_fp4(x, index)
+                assert torch.equal(q, q_ref) and torch.equal(s, s_ref)
             if not args.lane_only:
                 bench(
-                    f"separate_silu_quant_rows{rows}",
-                    lambda: sgl_per_token_group_quant_fp4(silu_and_mul(gate_up)),
+                    f"index_quant_rows{rows}",
+                    lambda: sgl_per_token_group_quant_fp4(x.index_select(0, index)),
                     args.warmup,
                     args.rep,
                 )
-            bench(
-                f"fused_silu_quant_rows{rows}",
-                lambda: sgl_per_token_group_quant_fp4(gate_up, fuse_silu_and_mul=True),
-                args.warmup,
-                args.rep,
-            )
+            if not args.fused_only:
+                bench(
+                    f"plain_quant_rows{rows}",
+                    lambda: sgl_per_token_group_quant_fp4(gathered),
+                    args.warmup,
+                    args.rep,
+                )
+            if args.branch:
+                if not args.fused_only:
+                    bench(
+                        f"gather_quant_rows{rows}",
+                        lambda: sgl_padded_gather_per_token_group_quant_fp4(x, index),
+                        args.warmup,
+                        args.rep,
+                    )
+                routed_rows = source_rows * 8
+                active_experts = min(256, routed_rows)
+                counts = torch.zeros(256, dtype=torch.int32)
+                base, rem = divmod(routed_rows, active_experts)
+                counts[:active_experts] = base
+                counts[:rem] += 1
+                counts = (counts + 3) // 4 * 4
+                used_rows = int(counts.sum())
+                if used_rows <= rows and not args.lane_only:
+                    counts_xpu = counts.to("xpu")
+
+                    def index_quant_relayout():
+                        q, s = sgl_per_token_group_quant_fp4(x.index_select(0, index))
+                        s_mn = torch.empty_like(s)
+                        mxfp4_moe_scale_to_mn_major(s_mn, s, counts_xpu)
+                        return q, s_mn
+
+                    def gather_quant_relayout():
+                        q, s = sgl_padded_gather_per_token_group_quant_fp4(x, index)
+                        s_mn = torch.empty_like(s)
+                        mxfp4_moe_scale_to_mn_major(s_mn, s, counts_xpu)
+                        return q, s_mn
+
+                    iq, is_mn = index_quant_relayout()
+                    gq, gs_mn = gather_quant_relayout()
+                    assert torch.equal(iq, gq) and torch.equal(
+                        is_mn.flatten()[: used_rows * (args.hidden // 32)],
+                        gs_mn.flatten()[: used_rows * (args.hidden // 32)],
+                    )
+                    bench(
+                        f"index_quant_relayout_rows{rows}",
+                        index_quant_relayout,
+                        args.warmup,
+                        args.rep,
+                    )
+                    bench(
+                        f"gather_quant_relayout_rows{rows}",
+                        gather_quant_relayout,
+                        args.warmup,
+                        args.rep,
+                    )
+                gate_up = torch.randn(
+                    (rows, 2 * args.hidden), device="xpu", dtype=torch.bfloat16
+                )
+                activated = silu_and_mul(gate_up)
+                fused_q, fused_s = sgl_per_token_group_quant_fp4(
+                    gate_up, fuse_silu_and_mul=True
+                )
+                separate_q, separate_s = sgl_per_token_group_quant_fp4(activated)
+                assert torch.equal(fused_q, separate_q) and torch.equal(
+                    fused_s, separate_s
+                )
+                if not args.lane_only:
+                    bench(
+                        f"separate_silu_quant_rows{rows}",
+                        lambda: sgl_per_token_group_quant_fp4(silu_and_mul(gate_up)),
+                        args.warmup,
+                        args.rep,
+                    )
+                bench(
+                    f"fused_silu_quant_rows{rows}",
+                    lambda: sgl_per_token_group_quant_fp4(
+                        gate_up, fuse_silu_and_mul=True
+                    ),
+                    args.warmup,
+                    args.rep,
+                )
         if not args.quant_only and rows in (256, 512, 32768 * 8 + 768):
             route_tokens = source_rows if rows != 512 else 16
             if args.graph_replay > 1:
@@ -296,6 +540,24 @@ def main():
             if args.branch:
                 bench(f"fused_route_tokens{route_tokens}", fused, args.warmup, args.rep)
         torch.xpu.synchronize()
+
+
+def main():
+    args = parse_args()
+    global torch, sgl_per_token_group_quant_fp4, silu_and_mul, topk_sigmoid
+    global mxfp4_moe_scale_to_mn_major, sgl_padded_gather_per_token_group_quant_fp4
+    import torch
+    from sgl_kernel import sgl_per_token_group_quant_fp4, silu_and_mul, topk_sigmoid
+
+    if args.mode == "padded-gather":
+        from sgl_kernel import (
+            mxfp4_moe_scale_to_mn_major,
+            sgl_padded_gather_per_token_group_quant_fp4,
+        )
+
+        run_padded_gather(args)
+    else:
+        run_audit(args)
 
 
 if __name__ == "__main__":
