@@ -3,6 +3,25 @@ import sgl_kernel  # noqa: F401
 import torch
 
 
+@pytest.mark.parametrize("length_dtype", [torch.int32, torch.int64])
+@pytest.mark.parametrize("with_prefix", [False, True])
+def test_compute_position_production_exact(length_dtype, with_prefix):
+    if not torch.xpu.is_available():
+        pytest.skip("XPU unavailable")
+    # Muse-Spark position: B8, ISL4096, OSL16, TP1/EP1.
+    lengths = torch.full((8,), 4096, dtype=length_dtype, device="xpu")
+    prefix = torch.zeros(8 if with_prefix else 0, dtype=length_dtype, device="xpu")
+    positions = torch.empty(8 * 4096, dtype=torch.int64, device="xpu")
+    starts = torch.empty(8, dtype=torch.int32, device="xpu")
+    torch.ops.sgl_kernel.muse_compute_position(positions, starts, prefix, lengths)
+    torch.testing.assert_close(
+        positions.cpu(), torch.arange(4096).repeat(8), atol=0, rtol=0
+    )
+    torch.testing.assert_close(
+        starts.cpu(), torch.arange(8, dtype=torch.int32) * 4096, atol=0, rtol=0
+    )
+
+
 def test_compute_position_with_prefix():
     if not torch.xpu.is_available():
         pytest.skip("XPU unavailable")

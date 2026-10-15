@@ -70,9 +70,11 @@ def main():
     parser.add_argument("--reverse-order", action="store_true")
     parser.add_argument("--prefix-mode", choices=["zero", "staggered"], default="zero")
     args = parser.parse_args()
-    position_module = importlib.import_module(
-        "sglang.kernels.ops.attention.position"
-    )
+    if args.batch != 8:
+        parser.error("Muse-Spark serving workload requires B=8")
+    if (args.isl, args.osl, args.tp, args.ep) != (4096, 16, 1, 1):
+        parser.error("Muse-Spark workload requires ISL4096/OSL16/TP1/EP1")
+    position_module = importlib.import_module("sglang.kernels.ops.attention.position")
     compute_position_kernel = position_module.compute_position_kernel
     length_dtype = getattr(torch, args.length_dtype)
     assert args.batch > 0 and args.samples > 0
@@ -135,19 +137,18 @@ def main():
         torch.xpu.synchronize()
         expected = torch.cat(
             [
-                torch.arange(size, device="xpu", dtype=torch.int64)
+                torch.arange(size, dtype=torch.int64)
                 + (i * 3 if args.prefix_mode == "staggered" else 0)
                 for i, size in enumerate(lengths)
             ]
         )
         expected_starts = torch.tensor(
             [sum(lengths[:i]) for i in range(args.batch)],
-            device="xpu",
             dtype=torch.int32,
         )
         for pos, starts in ((positions_t, starts_t), (positions_s, starts_s)):
-            torch.testing.assert_close(pos, expected, rtol=0, atol=0)
-            torch.testing.assert_close(starts, expected_starts, rtol=0, atol=0)
+            torch.testing.assert_close(pos.cpu(), expected, rtol=0, atol=0)
+            torch.testing.assert_close(starts.cpu(), expected_starts, rtol=0, atol=0)
         t, s = measure(main_triton, branch_sycl, args.samples, args.reverse_order)
         t_p20, t_p80 = spread(t)
         s_p20, s_p80 = spread(s)
