@@ -3,9 +3,7 @@
 
 import argparse
 import json
-import os
 import statistics
-import time
 
 import torch
 from sgl_kernel import is_xe3_arch, moe_grouped_mm_nt_xe35_mxfp4_w4a4
@@ -164,10 +162,8 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    if os.environ.get("BATCHES", "8") != "8":
-        parser.error("Muse-Spark serving workload requires BATCHES=8")
     if not torch.xpu.is_available() or not is_xe3_arch():
-        raise RuntimeError("Muse MXFP4 decode benchmark requires a CRI XPU")
+        raise RuntimeError("MXFP4 decode benchmark requires a CRI XPU")
     counts = (
         make_sweep_counts(args.sweep_rows)
         if args.sweep_rows is not None
@@ -183,12 +179,10 @@ def main() -> None:
     if args.projection in ("down", "both"):
         projections.append(("down", HIDDEN, INTERMEDIATE))
 
-    for index, projection in enumerate(projections):
+    for projection in projections:
         benchmark_projection(
             *projection, counts, args.warmup, args.iterations, args.allocated_rows
         )
-        if index + 1 < len(projections):
-            time.sleep(2)
 
 
 if __name__ == "__main__":

@@ -27,7 +27,6 @@
 #include <c10/xpu/XPUStream.h>
 #include <torch/all.h>
 
-#include <cstdlib>
 
 #include "sycl/kernels/moe/xe35/device/grouped_gemm_runner.hpp"
 
@@ -57,22 +56,7 @@ namespace policies = gpu::cutlass_kernel::grouped_gemm;
 // expert's block as ceil(K/32) * round_up(M_e, kScaleAlignRows) bytes.
 constexpr int64_t kScaleAlignRows = 4;
 
-// a_scale must therefore hold sum(round_up(M_e, kScaleAlignRows)) rows, which exceeds
-// sum(M_e) by up to kScaleAlignRows - 1 per expert unless the caller already padded
-// every expert's row block (sglang's `_xpu_w4a4_row_alignment` does). Getting this
-// wrong means the mainloop reads past the end of the scale surface, so check it against
-// the row counts themselves and not just against the shapes: that costs one
-// num_experts-element D2H copy, i.e. a queue drain, per call. That drain is neither
-// graph-recordable (the level-zero backend rejects a D2H copy inside an XPU graph with
-// UR_RESULT_ERROR_UNSUPPORTED_FEATURE) nor safe to do between a rank's collectives (it
-// waits on all-reduces the peers have not matched yet, so the ranks deadlock), so the
-// row-count part is opt-in via SGL_KERNEL_MXFP4_CHECK_ROW_COUNTS=1. Normal
-// callers must size a_scale for their per-expert padding contract.
-bool row_count_checks_enabled() {
-  const char* v = std::getenv("SGL_KERNEL_MXFP4_CHECK_ROW_COUNTS");
-  return v != nullptr && v[0] == '1' && v[1] == '\0';
-}
-void check_a_scale_rows(const torch::Tensor& rows_per_expert, int64_t a_scale_rows, int64_t total_m) {
+void check_a_scale_rows(int64_t a_scale_rows, int64_t total_m) {
   TORCH_CHECK(
       a_scale_rows >= total_m,
       "a_scale must have at least as many rows as a (",
@@ -81,36 +65,6 @@ void check_a_scale_rows(const torch::Tensor& rows_per_expert, int64_t a_scale_ro
       kScaleAlignRows,
       ")) >= sum(M_e) rows, got ",
       a_scale_rows);
-
-  // The shape-only check above is free and always runs; the row-count check needs the
-  // device counts on the host, so it is opt-in (see row_count_checks_enabled).
-  if (!row_count_checks_enabled()) {
-    return;
-  }
-
-  const auto rows_cpu = rows_per_expert.to(at::kCPU).contiguous();
-  const int32_t* rows = rows_cpu.data_ptr<int32_t>();
-  int64_t total = 0;
-  int64_t padded_total = 0;
-  for (int64_t e = 0; e < rows_cpu.numel(); ++e) {
-    TORCH_CHECK(rows[e] >= 0, "rows_per_expert[", e, "] is negative (", rows[e], ")");
-    total += rows[e];
-    padded_total += (rows[e] + kScaleAlignRows - 1) / kScaleAlignRows * kScaleAlignRows;
-  }
-  TORCH_CHECK(total <= total_m, "rows_per_expert sums to ", total, " rows but a only has ", total_m);
-  TORCH_CHECK(
-      padded_total <= a_scale_rows,
-      "a_scale needs sum(round_up(M_e, ",
-      kScaleAlignRows,
-      ")) = ",
-      padded_total,
-      " rows for these row counts (sum(M_e) = ",
-      total,
-      "), but it has only ",
-      a_scale_rows,
-      ". Pad every expert's row block to a multiple of ",
-      kScaleAlignRows,
-      ", or size a_scale for the padding");
 }
 
 // Selects between the two general prefill tiles.
@@ -225,7 +179,7 @@ void moe_grouped_mm_nt_xe35_mxfp4_w4a4(
   // Callers that pad each expert's row block size the activation buffer from a host-side
   // upper bound rather than syncing the routing histogram, so a_scale is allowed to be
   // taller than the rows actually routed.
-  check_a_scale_rows(rows_per_expert, a_scale.size(0), total_m);
+  check_a_scale_rows(a_scale.size(0), total_m);
   // Element (e, n, k) must sit at e * N * scale_k + n + k * N.
   TORCH_CHECK(
       b_scale.dim() == 3 && b_scale.size(0) == groups &&

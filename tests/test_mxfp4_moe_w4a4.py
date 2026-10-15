@@ -19,7 +19,6 @@ This extends the existing MXFP4 grouped GEMM coverage with the W4A4 path.
 """
 
 import math
-import os
 
 import pytest
 import torch
@@ -27,7 +26,6 @@ from mxfp4_utils import MXFP4_BLOCK_SIZE, dequantize_mxfp4_2d, quantize_mxfp4_2d
 
 # The 64-byte base-pointer rule below makes the per-expert row counts, and with them
 # total_M, grow fast; keep the wider shapes out of the default (simulator) run.
-LONG_TESTS = os.getenv("LONG_TESTS") == "1"
 
 SCALE_ALIGN_ROWS = 4
 PTR_ALIGN_BYTES = 64
@@ -245,34 +243,18 @@ class TestMxfp4MoeScaleToMnMajor:
         with pytest.raises(RuntimeError, match="at least as many rows"):
             mxfp4_moe_scale_to_mn_major(out, scales, rows_per_expert)
 
-    def test_rejects_missing_padding_rows(self, monkeypatch):
-        """Ragged row counts need sum(padded(rows_e)) rows, which is more than the
-        input has -- only a check against the row counts themselves catches it, since
-        the shapes alone look fine.
-        """
+    def test_accepts_ragged_counts_with_padded_output(self):
         from sgl_kernel import mxfp4_moe_scale_to_mn_major
 
-        monkeypatch.setenv("SGL_KERNEL_MXFP4_CHECK_ROW_COUNTS", "1")
-        rows_per_expert = torch.tensor([3, 5], dtype=torch.int32, device="xpu")
-        scales = torch.zeros(8, 4, dtype=torch.uint8, device="xpu")
-        out = torch.zeros(8, 4, dtype=torch.uint8, device="xpu")  # needs 4 + 8 = 12
-        with pytest.raises(RuntimeError, match="round_up"):
-            mxfp4_moe_scale_to_mn_major(out, scales, rows_per_expert)
-
-        # 12 rows is what these counts need.
+        counts = [3, 5]
+        scales = torch.arange(32, dtype=torch.uint8).reshape(8, 4)
+        out = torch.zeros(12, 4, dtype=torch.uint8, device="xpu")
         mxfp4_moe_scale_to_mn_major(
-            torch.zeros(12, 4, dtype=torch.uint8, device="xpu"), scales, rows_per_expert
+            out,
+            scales.to("xpu"),
+            torch.tensor(counts, dtype=torch.int32, device="xpu"),
         )
-
-    def test_rejects_row_counts_exceeding_input(self, monkeypatch):
-        from sgl_kernel import mxfp4_moe_scale_to_mn_major
-
-        monkeypatch.setenv("SGL_KERNEL_MXFP4_CHECK_ROW_COUNTS", "1")
-        rows_per_expert = torch.tensor([8, 8], dtype=torch.int32, device="xpu")
-        scales = torch.zeros(8, 4, dtype=torch.uint8, device="xpu")  # only 8 rows in
-        out = torch.zeros(16, 4, dtype=torch.uint8, device="xpu")
-        with pytest.raises(RuntimeError, match="sums to 16 rows"):
-            mxfp4_moe_scale_to_mn_major(out, scales, rows_per_expert)
+        assert torch.equal(out.cpu(), mn_major_reference(scales, counts))
 
     def test_rejects_noncontiguous_row_counts(self):
         from sgl_kernel import mxfp4_moe_scale_to_mn_major
@@ -328,17 +310,14 @@ class TestMoeGroupedMmNtXe35Mxfp4W4A4:
         )
 
     @torch.inference_mode()
-    @pytest.mark.skipif(
-        not LONG_TESTS, reason="requires production-size expert weights"
-    )
+    @pytest.mark.long_test
     @pytest.mark.parametrize(
         "n,allocated_rows",
         [(n, rows) for n in (4096, 8192) for rows in (256, 257, 384, 1279, 1280)]
         + [(4096, 2880), (4096, 2881), (8192, 3840), (8192, 3841)],
     )
-    def test_muse_decode_tile_boundary(self, n, allocated_rows):
+    def test_decode_tile_boundary(self, n, allocated_rows):
         """The small-row tile and the mid-row fallback preserve used rows."""
-        import time
 
         from sgl_kernel import moe_grouped_mm_nt_xe35_mxfp4_w4a4
 
@@ -366,7 +345,6 @@ class TestMoeGroupedMmNtXe35Mxfp4W4A4:
         )
         torch.xpu.synchronize()
         assert_moe_close(out[:4], expected)
-        time.sleep(2)
 
     @torch.inference_mode()
     def test_bias(self):
@@ -380,7 +358,7 @@ class TestMoeGroupedMmNtXe35Mxfp4W4A4:
         got = run_grouped_mm(operands, rows_per_expert, n, k, bias=bias)
         assert_moe_close(got, operands["reference"] + bias)
 
-    @pytest.mark.skipif(not LONG_TESTS, reason="set LONG_TESTS=1 for the prefill tiles")
+    @pytest.mark.long_test
     @torch.inference_mode()
     def test_prefill_tile_dispatch(self):
         """avg_tokens_cnt > 32 selects the prefill tile family instead of the
@@ -441,7 +419,7 @@ class TestMoeGroupedMmNtXe35Mxfp4W4A4:
             row += m_i
         assert_moe_close(got, torch.cat(want, dim=0))
 
-    def test_argument_validation(self, monkeypatch):
+    def test_argument_validation(self):
         from sgl_kernel import moe_grouped_mm_nt_xe35_mxfp4_w4a4
 
         device = "xpu"
@@ -492,13 +470,6 @@ class TestMoeGroupedMmNtXe35Mxfp4W4A4:
                 )[::2]
             )
 
-        # Unpadded row counts need more A-scale rows than `a` has. The shapes look fine,
-        # so exact validation is explicitly enabled for these diagnostic cases.
-        monkeypatch.setenv("SGL_KERNEL_MXFP4_CHECK_ROW_COUNTS", "1")
-        with pytest.raises(RuntimeError, match="round_up"):
-            call(rows_per_expert=torch.tensor([3, 5], dtype=torch.int32, device=device))
-        with pytest.raises(RuntimeError, match="sums to 16 rows"):
-            call(rows_per_expert=torch.tensor([8, 8], dtype=torch.int32, device=device))
 
 
 if __name__ == "__main__":

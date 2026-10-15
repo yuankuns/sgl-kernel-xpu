@@ -4,20 +4,15 @@
 import argparse
 import json
 import statistics
-import time
 
 import torch
-from sgl_kernel import moe_grouped_mm_nt_xe35_mxfp4_w4a4, mxfp4_moe_scale_to_mn_major
-
-if not hasattr(torch.ops.sgl_kernel, "mxfp4_blockwise_scaled_grouped_mm"):
-    # The local audit image has a common_ops predating this main registration.
-    import mxfp4_compare_register  # noqa: F401
-
-mxfp4_blockwise_scaled_grouped_mm = (
-    torch.ops.sgl_kernel.mxfp4_blockwise_scaled_grouped_mm.default
+from sgl_kernel import (
+    moe_grouped_mm_nt_xe35_mxfp4_w4a4,
+    mxfp4_blockwise_scaled_grouped_mm,
+    mxfp4_moe_scale_to_mn_major,
 )
 
-from bench_muse_mxfp4_decode import (
+from bench_mxfp4_decode import (
     EXPERTS,
     UPPER_BOUND_ROWS,
     event_samples,
@@ -183,7 +178,6 @@ def run_case(n: int, allocated_rows: int, warmup: int, iterations: int, rounds: 
                 flush=True,
             )
             torch.xpu.synchronize()
-            time.sleep(2)
 
 
 if __name__ == "__main__":
