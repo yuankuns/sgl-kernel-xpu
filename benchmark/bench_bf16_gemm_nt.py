@@ -1,53 +1,55 @@
+"""Compare BF16 GEMM dispatch and kernels with XPU graph event timing."""
+
 import argparse
+import csv
 import statistics
+import time
+from contextlib import nullcontext
 
 import torch
 from sgl_kernel import bf16_gemm_nt, pack_bf16_gemm_weight
 
 
-def measure(fn, warmup=5, repeat=20, calls=20):
+def capture(function, warmup, calls):
     for _ in range(warmup):
-        fn()
+        function()
     torch.xpu.synchronize()
     graph = torch.xpu.XPUGraph()
     with torch.xpu.graph(graph):
         for _ in range(calls):
-            fn()
+            function()
     for _ in range(warmup):
         graph.replay()
     torch.xpu.synchronize()
-    starts = [torch.xpu.Event(enable_timing=True) for _ in range(repeat)]
-    ends = [torch.xpu.Event(enable_timing=True) for _ in range(repeat)]
-    for start, end in zip(starts, ends):
-        start.record()
-        graph.replay()
-        end.record()
-    torch.xpu.synchronize()
-    return (
-        statistics.median(start.elapsed_time(end) for start, end in zip(starts, ends))
-        / calls
-    )
+    return graph
 
 
-def force_packed_kernel(a, packed_b):
-    output = torch.empty(
-        (a.shape[0], packed_b.shape[1]), dtype=a.dtype, device=a.device
+def measure(graph, calls):
+    start = torch.xpu.Event(enable_timing=True)
+    end = torch.xpu.Event(enable_timing=True)
+    start.record()
+    graph.replay()
+    end.record()
+    end.synchronize()
+    return start.elapsed_time(end) / calls
+
+
+def force_kernel(output, activations, weight, packed):
+    torch.ops.sgl_kernel.bf16_gemm_nt.default(
+        output, activations, weight, 2 if packed else 0
     )
-    torch.ops.sgl_kernel.bf16_gemm_nt.default(output, a, packed_b, 2)
     return output
 
 
-def force_native_kernel(a, b):
-    output = torch.empty((a.shape[0], b.shape[0]), dtype=a.dtype, device=a.device)
-    torch.ops.sgl_kernel.bf16_gemm_nt.default(output, a, b, 0)
-    return output
-
-
-def main():
-    parser = argparse.ArgumentParser()
+def parse_args():
+    parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--serving-batch", type=int, choices=(8,), default=8)
+    parser.add_argument("--mode", choices=("all", "dispatch", "kernel"), default="all")
     parser.add_argument(
-        # M is the GEMM row count, not the serving batch size.
+        "--shape", nargs=2, action="append", type=int, metavar=("N", "K")
+    )
+    parser.add_argument(
+        # M counts GEMM rows, not the serving batch size.
         "--m",
         type=int,
         nargs="+",
@@ -56,89 +58,124 @@ def main():
     parser.add_argument("--n", type=int, default=32768)
     parser.add_argument("--k", type=int, default=8192)
     parser.add_argument("--warmup", type=int, default=5)
-    parser.add_argument("--repeat", type=int, default=20)
+    parser.add_argument("--repeat", "--repeats", dest="repeats", type=int, default=20)
     parser.add_argument("--calls", type=int, default=20)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--output", help="Optional CSV with medians and sample spans")
     args = parser.parse_args()
-    if args.n <= 0 or args.k <= 0 or any(m <= 0 for m in args.m):
-        parser.error("M, N and K must be positive")
-    if args.k % 16:
-        parser.error("K must be a multiple of 16 for the forced kernel comparison")
-    if args.warmup < 0 or args.repeat <= 0 or args.calls <= 0:
-        parser.error("--warmup must be nonnegative; --repeat and --calls positive")
+    args.shapes = args.shape or [(args.n, args.k)]
+    if any(
+        columns <= 0 or inner <= 0 or columns % 16 or inner % 16
+        for columns, inner in args.shapes
+    ) or any(rows <= 0 for rows in args.m):
+        parser.error("positive shapes with N and K divisible by 16 are required")
+    if args.warmup < 0 or args.repeats <= 0 or args.calls <= 0:
+        parser.error("--warmup must be nonnegative; repeats and calls must be positive")
+    return args
 
-    print(
-        f"device={torch.xpu.get_device_name(0)} timing=xpu_graph_events "
-        f"calls={args.calls} repeats={args.repeat}"
+
+def benchmark_case(args, weight, packed_weight, rows, names):
+    columns, inner = weight.shape
+    activations = torch.randn((rows, inner), dtype=torch.bfloat16, device=weight.device)
+    native_output = torch.empty(
+        (rows, columns), dtype=activations.dtype, device=activations.device
     )
-    b = torch.randn((args.n, args.k), dtype=torch.bfloat16, device="xpu")
-    packed_b = pack_bf16_gemm_weight(b)
-    for index, m in enumerate(args.m):
-        if index:
-            torch.xpu.synchronize()
-        a = torch.randn((m, args.k), dtype=torch.bfloat16, device="xpu")
-        reference = torch.mm(a.float().cpu(), b.float().cpu().T)
+    packed_output = torch.empty(
+        (rows, packed_weight.shape[1]),
+        dtype=activations.dtype,
+        device=activations.device,
+    )
+    functions = {
+        "native_mm": lambda: torch.mm(activations, weight.T),
+        "native_cute": lambda: force_kernel(native_output, activations, weight, False),
+        "packed_mm": lambda: torch.mm(activations, packed_weight),
+        "packed_cute": lambda: force_kernel(
+            packed_output, activations, packed_weight, True
+        ),
+        "native_dispatch": lambda: bf16_gemm_nt(activations, weight),
+        "packed_dispatch": lambda: bf16_gemm_nt(
+            activations, packed_weight, packed_weight=True
+        ),
+        "native_mm_after": lambda: torch.mm(activations, weight.T),
+    }
+    reference = torch.mm(activations.float().cpu(), weight.float().cpu().T)
+    for name in names:
+        output = functions[name]()
         torch.testing.assert_close(
-            force_packed_kernel(a, packed_b)[:, : args.n].float().cpu(),
-            reference,
-            rtol=5e-3,
-            atol=5e-3,
+            output[:, :columns].float().cpu(), reference, atol=5e-3, rtol=5e-3
         )
-        torch.testing.assert_close(
-            force_native_kernel(a, b).float().cpu(),
-            reference,
-            rtol=5e-3,
-            atol=5e-3,
+    graphs = {name: capture(functions[name], args.warmup, args.calls) for name in names}
+    samples = {name: [] for name in names}
+    for index in range(args.repeats):
+        comparison_names = tuple(name for name in names if name != "native_mm_after")
+        order = (
+            comparison_names if index % 2 == 0 else tuple(reversed(comparison_names))
         )
-        torch.testing.assert_close(
-            torch.mm(a, packed_b)[:, : args.n].float().cpu(),
-            reference,
-            rtol=5e-3,
-            atol=5e-3,
-        )
-        reference_ms = measure(
-            lambda: torch.mm(a, b.T), args.warmup, args.repeat, args.calls
-        )
-        native_dispatch_ms = measure(
-            lambda: bf16_gemm_nt(a, b), args.warmup, args.repeat, args.calls
-        )
-        native_kernel_ms = measure(
-            lambda: force_native_kernel(a, b),
-            args.warmup,
-            args.repeat,
-            args.calls,
-        )
-        packed_onednn_ms = measure(
-            lambda: torch.mm(a, packed_b), args.warmup, args.repeat, args.calls
-        )
-        packed_dispatch_ms = measure(
-            lambda: bf16_gemm_nt(a, packed_b, packed_weight=True),
-            args.warmup,
-            args.repeat,
-            args.calls,
-        )
-        packed_kernel_ms = measure(
-            lambda: force_packed_kernel(a, packed_b),
-            args.warmup,
-            args.repeat,
-            args.calls,
-        )
-        reference_after_ms = measure(
-            lambda: torch.mm(a, b.T), args.warmup, args.repeat, args.calls
-        )
-        print(
-            f"M={m} N={args.n} K={args.k}: torch={reference_ms:.4f} ms, "
-            f"native_dispatch={native_dispatch_ms:.4f} ms "
-            f"({reference_ms / native_dispatch_ms:.3f}x), "
-            f"native_cute_forced={native_kernel_ms:.4f} ms "
-            f"({reference_ms / native_kernel_ms:.3f}x), "
-            f"packed_onednn={packed_onednn_ms:.4f} ms "
-            f"({reference_ms / packed_onednn_ms:.3f}x), "
-            f"packed_dispatch={packed_dispatch_ms:.4f} ms "
-            f"({reference_ms / packed_dispatch_ms:.3f}x), "
-            f"cutlass_packed_forced={packed_kernel_ms:.4f} ms "
-            f"({reference_ms / packed_kernel_ms:.3f}x), "
-            f"torch_after={reference_after_ms:.4f} ms"
-        )
+        if "native_mm_after" in names:
+            order = (*order, "native_mm_after")
+        for name in order:
+            samples[name].append(measure(graphs[name], args.calls))
+    result = {"m": rows, "n": columns, "k": inner}
+    for name in names:
+        result[name + "_ms"] = statistics.median(samples[name])
+        result[name + "_span_ms"] = max(samples[name]) - min(samples[name])
+    return result
+
+
+def main():
+    args = parse_args()
+    names = {
+        "kernel": ("native_mm", "native_cute", "packed_mm", "packed_cute"),
+        "dispatch": (
+            "native_mm",
+            "native_dispatch",
+            "packed_mm",
+            "packed_dispatch",
+        ),
+        "all": (
+            "native_mm",
+            "native_cute",
+            "packed_mm",
+            "packed_cute",
+            "native_dispatch",
+            "packed_dispatch",
+            "native_mm_after",
+        ),
+    }[args.mode]
+    torch.manual_seed(args.seed)
+    print(
+        f"device={torch.xpu.get_device_name(0)} torch={torch.__version__} "
+        f"timing=xpu_graph_events mode={args.mode} "
+        f"calls={args.calls} repeats={args.repeats}",
+        flush=True,
+    )
+    fields = ["m", "n", "k"]
+    fields += [name + "_ms" for name in names]
+    fields += [name + "_span_ms" for name in names]
+    output_context = (
+        open(args.output, "w", newline="") if args.output else nullcontext(None)
+    )
+    with output_context as handle:
+        writer = csv.DictWriter(handle, fieldnames=fields) if handle else None
+        if writer:
+            writer.writeheader()
+        completed_cases = 0
+        for columns, inner in args.shapes:
+            weight = torch.randn((columns, inner), dtype=torch.bfloat16, device="xpu")
+            packed_weight = pack_bf16_gemm_weight(weight)
+            for rows in args.m:
+                if completed_cases:
+                    torch.xpu.synchronize()
+                    time.sleep(2)
+                result = benchmark_case(args, weight, packed_weight, rows, names)
+                if writer:
+                    writer.writerow(result)
+                    handle.flush()
+                timings = " ".join(
+                    f"{name}={result[name + '_ms']:.5f}ms" for name in names
+                )
+                print(f"M={rows} N={columns} K={inner} {timings}", flush=True)
+                completed_cases += 1
 
 
 if __name__ == "__main__":
