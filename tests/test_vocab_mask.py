@@ -3,6 +3,31 @@ import sgl_kernel  # noqa: F401
 import torch
 
 
+@pytest.mark.parametrize("id_dtype", [torch.int32, torch.int64])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("vocab,hidden", [(128, 33), (202048, 4096)])
+def test_vocab_parallel_embedding_independent_exact(vocab, hidden, dtype, id_dtype):
+    if not torch.xpu.is_available():
+        pytest.skip("XPU unavailable")
+    # Muse-Spark production embedding: B8, vocab202048, hidden4096, TP1/EP1.
+    ids_cpu = torch.tensor(
+        [-1, 0, 1, vocab // 2, vocab - 2, vocab - 1, vocab, vocab + 1], dtype=id_dtype
+    )
+    columns_cpu = (torch.arange(hidden, dtype=torch.float64) % 16) * 0.0625
+    rows = torch.arange(vocab, device="xpu", dtype=torch.float32).view(-1, 1) * 0.125
+    weight = (rows + columns_cpu.float().to("xpu")).to(dtype)
+    output = torch.empty(8, hidden, device="xpu", dtype=dtype)
+    torch.ops.sgl_kernel.muse_vocab_parallel_embedding(
+        ids_cpu.to("xpu"), weight, output, 0, vocab, 0, vocab, vocab
+    )
+    invalid = (ids_cpu < 0) | (ids_cpu >= vocab)
+    expected = (
+        ids_cpu.clamp(0, vocab - 1).double().view(-1, 1) * 0.125 + columns_cpu
+    ).to(dtype)
+    expected[invalid] = 0
+    torch.testing.assert_close(output.cpu(), expected, atol=0, rtol=0)
+
+
 @pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
 def test_vocab_mask_boundaries(dtype):
     if not torch.xpu.is_available():
