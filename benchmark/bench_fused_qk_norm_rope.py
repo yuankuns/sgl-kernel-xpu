@@ -1,4 +1,5 @@
 import argparse
+import hashlib
 import itertools
 import json
 import os
@@ -233,6 +234,20 @@ for batch_size, seq_len, (nq, nk, nv, hd), is_neox, dtype in itertools.product(
     configs.append((batch_size, seq_len, nq, nk, nv, hd, is_neox, dtype))
 
 parser = argparse.ArgumentParser()
+parser.add_argument("--mode", choices=("eager", "graph", "boundary"), default="eager")
+parser.add_argument("--impl", choices=("sglang", "unfused"), default="sglang")
+parser.add_argument("--tokens", type=int, nargs="+")
+parser.add_argument("--repeats", type=int, default=32)
+parser.add_argument("--samples", type=int)
+parser.add_argument("--warmup", type=int, default=5)
+parser.add_argument("--q-heads", type=int, default=128)
+parser.add_argument("--k-heads", type=int, default=16)
+parser.add_argument("--tail-heads", type=int, default=144)
+parser.add_argument("--head-dim", type=int, choices=(64, 128, 256), default=64)
+parser.add_argument("--dtype", choices=("bf16", "fp16"), default="bf16")
+parser.add_argument(
+    "--output", type=Path, help="eager CSV or graph/boundary JSON output path"
+)
 parser.add_argument(
     "--production-shapes",
     "--production-shape",
@@ -254,8 +269,43 @@ parser.add_argument(
 )
 parser.add_argument("--profile", action="store_true")
 args = parser.parse_args()
+if args.samples is None:
+    args.samples = 7 if args.mode == "boundary" else 21
 if args.num_chunks <= 0 or not 0 <= args.chunk_idx < args.num_chunks:
     parser.error("num-chunks must be positive and 0 <= chunk-idx < num-chunks")
+if args.mode in ("graph", "boundary"):
+    if args.tokens is None:
+        if args.production_shape:
+            args.tokens = [8, 32768] if args.mode == "boundary" else [32768]
+        elif args.mode == "boundary":
+            args.tokens = [1, 4, 8, 16, 32, 64, 128, 256, 512, 2048, 32768]
+        else:
+            parser.error("--mode graph requires --tokens or --production-shapes")
+    if (
+        min(*args.tokens, args.repeats, args.samples, args.q_heads, args.k_heads) <= 0
+        or min(args.warmup, args.tail_heads) < 0
+    ):
+        parser.error("counts must be positive; warmup and tail-heads may be zero")
+    if args.mode == "graph" and args.providers not in (None, ["sglang"]):
+        parser.error("--mode graph supports only --providers sglang")
+    if args.config or args.num_chunks != 1 or args.chunk_idx != 0:
+        parser.error(
+            "graph/boundary uses --tokens and head options, not configs/chunks"
+        )
+    if args.mode == "graph" and (len(args.tokens) != 1 or args.impl != "sglang"):
+        parser.error("--mode graph requires one token count and --impl sglang")
+    if args.mode == "boundary" and args.providers:
+        parser.error("--mode boundary uses --impl instead of --providers")
+    if args.production_shape and (
+        any(tokens not in (8, 32768) for tokens in args.tokens)
+        or (args.q_heads, args.k_heads, args.tail_heads, args.head_dim)
+        != (128, 16, 144, 64)
+    ):
+        parser.error(
+            "production graph/boundary requires B8 T8/T32768 Q128/K16/tail144/D64"
+        )
+elif args.tokens is not None:
+    parser.error("--tokens is a graph/boundary option; eager uses --single-config")
 production_shape = args.production_shape
 if production_shape:
     # Muse-Spark B8 prefill: T32768, Q128/K16/V16, D64; positions repeat 0..4095.
@@ -308,6 +358,275 @@ if num_chunks > 1:
     start = chunk_idx * chunk_size
     end = min(start + chunk_size, total)
     configs = configs[start:end]
+
+
+def benchmark_graph():
+    torch.manual_seed(42)
+    tokens, repeats, samples, warmup = (
+        args.tokens[0],
+        args.repeats,
+        args.samples,
+        args.warmup,
+    )
+    nq, nk, nv, hd = args.q_heads, args.k_heads, args.tail_heads, args.head_dim
+    # Muse-Spark B8 uses T8/T32768, Q128/K16/D64 and gated tail144; other dimensions are generic corners.
+    dtype = DTYPE_MAP[args.dtype]
+    scale = 43.7840518911 / (hd**0.5)
+    qkv = torch.randn(tokens, (nq + nk + nv) * hd, device="xpu:0", dtype=dtype)
+    initial = qkv.clone()
+    q_weight = torch.full((hd,), scale, device="xpu:0", dtype=dtype)
+    k_weight = torch.ones(hd, device="xpu:0", dtype=dtype)
+    positions = torch.arange(tokens, device="xpu:0", dtype=torch.int32) % 4096
+
+    def fn():
+        fused_qk_norm_rope(
+            qkv,
+            nq,
+            nk,
+            nv,
+            hd,
+            1e-5,
+            q_weight,
+            k_weight,
+            500000.0,
+            False,
+            positions,
+            rotary_dim=hd,
+        )
+
+    if args.profile:
+        median_ms, min_ms, max_ms = profile_fused_qk_norm_rope(fn, samples=samples)
+        print(
+            f"profiler p50_us={median_ms * 1000:.3f} "
+            f"min_us={min_ms * 1000:.3f} max_us={max_ms * 1000:.3f}"
+        )
+    for _ in range(5):
+        fn()
+    torch.xpu.synchronize()
+    qkv.copy_(initial)
+    graph = torch.xpu.XPUGraph()
+    with torch.xpu.graph(graph):
+        for _ in range(repeats):
+            fn()
+    torch.xpu.synchronize()
+
+    paths = {
+        line.split()[-1]
+        for line in Path("/proc/self/maps").read_text().splitlines()
+        if "libsgl-ops-sycl-FusedQKNormRope.so" in line
+    }
+    loaded_libraries = {}
+    for path in sorted(paths):
+        digest = hashlib.sha256(Path(path).read_bytes()).hexdigest()
+        loaded_libraries[path] = digest
+        print(f"loaded_lib={path} sha256={digest}", flush=True)
+
+    for _ in range(warmup):
+        qkv.copy_(initial)
+        graph.replay()
+    torch.xpu.synchronize()
+    values = []
+    for _ in range(samples):
+        qkv.copy_(initial)
+        torch.xpu.synchronize()
+        start = torch.xpu.Event(enable_timing=True)
+        end = torch.xpu.Event(enable_timing=True)
+        start.record()
+        graph.replay()
+        end.record()
+        end.synchronize()
+        values.append(start.elapsed_time(end) * 1000 / repeats)
+
+    ordered = sorted(values)
+    median = statistics.median(values)
+    mad = statistics.median(abs(value - median) for value in values)
+    p20 = ordered[int((samples - 1) * 0.2)]
+    p80 = ordered[int((samples - 1) * 0.8)]
+    device_name = torch.xpu.get_device_name(0)
+    print(
+        f"graph tokens={tokens} dtype={args.dtype} heads={nq},{nk},{nv} hd={hd} "
+        f"repeats={repeats} samples={samples} warmup={warmup} "
+        f"device={device_name}",
+        flush=True,
+    )
+    print(
+        f"tokens={tokens} raw_us={','.join(f'{value:.3f}' for value in values)} "
+        f"p50_us={median:.3f} mad_us={mad:.3f} p20_us={p20:.3f} p80_us={p80:.3f}",
+        flush=True,
+    )
+    if args.output:
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        args.output.write_text(
+            json.dumps(
+                dict(
+                    mode="graph",
+                    tokens=tokens,
+                    dtype=args.dtype,
+                    heads=[nq, nk, nv],
+                    head_dim=hd,
+                    repeats=repeats,
+                    samples=samples,
+                    warmup=warmup,
+                    device=device_name,
+                    loaded_libraries=loaded_libraries,
+                    raw_us=values,
+                    p50_us=median,
+                    mad_us=mad,
+                    p20_us=p20,
+                    p80_us=p80,
+                ),
+                indent=2,
+            )
+            + "\n"
+        )
+
+
+def benchmark_boundary():
+    torch.manual_seed(42)
+    impl, tokens_list = args.impl, args.tokens
+    samples, warmup = args.samples, args.warmup
+    nq, nk, nv, hd = args.q_heads, args.k_heads, args.tail_heads, args.head_dim
+    dtype = DTYPE_MAP[args.dtype]
+    # Muse-Spark B8 Q128/K16/D64 projection carries V16 plus untouched O-gate128.
+    eps, base = 1e-5, 500000.0
+    scale = 43.7840518911 / (hd**0.5)
+    device = "xpu:0"
+    print(
+        f"impl={impl} dtype={args.dtype} heads={nq},{nk},{nv} hd={hd} "
+        f"eps={eps} base={base} samples={samples} warmup={warmup} "
+        f"device={torch.xpu.get_device_name(0)}",
+        flush=True,
+    )
+    if impl == "sglang":
+        paths = {
+            line.split()[-1]
+            for line in Path("/proc/self/maps").read_text().splitlines()
+            if "libsgl-ops-sycl-FusedQKNormRope.so" in line
+        }
+        if not paths:
+            print("loaded_lib=not_mapped_at_import", flush=True)
+        for path in sorted(paths):
+            digest = hashlib.sha256(Path(path).read_bytes()).hexdigest()
+            print(f"loaded_lib={path} sha256={digest}", flush=True)
+    records = []
+    for tokens in tokens_list:
+        qkv = torch.randn(tokens, (nq + nk + nv) * hd, device=device, dtype=dtype)
+        original_qkv = qkv.clone()
+        q_weight = torch.full((hd,), scale, device=device, dtype=dtype)
+        k_weight = torch.ones(hd, device=device, dtype=dtype)
+        positions = torch.arange(tokens, device=device, dtype=torch.int32) % 4096
+        if impl == "unfused":
+            inv_freq = 1.0 / (
+                base ** (torch.arange(0, hd, 2, dtype=torch.float32) / hd)
+            )
+            freqs = torch.outer(torch.arange(32768, dtype=torch.float32), inv_freq)
+            cache = torch.cat((freqs.cos(), freqs.sin()), dim=-1).to(
+                device=device, dtype=dtype
+            )
+            rope_positions = positions.to(torch.long)
+
+            def fn():
+                query = qkv[:, : nq * hd]
+                key = qkv[:, nq * hd : (nq + nk) * hd]
+                query = (
+                    F.rms_norm(query.reshape(-1, hd), (hd,), None, eps)
+                    .reshape_as(query)
+                    .to(dtype)
+                    * scale
+                )
+                key = (
+                    F.rms_norm(key.reshape(-1, hd), (hd,), None, eps)
+                    .reshape_as(key)
+                    .to(dtype)
+                )
+                torch.ops.sgl_kernel.rotary_embedding(
+                    rope_positions, query, key, hd, cache, False
+                )
+
+        else:
+
+            def fn():
+                fused_qk_norm_rope(
+                    qkv,
+                    nq,
+                    nk,
+                    nv,
+                    hd,
+                    eps,
+                    q_weight,
+                    k_weight,
+                    base,
+                    False,
+                    positions,
+                    rotary_dim=hd,
+                )
+
+        for _ in range(warmup):
+            qkv.copy_(original_qkv)
+            fn()
+        torch.xpu.synchronize()
+        values = []
+        for _ in range(samples):
+            qkv.copy_(original_qkv)
+            start = torch.xpu.Event(enable_timing=True)
+            end = torch.xpu.Event(enable_timing=True)
+            start.record()
+            fn()
+            end.record()
+            end.synchronize()
+            values.append(start.elapsed_time(end) * 1000)
+        ordered = sorted(values)
+        median = statistics.median(values)
+        mad = statistics.median(abs(value - median) for value in values)
+        p20 = ordered[int((samples - 1) * 0.2)]
+        p80 = ordered[int((samples - 1) * 0.8)]
+        print(
+            f"tokens={tokens} raw_us={','.join(f'{value:.3f}' for value in values)} "
+            f"p50_us={median:.3f} mad_us={mad:.3f} p20_us={p20:.3f} p80_us={p80:.3f}",
+            flush=True,
+        )
+        names = []
+        if args.profile:
+            qkv.copy_(original_qkv)
+            with torch.profiler.profile(
+                activities=[torch.profiler.ProfilerActivity.XPU]
+            ) as profiler:
+                fn()
+                torch.xpu.synchronize()
+            with tempfile.TemporaryDirectory() as directory:
+                trace = Path(directory) / "qk-trace.json"
+                profiler.export_chrome_trace(str(trace))
+                events = json.loads(trace.read_text())["traceEvents"]
+            names = [
+                event.get("name", "")
+                for event in events
+                if event.get("cat") == "kernel"
+            ]
+            print(f"tokens={tokens} kernel_names={names}", flush=True)
+        records.append(
+            dict(
+                mode="boundary",
+                impl=impl,
+                tokens=tokens,
+                dtype=args.dtype,
+                heads=[nq, nk, nv],
+                head_dim=hd,
+                samples=samples,
+                warmup=warmup,
+                raw_us=values,
+                p50_us=median,
+                mad_us=mad,
+                p20_us=p20,
+                p80_us=p80,
+                kernel_names=names,
+            )
+        )
+        qkv = None
+        original_qkv = None
+        torch.xpu.synchronize()
+    if args.output:
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        args.output.write_text(json.dumps(records, indent=2) + "\n")
 
 
 def calculate_flops(
@@ -631,6 +950,12 @@ def benchmark(
 
 
 if __name__ == "__main__":
+    if args.mode == "boundary":
+        benchmark_boundary()
+        raise SystemExit(0)
+    if args.mode == "graph":
+        benchmark_graph()
+        raise SystemExit(0)
     print("Running benchmarks...")
     benchmark.run(print_data=True)
 
@@ -638,7 +963,8 @@ if __name__ == "__main__":
     os.makedirs("benchmark/results", exist_ok=True)
     df = pd.DataFrame(all_results)
     chunk_label = f"chunk_{chunk_idx}_of_{num_chunks}"
-    out_csv = os.path.join("benchmark/results", f"results_{chunk_label}.csv")
+    out_csv = args.output or Path("benchmark/results") / f"results_{chunk_label}.csv"
+    out_csv.parent.mkdir(parents=True, exist_ok=True)
     df.to_csv(out_csv, index=False)
     print(f"Wrote results CSV: {out_csv}")
 
