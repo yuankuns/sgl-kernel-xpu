@@ -7,6 +7,7 @@ import torch
 @pytest.mark.parametrize("experts,alignment", [(128, 4), (256, 4), (512, 16)])
 @pytest.mark.parametrize("tokens", [1, 7, 8, 9, 16])
 def test_mxfp4_small_permutation(index_dtype, experts, alignment, tokens):
+    # Muse decode is B8/E256/topk8/alignment4; other shapes are generic edges.
     if not torch.xpu.is_available():
         pytest.skip("XPU unavailable")
 
