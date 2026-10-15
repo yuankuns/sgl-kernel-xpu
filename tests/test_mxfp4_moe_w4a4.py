@@ -242,12 +242,13 @@ def run_grouped_mm(
 
 
 def assert_moe_close(got: torch.Tensor, want: torch.Tensor):
+    tolerance = 1e-3 if got.dtype == torch.float16 else 5e-3
     got = got.float().cpu()
     want = want.float().cpu()
     assert got.shape == want.shape, f"{got.shape} vs {want.shape}"
     assert not torch.isnan(got).any(), "kernel produced NaN"
     assert not torch.isinf(got).any(), "kernel produced Inf"
-    torch.testing.assert_close(got, want, rtol=5e-3, atol=5e-3)
+    torch.testing.assert_close(got, want, rtol=tolerance, atol=tolerance)
     if want.abs().max() > 0:
         correlation = torch.corrcoef(torch.stack([got.flatten(), want.flatten()]))[0, 1]
         assert correlation > 0.99, f"correlation too low: {correlation}"

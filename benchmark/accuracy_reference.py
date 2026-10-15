@@ -34,6 +34,8 @@ def verify_grouped_output(
     contract: NVFP4 has per-16 E4M3 scales; MXFP4 has per-32 E8M0 scales.
     """
     counts = counts.cpu().tolist() if isinstance(counts, torch.Tensor) else counts
+    if output.dtype == torch.float16:
+        atol = rtol = 1e-3
     groups = packed_activations.shape[1] * 2 // 32
     row_start = scale_start = checked = 0
     maximum_error = 0.0
