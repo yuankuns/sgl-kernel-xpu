@@ -90,7 +90,8 @@ cutlass::Status launch(
     const cutlass::KernelHardwareInfo& hw_info,
     sycl::queue& queue,
     int n,
-    int k) {
+    int k,
+    int packed_b_width) {
   using ElementA = typename Gemm::ElementA;
   using ElementB = typename Gemm::ElementB;
   using ElementD = typename Gemm::CollectiveEpilogue::ElementOutput;
@@ -102,7 +103,7 @@ cutlass::Status launch(
   const int m = static_cast<int>(a.size(0));
   auto problem = make_shape(m, n, k, 1);
   StrideA stride_a = cutlass::make_cute_packed_stride(StrideA{}, make_shape(m, k, 1));
-  StrideB stride_b = cutlass::make_cute_packed_stride(StrideB{}, make_shape(n, k, 1));
+  StrideB stride_b = cutlass::make_cute_packed_stride(StrideB{}, make_shape(packed_b_width, k, 1));
   StrideC stride_c = cutlass::make_cute_packed_stride(StrideC{}, make_shape(m, n, 1));
   StrideD stride_d = cutlass::make_cute_packed_stride(StrideD{}, make_shape(m, n, 1));
 
@@ -129,8 +130,9 @@ cutlass::Status launch_config(
     const cutlass::KernelHardwareInfo& hw_info,
     sycl::queue& queue,
     int n,
-    int k) {
-  return launch<typename Config::Gemm>(a, b, out, hw_info, queue, n, k);
+    int k,
+    int packed_b_width) {
+  return launch<typename Config::Gemm>(a, b, out, hw_info, queue, n, k, packed_b_width);
 }
 
 }  // namespace
@@ -149,10 +151,14 @@ void bf16_gemm_nt_xpu(at::Tensor& output, const at::Tensor& mat_a, const at::Ten
   const bool packed_b = config == 2;
   TORCH_CHECK(mat_a.size(1) == (packed_b ? mat_b.size(0) : mat_b.size(1)), "K mismatch");
   TORCH_CHECK(
-      output.size(0) == mat_a.size(0) && output.size(1) == (packed_b ? mat_b.size(1) : mat_b.size(0)),
+      output.size(0) == mat_a.size(0) && output.size(1) > 0 &&
+          (packed_b ? output.size(1) <= mat_b.size(1) : output.size(1) == mat_b.size(0)),
       "output shape mismatch");
   TORCH_CHECK(mat_a.size(0) > 0 && mat_b.size(0) > 0 && mat_a.size(1) > 0, "dimensions must be positive");
-  TORCH_CHECK(mat_a.size(0) <= INT_MAX && mat_b.size(0) <= INT_MAX && mat_a.size(1) <= INT_MAX, "dimension too large");
+  TORCH_CHECK(
+      mat_a.size(0) <= INT_MAX && mat_b.size(0) <= INT_MAX && mat_a.size(1) <= INT_MAX && mat_b.size(1) <= INT_MAX &&
+          output.size(1) <= INT_MAX,
+      "dimension too large");
 
   c10::DeviceGuard guard(mat_a.device());
   sycl::queue& queue = at::xpu::getCurrentXPUStream(mat_a.device().index()).queue();
@@ -161,20 +167,22 @@ void bf16_gemm_nt_xpu(at::Tensor& output, const at::Tensor& mat_a, const at::Ten
   hw_info.sm_count = cutlass::KernelHardwareInfo::query_device_multiprocessor_count(hw_info.device_id);
 
   const int m = static_cast<int>(mat_a.size(0));
-  const int n = static_cast<int>(packed_b ? mat_b.size(1) : mat_b.size(0));
+  const int n = static_cast<int>(output.size(1));
   const int k = static_cast<int>(mat_a.size(1));
+  const int packed_b_width = packed_b ? static_cast<int>(mat_b.size(1)) : n;
+  TORCH_CHECK(
+      n % 16 == 0 && k % 16 == 0 && packed_b_width % 16 == 0, "N, K, and packed B width must be multiples of 16");
   cutlass::Status status;
   if (config == 0 || config == 1) {
-    status = launch_config<Bf16GemmNtConfig<64, 256, 8, 4, 64>>(mat_a, mat_b, output, hw_info, queue, n, k);
+    status =
+        launch_config<Bf16GemmNtConfig<64, 256, 8, 4, 64>>(mat_a, mat_b, output, hw_info, queue, n, k, packed_b_width);
   } else if (config == 2) {
-    // CRI graph timing across M=4..12 puts the QKV tile crossover between
-    // M=8 and M=9: the 8-row tile wins through 8, then the 16-row tile wins.
-    if (m <= 8 && n == 18432 && k == 8192) {
-      status = launch_config<Bf16GemmNtConfig<8, 256, 1, 16, 32, true, 2>>(mat_a, mat_b, output, hw_info, queue, n, k);
-    } else if (m <= 16) {
-      status = launch_config<Bf16GemmNtConfig<16, 256, 2, 16, 32, true, 2>>(mat_a, mat_b, output, hw_info, queue, n, k);
+    if (m <= 16) {
+      status = launch_config<Bf16GemmNtConfig<16, 256, 2, 16, 32, true, 2>>(
+          mat_a, mat_b, output, hw_info, queue, n, k, packed_b_width);
     } else {
-      status = launch_config<Bf16GemmNtConfig<32, 256, 4, 8, 64, true, 2>>(mat_a, mat_b, output, hw_info, queue, n, k);
+      status = launch_config<Bf16GemmNtConfig<32, 256, 4, 8, 64, true, 2>>(
+          mat_a, mat_b, output, hw_info, queue, n, k, packed_b_width);
     }
   } else {
     status = cutlass::Status::kErrorInvalidProblem;

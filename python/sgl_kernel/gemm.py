@@ -1,7 +1,80 @@
+from functools import lru_cache
 from typing import List, Optional, Tuple
 
 import torch
 from sgl_kernel.utils import _get_cache_buf, get_xpu_stream
+
+
+@lru_cache(maxsize=None)
+def _bf16_gemm_nt_is_profiled_device(index: int) -> bool:
+    return "0x674f" in torch.xpu.get_device_name(index).lower()
+
+
+def _bf16_gemm_nt_use_cute(
+    mat_a: torch.Tensor, m: int, n: int, k: int, packed_weight: bool
+) -> bool:
+    if not _bf16_gemm_nt_is_profiled_device(mat_a.device.index or 0):
+        # Preserve the original native-weight path on devices without paired
+        # crossover measurements.
+        return not packed_weight
+    if not packed_weight:
+        # Paired native-B timings cross sharply at M=8/9. Around 4K, the
+        # crossover also follows K tile alignment and weight size; use the
+        # measured contiguous regions rather than individual model widths.
+        if not 0 < m <= 8:
+            return False
+        weight_elems = n * k
+        if k % 1024 == 0 and 3 * 1024 <= k <= 4 * 1024:
+            min_elems = 20 * 1024 * 1024 if k >= 4 * 1024 else 30 * 1024 * 1024
+            return min_elems <= weight_elems <= 100 * 1024 * 1024
+        if (
+            k % 16 != 0
+            or not 4 * 1024 - 96 <= k <= 4 * 1024 + 96
+            or weight_elems > 82 * 1024 * 1024
+        ):
+            return False
+        # A power-of-two row count avoids the N crossover at this smaller
+        # weight size. Neighboring non-power-of-two N favored torch.mm.
+        if (
+            (n & (n - 1)) == 0
+            and abs(k - 4 * 1024) <= 16
+            and weight_elems >= 31 * 1024 * 1024
+        ):
+            return True
+        if abs(k - 4 * 1024) <= 16 and weight_elems >= 43 * 1024 * 1024:
+            return True
+        if k % 64 == 32 and weight_elems >= 39 * 1024 * 1024:
+            return True
+        # The edge K tiles have a short throughput dip just above 16K rows.
+        min_large_elems = 65 * 1024 * 1024 if k % 64 == 48 else 66 * 1024 * 1024
+        return (
+            abs(k - 4 * 1024) <= 48
+            and weight_elems >= 47 * 1024 * 1024
+            and (n <= 16 * 1024 or weight_elems >= min_large_elems)
+        )
+    # On this Xe35 device, paired BF16 graph timings favor CuTe for packed
+    # weights above roughly 200 MiB. Smaller weights and power-of-two row
+    # strides favor torch.mm. The M bounds follow the measured kernel
+    # crossover; larger M needs a smaller weight to stay ahead of torch.mm.
+    if m <= 0 or n < 14336 or n * k < 100 * 1024 * 1024 or n & (n - 1) == 0:
+        return False
+    if m <= 16 or 33 <= m <= 80:
+        return True
+    return 81 <= m <= 128 and n >= 16384 and n * k <= 200 * 1024 * 1024
+
+
+def _bf16_gemm_nt_torch_fallback(
+    mat_a: torch.Tensor, mat_b: torch.Tensor, packed_weight: bool
+) -> torch.Tensor:
+    if packed_weight:
+        return torch.mm(mat_a, mat_b)
+    if (
+        mat_a.device.type == "xpu"
+        and mat_a.dtype == torch.bfloat16
+        and mat_b.dtype == torch.bfloat16
+    ):
+        return torch.mm(mat_a, mat_b.T, out_dtype=torch.bfloat16)
+    return torch.mm(mat_a, mat_b.T)
 
 
 def awq_dequantize(
@@ -43,37 +116,29 @@ def fp8_scaled_mm(mat_a, mat_b, scales_a, scales_b, out_dtype, bias=None):
 
 
 def bf16_gemm_nt(
-    mat_a: torch.Tensor, mat_b: torch.Tensor, *, packed_weight: bool = False
+    mat_a: torch.Tensor,
+    mat_b: torch.Tensor,
+    *,
+    packed_weight: bool = False,
+    output_n: Optional[int] = None,
 ) -> torch.Tensor:
     """Compute an XPU BF16 GEMM with a model-native or prepacked weight.
 
     ``mat_b`` is ``[N, K]`` by default. When ``packed_weight`` is true it is
     a contiguous ``[K, padded_N]`` tensor produced by
-    :func:`pack_bf16_gemm_weight`. The caller crops padded output columns.
+    :func:`pack_bf16_gemm_weight`. ``output_n`` selects the logical output
+    width while retaining the packed weight's physical stride.
     """
     assert mat_a.ndim == 2 and mat_b.ndim == 2
     k = mat_b.shape[0] if packed_weight else mat_b.shape[1]
     n = mat_b.shape[1] if packed_weight else mat_b.shape[0]
     assert mat_a.shape[1] == k
-    # These are kernel-vs-packed-oneDNN boundaries for the three measured
-    # Muse-Spark projections. The model separately decides whether packing
-    # beats its original-weight path. O switches at M=16/17; its CuTe path
-    # was 0.171 ms at M=96 versus 0.125 ms for packed oneDNN. The lm_head
-    # N is padded from 202048. Its CuTe path wins at sampled M=65..79;
-    # packed oneDNN wins strongly by M=95/96, with a near tie at M=80/81.
-    use_packed_kernel = not packed_weight or (
-        (
-            n == 202240
-            and k == 8192
-            and (mat_a.shape[0] <= 16 or 33 <= mat_a.shape[0] <= 79)
+    if output_n is not None and (not packed_weight or not 0 < output_n <= n):
+        raise ValueError(
+            "output_n requires a packed weight and must be within its width"
         )
-        or (
-            n == 18432
-            and k == 8192
-            and (mat_a.shape[0] <= 8 or 33 <= mat_a.shape[0] <= 96)
-        )
-        or (n == 8192 and k == 8192 and mat_a.shape[0] <= 16)
-    )
+    logical_n = output_n if output_n is not None else n
+    fallback_b = mat_b[:, :logical_n] if packed_weight and logical_n != n else mat_b
     if (
         mat_a.device.type != "xpu"
         or mat_a.dtype != torch.bfloat16
@@ -82,10 +147,14 @@ def bf16_gemm_nt(
         or not mat_b.is_contiguous()
         or k % 16 != 0
         or n % 16 != 0
-        or not use_packed_kernel
+        or logical_n % 16 != 0
     ):
-        return torch.mm(mat_a, mat_b if packed_weight else mat_b.T)
-    out = torch.empty((mat_a.shape[0], n), dtype=torch.bfloat16, device=mat_a.device)
+        return _bf16_gemm_nt_torch_fallback(mat_a, fallback_b, packed_weight)
+    if not _bf16_gemm_nt_use_cute(mat_a, mat_a.shape[0], n, k, packed_weight):
+        return _bf16_gemm_nt_torch_fallback(mat_a, fallback_b, packed_weight)
+    out = torch.empty(
+        (mat_a.shape[0], logical_n), dtype=torch.bfloat16, device=mat_a.device
+    )
     torch.ops.sgl_kernel.bf16_gemm_nt.default(
         out, mat_a, mat_b, 2 if packed_weight else 0
     )
@@ -99,6 +168,22 @@ def pack_bf16_gemm_weight(weight: torch.Tensor) -> torch.Tensor:
     assert weight.is_contiguous()
     n, k = weight.shape
     padded_n = (n + 255) // 256 * 256
+    # Keep device-specific packing choices on the device where they were
+    # measured. Other devices retain the ordinary transposed layout.
+    tuned_device = weight.device.type == "xpu" and _bf16_gemm_nt_is_profiled_device(
+        weight.device.index or 0
+    )
+    # Power-of-two row strides from 16K onward show a repeatable packed GEMM
+    # throughput cliff on this Xe35 device. One more block avoids it.
+    power_of_two_stride = (
+        tuned_device and padded_n >= 16384 and padded_n & (padded_n - 1) == 0
+    )
+    if power_of_two_stride:
+        padded_n += 256
+    # For very large weights with an N that is not 32-aligned, writing into a
+    # sliced packed tensor is much slower than padding before the transpose.
+    if power_of_two_stride or (tuned_device and n * k >= 1 << 30 and n % 32 != 0):
+        return torch.nn.functional.pad(weight, (0, 0, 0, padded_n - n)).T.contiguous()
     # Materialize the transpose before writing into a padded slice. XPU
     # copy_ from a transposed source can leave isolated columns unwritten.
     transposed = weight.T.contiguous()
