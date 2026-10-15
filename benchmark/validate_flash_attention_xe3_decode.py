@@ -5,6 +5,7 @@ import sgl_kernel  # noqa: F401
 import torch
 from sgl_kernel.flash_attn import flash_attn_with_kvcache
 
+# Muse-Spark: B8, ISL4096, OSL16, Q/KV heads128/16, D64, BF16, TP1/EP1.
 BATCH = 8
 SEQLEN_K = 4097
 PAGE_SIZE = 64
@@ -75,7 +76,7 @@ def main():
         error = out.float().cpu() - ref
         max_abs = error.abs().max().item()
         mean_abs = error.abs().mean().item()
-        torch.testing.assert_close(out.float().cpu(), ref, rtol=2e-2, atol=2e-2)
+        torch.testing.assert_close(out.float().cpu(), ref, rtol=5e-3, atol=5e-3)
         print(
             f"{'swa' if local else 'global'}: max_abs={max_abs:.6f} "
             f"mean_abs={mean_abs:.6f}"

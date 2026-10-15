@@ -47,8 +47,6 @@ def cpu_ref(
     batch, _, num_heads_q, head_dim = q.shape
     _, page_size, num_heads_kv, _ = k_cache.shape
 
-    dtype = q.dtype
-
     q = q.cpu()
     k_cache = k_cache.cpu()
     v_cache = v_cache.cpu()
@@ -135,9 +133,6 @@ def cpu_ref(
 
             out[b, :, h, :] = torch.matmul(attn_weights, v_head)
 
-    if upcast and dtype != torch.float32:
-        out = out.to(dtype)
-
     return out
 
 
@@ -211,7 +206,7 @@ def test_flash_attention_xe3_prefill_local_window_boundary(window_left, page_siz
         upcast=True,
     )
     torch.testing.assert_close(
-        out.float().cpu().reshape_as(expected), expected.float(), rtol=2e-2, atol=2e-2
+        out.float().cpu().reshape_as(expected), expected.float(), rtol=5e-3, atol=5e-3
     )
     torch.xpu.synchronize()
 
@@ -321,26 +316,13 @@ def test_flash_attention_xe3_fwd(
         sinks=sinks,
         upcast=True,
     )
-    out_ref_bf16 = cpu_ref(
-        q,
-        k_cache,
-        v_cache,
-        page_table,
-        cache_seqlens,
-        seqlen_q,
-        softmax_scale,
-        window_size=window_size,
-        causal=causal,
-        sinks=sinks,
-        upcast=False,
-    )
     out_kernel = out.view(batch, seqlen_q, nheads_q, head_dim)
-    kernel_diff = (out_kernel.float().cpu() - out_ref_fp32).abs().max().item()
-    baseline_diff = (out_ref_bf16 - out_ref_fp32).abs().max().item()
-    tol = 2.0 * baseline_diff + 1e-5
-    assert kernel_diff <= tol, (
-        f"Xe3 flash attention case={case_name} failed: kernel_diff={kernel_diff} > tol={tol} "
-        f"(baseline={baseline_diff})"
+    torch.testing.assert_close(
+        out_kernel.float().cpu(),
+        out_ref_fp32,
+        atol=5e-3,
+        rtol=5e-3,
+        msg=f"Xe3 flash attention case={case_name}",
     )
 
 
@@ -398,21 +380,12 @@ def test_flash_attention_xe3_decode_gqa_fusion(window_size):
         causal=True,
         upcast=True,
     )
-    ref_bf16 = cpu_ref(
-        q,
-        k_cache,
-        v_cache,
-        page_table,
-        cache_seqlens,
-        seqlen_q,
-        softmax_scale,
-        window_size=window_size,
-        causal=True,
-        upcast=False,
+    torch.testing.assert_close(
+        out.view_as(q).float().cpu(),
+        ref_fp32,
+        atol=5e-3,
+        rtol=5e-3,
     )
-    kernel_diff = (out.view_as(q).float().cpu() - ref_fp32).abs().max().item()
-    baseline_diff = (ref_bf16 - ref_fp32).abs().max().item()
-    assert kernel_diff <= 2.0 * baseline_diff + 1e-5
 
 
 if __name__ == "__main__":

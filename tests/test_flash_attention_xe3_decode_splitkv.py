@@ -24,7 +24,7 @@ def is_xpu_available():
 def is_cri_device():
     if not is_xpu_available():
         return False
-    return torch.xpu.get_device_properties(0).device_id == 0x674F
+    return sgl_kernel.is_xe3_arch()
 
 
 def reference(q, k_cache, v_cache, page_table, cache_seqlens, window_left):
@@ -147,7 +147,7 @@ CASES = [
 def test_decode_splitkv(lengths, heads_q, heads_kv, head_dim, page_size, window):
     out, ref = run_case(lengths, heads_q, heads_kv, head_dim, page_size, window)
     assert torch.isfinite(out).all()
-    torch.testing.assert_close(out, ref, rtol=2e-2, atol=2e-2)
+    torch.testing.assert_close(out, ref, rtol=5e-3, atol=5e-3)
 
 
 @pytest.mark.skipif(not is_cri_device(), reason="Requires a CRI (Xe3P) device")
@@ -164,7 +164,7 @@ def test_decode_explicit_split_count(num_splits, window, heads_q):
         window,
         num_splits=num_splits,
     )
-    torch.testing.assert_close(out, ref, rtol=2e-2, atol=2e-2)
+    torch.testing.assert_close(out, ref, rtol=5e-3, atol=5e-3)
 
 
 @pytest.mark.skipif(not is_xpu_available(), reason="Intel XPU not available")
@@ -233,7 +233,7 @@ def test_decode_splitkv_concurrent_torch_streams_b8():
                 outputs.append((out, ref))
         torch.xpu.synchronize()
         for out, ref in outputs:
-            torch.testing.assert_close(out.float().cpu(), ref, rtol=2e-2, atol=2e-2)
+            torch.testing.assert_close(out.float().cpu(), ref, rtol=5e-3, atol=5e-3)
 
 
 if __name__ == "__main__":
