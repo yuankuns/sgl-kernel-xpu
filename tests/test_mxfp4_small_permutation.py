@@ -5,12 +5,12 @@ import torch
 
 @pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64])
 @pytest.mark.parametrize("experts,alignment", [(128, 4), (256, 4), (512, 16)])
-def test_muse_mxfp4_small_permutation(index_dtype, experts, alignment):
+@pytest.mark.parametrize("tokens", [1, 7, 8, 9, 16])
+def test_mxfp4_small_permutation(index_dtype, experts, alignment, tokens):
     if not torch.xpu.is_available():
         pytest.skip("XPU unavailable")
 
-    # B=8, topk=8. Repeated experts exercise stable ordering and padding.
-    tokens, topk = 8, 8
+    topk = 8
     ids_cpu = (
         torch.arange(tokens * topk, dtype=torch.int64).reshape(tokens, topk) * 7
     ) % 23
