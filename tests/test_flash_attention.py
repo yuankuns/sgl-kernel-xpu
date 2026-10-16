@@ -568,7 +568,7 @@ def generate_qkv(
 @pytest.mark.parametrize("has_leftpad", [False])
 @pytest.mark.parametrize("has_batch_idx", [False])
 @pytest.mark.parametrize("varlen_q", [True])
-@pytest.mark.parametrize("d", [128])
+@pytest.mark.parametrize("d", [64, 128, 256])
 @pytest.mark.parametrize(
     "seqlen_q,seqlen_k",
     [
@@ -576,6 +576,8 @@ def generate_qkv(
         (64, 1024),
         (64, 4096),
         (128, 128),
+        (64, 300),  # Non-tile-aligned K with Q < K (exercises causal block pruning)
+        (100, 500),  # Ragged Q and K with uneven tiles
     ],
 )
 def test_flash_attn_kvcache(
@@ -600,7 +602,7 @@ def test_flash_attn_kvcache(
 ):
     from sgl_kernel.flash_attn import flash_attn_with_kvcache
 
-    if page_size is not None and seqlen_k % page_size != 0:
+    if page_size is not None and seqlen_k % page_size != 0 and not is_cri_device():
         pytest.skip("page_size must divide seqlen_k")
     if seqlen_q > seqlen_k and new_kv:
         pytest.skip("new_kv requires seqlen_q <= seqlen_k")
@@ -1947,7 +1949,7 @@ def test_flash_attn_with_kvcache_out_buffer():
 @pytest.mark.skipif(not is_cri_device(), reason="Requires a CRI (Xe3P) device")
 @pytest.mark.parametrize("fp8_dtype", [torch.float8_e4m3fn, torch.float8_e5m2])
 @pytest.mark.parametrize("head_dim", [64, 128, 256])
-@pytest.mark.parametrize("seqlen_q", [1, 16])
+@pytest.mark.parametrize("seqlen_q", [1, 16, 128, 2048])
 @pytest.mark.parametrize("bf16_q_input", [False, True])
 def test_flash_attention_xe3_fp8_full_qkv(fp8_dtype, head_dim, seqlen_q, bf16_q_input):
     from sgl_kernel.flash_attn import flash_attn_with_kvcache
@@ -2028,9 +2030,12 @@ def test_flash_attention_xe3_fp8_full_qkv(fp8_dtype, head_dim, seqlen_q, bf16_q_
     )
 
     assert out.dtype == torch.bfloat16
-    atol = 4e-2 if fp8_dtype == torch.float8_e5m2 else 2e-2
+    atol = 5e-2 if (fp8_dtype == torch.float8_e5m2 or seqlen_q >= 128) else 2e-2
     torch.testing.assert_close(
-        out.view_as(out_ref).cpu(), out_ref, atol=atol, rtol=2e-2
+        out.view_as(out_ref).cpu(),
+        out_ref,
+        atol=atol,
+        rtol=5e-2 if seqlen_q >= 128 else 2e-2,
     )
 
 

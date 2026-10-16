@@ -122,9 +122,9 @@ use_sinks = [True, False]
 batch_size = [1, 4, 8, 16, 32, 64]
 # prefill: q_seq_length in [1024, 2048, 4096]; decode: q_seq_length == 1
 q_seq_length_range = [1, 1024, 2048, 4096]
-head_dim = [128]
+head_dim = [128, 256]
 num_heads_q = [16]
-num_heads_kv = [8]
+num_heads_kv = [2, 8]
 kv_seq_length_range = [1024, 2048, 4096, 8192]
 # Test both no-page (0) and paged (128)
 page_size_range = [0, 128]
@@ -146,12 +146,15 @@ configs = list(
             and (cfg[9] != 0 or not cfg[2])
             # Condition 6: sink is only supported for head_size == 64
             and (not cfg[2] or cfg[5] == 64)
-            # Condition 7: Xe35 full-QKV FP8 supports paged attention without sinks, with head dims 64/128
+            # Condition 7: Xe35 full-QKV FP8 supports paged attention without sinks, with head dims 64/128/256
             and (
-                cfg[10] == "bf16" or (cfg[9] > 0 and not cfg[2] and cfg[5] in (64, 128))
+                cfg[10] == "bf16"
+                or (cfg[9] > 0 and not cfg[2] and cfg[5] in (64, 128, 256))
             )
             # Condition 8: for prefill (q_seq_length > 1), test matching q and kv seqlen and limit batch size <= 16
             and (cfg[4] == 1 or (cfg[4] == cfg[8] and cfg[3] <= 16))
+            # Condition 9: head_dim=256 is only supported in paged mode (page_size > 0)
+            and (cfg[5] != 256 or cfg[9] > 0)
         ),
         [
             cfg
