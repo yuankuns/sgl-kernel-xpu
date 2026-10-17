@@ -1,0 +1,109 @@
+diff --git a/python/sglang/kernels/ops/attention/position.py b/python/sglang/kernels/ops/attention/position.py
+index f9196d4967..81b33564f9 100644
+--- a/python/sglang/kernels/ops/attention/position.py
++++ b/python/sglang/kernels/ops/attention/position.py
+@@ -4,7 +4,10 @@ import triton.language as tl
+ 
+ 
+ def compute_position_triton(
+-    extend_prefix_lens: torch.Tensor, extend_seq_lens: torch.Tensor, extend_seq_lens_sum
++    extend_prefix_lens: torch.Tensor,
++    extend_seq_lens: torch.Tensor,
++    extend_seq_lens_sum: int,
++    max_seq_len_hint: int = -1,
+ ):
+     """Compute positions. It is a fused version of `compute_position_torch`."""
+     batch_size = extend_seq_lens.shape[0]
+@@ -17,13 +20,22 @@ def compute_position_triton(
+         batch_size, dtype=torch.int32, device=extend_seq_lens.device
+     )
+ 
+-    # Launch kernel
+-    compute_position_kernel[(batch_size,)](
++    if batch_size == 0:
++        return positions, extend_start_loc
++
++    # Spread a long request across programs while keeping one program for
++    # short requests. A stale hint changes only occupancy, not coverage.
++    average_groups = triton.cdiv(extend_seq_lens_sum, batch_size * 512)
++    hinted_groups = triton.cdiv(max_seq_len_hint, 512) if max_seq_len_hint > 0 else 1
++    useful_groups = max(1, triton.cdiv(extend_seq_lens_sum, 512))
++    groups_per_request = min(useful_groups, max(1, average_groups, hinted_groups))
++    compute_position_kernel[(batch_size, groups_per_request)](
+         positions,
+         extend_start_loc,
+         extend_prefix_lens,
+         extend_seq_lens,
+         has_prefix,
++        groups_per_request,
+     )
+ 
+     return positions, extend_start_loc
+@@ -36,9 +48,11 @@ def compute_position_kernel(
+     extend_prefix_lens,
+     extend_seq_lens,
+     has_prefix: tl.constexpr,
++    groups_per_request: tl.constexpr,
+ ):
+     BLOCK_SIZE: tl.constexpr = 512
+     pid = tl.program_id(0).to(tl.int64)
++    tile = tl.program_id(1).to(tl.int64)
+ 
+     prefix_len = tl.load(extend_prefix_lens + pid) if has_prefix else 0
+     seq_len = tl.load(extend_seq_lens + pid)
+@@ -48,12 +62,12 @@ def compute_position_kernel(
+     for i in range(pid):
+         cumsum_start += tl.load(extend_seq_lens + i)
+ 
+-    num_loop = tl.cdiv(seq_len, BLOCK_SIZE)
+-    for i in range(num_loop):
+-        offset = tl.arange(0, BLOCK_SIZE) + i * BLOCK_SIZE
++    for i in range(tile * BLOCK_SIZE, seq_len, groups_per_request * BLOCK_SIZE):
++        offset = tl.arange(0, BLOCK_SIZE) + i
+         tl.store(
+             positions + cumsum_start + offset,
+             prefix_len + offset,
+             mask=offset < seq_len,
+         )
+-    tl.store(extend_start_loc + pid, cumsum_start)
++    if tile == 0:
++        tl.store(extend_start_loc + pid, cumsum_start)
+diff --git a/python/sglang/srt/model_executor/forward_batch_info.py b/python/sglang/srt/model_executor/forward_batch_info.py
+index ee2e5d2bf0..2d6585ebd7 100644
+--- a/python/sglang/srt/model_executor/forward_batch_info.py
++++ b/python/sglang/srt/model_executor/forward_batch_info.py
+@@ -1104,9 +1104,11 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
+             if ret.positions is None:
+                 ret.positions = clamp_position(batch.seq_lens)
+         else:
++            max_seq_len_hint = -1
+             if isinstance(extend_seq_lens, list):
+                 # Main path: H2D from host lists; populate *_cpu mirrors.
+                 assert isinstance(extend_prefix_lens, list)
++                max_seq_len_hint = max(extend_seq_lens, default=0)
+                 pin_memory = is_pin_memory_available(device)
+                 ret.extend_seq_lens = torch.tensor(
+                     extend_seq_lens, dtype=torch.int32, pin_memory=pin_memory
+@@ -1127,6 +1129,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
+                 ret.extend_prefix_lens,
+                 ret.extend_seq_lens,
+                 ret.extend_num_tokens,
++                max_seq_len_hint,
+             )
+             if ret.positions is None:
+                 ret.positions = positions
+@@ -2123,12 +2126,14 @@ def compute_position(
+     extend_prefix_lens: torch.Tensor,
+     extend_seq_lens: torch.Tensor,
+     extend_seq_lens_sum: int,
++    max_seq_len_hint: int = -1,
+ ):
+     if support_triton(attn_backend):
+         positions, extend_start_loc = compute_position_triton(
+             extend_prefix_lens,
+             extend_seq_lens,
+             extend_seq_lens_sum,
++            max_seq_len_hint,
+         )
+     else:
+         positions, extend_start_loc = compute_position_torch(
