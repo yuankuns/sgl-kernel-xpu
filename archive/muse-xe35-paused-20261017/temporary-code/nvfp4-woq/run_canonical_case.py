@@ -1,0 +1,183 @@
+import argparse
+import hashlib
+import importlib.util
+import json
+import os
+import pathlib
+import time
+
+import torch
+
+import canonical_check
+
+from compare_source_port import device_samples_xe35, serving_scope_xe35, tensor_hash_xe35
+
+
+def full_tensor_evidence(tensor, cache, name, create, exact):
+    digest = hashlib.sha256()
+    maximum = 0.0
+    equal = True
+    for chunk_index, chunk in enumerate(tensor.split(16 if name != 'output' else 1024)):
+        actual = chunk.contiguous().cpu()
+        digest.update(actual.view(torch.uint8).numpy().tobytes())
+        path = cache / f'{name}-{chunk_index}.pt'
+        if create:
+            torch.save(actual, path)
+        else:
+            expected = torch.load(path, weights_only=True)
+            if exact:
+                assert torch.equal(actual, expected), f'full {name} differs in chunk {chunk_index}'
+            else:
+                torch.testing.assert_close(actual, expected, rtol=5e-3, atol=5e-3)
+            maximum = max(maximum, (actual.float() - expected.float()).abs().max().item())
+            equal = equal and torch.equal(actual, expected)
+    return {'sha256': digest.hexdigest(), 'max_abs': maximum, 'exact': equal,
+            'all_elements_checked': True, 'first_phase_cache_created': create}
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('label', choices=('source', 'port'))
+    parser.add_argument('--phase', type=int, required=True, choices=range(4))
+    parser.add_argument('--round', type=int, required=True)
+    parser.add_argument('--run', required=True)
+    parser.add_argument('--tail-only', action='store_true')
+    parser.add_argument('--accuracy-only', action='store_true')
+    parser.add_argument('--version', default=canonical_check.DEFAULT_VERSION)
+    parser.add_argument('--warmup', type=int, default=10)
+    parser.add_argument('--iterations', type=int, default=20)
+    args = parser.parse_args()
+    canonical_check.select_version(args.version)
+    serving_scope_xe35()
+    if args.round < 0 or args.warmup < 0 or args.iterations <= 0:
+        parser.error('invalid timing controls')
+    artifact = pathlib.Path('/root/worktrees/sgl-kernel-xpu-up/muse-upstream-artifacts-20261017/nvfp4-woq')
+    canonical = artifact / args.version
+    official = canonical_check.check(args.version)
+    if not args.accuracy_only and (os.environ.get('ZE_AFFINITY_MASK') != '5' or not os.environ.get('NVFP4_GRANTED_MANIFEST_SHA256')):
+        raise RuntimeError('Timing prohibited without explicit main GPU5 canonical grant')
+    if not args.accuracy_only and os.environ['NVFP4_GRANTED_MANIFEST_SHA256'] != official['manifest_sha256']:
+        raise RuntimeError('GPU5 grant belongs to a different canonical manifest')
+    if args.accuracy_only and os.environ.get('ZE_AFFINITY_MASK') != '9':
+        raise RuntimeError('Canonical accuracy requires allocated GPU9')
+    result_dir = canonical / 'results' / args.run
+    result_dir.mkdir(parents=True, exist_ok=True)
+    import sgl_kernel
+
+    if args.label == 'port':
+        official = canonical_check.runtime(official)
+        expected_package = canonical / 'site/sgl_kernel'
+    else:
+        import verify_source_baseline
+        source_baseline = verify_source_baseline.verify(runtime=True)
+        expected_package = artifact / 'native-diagnostic/source/site/sgl_kernel'
+    assert pathlib.Path(sgl_kernel.__file__).parent == expected_package
+    if not torch.xpu.is_available() or not sgl_kernel.is_xe3_arch():
+        raise RuntimeError('NVFP4 requires actual Xe35 (3.5)')
+    suffix = '_xe35' if args.label == 'port' else ''
+    prep = getattr(sgl_kernel, 'nvfp4_woq_prep' + suffix)
+    bf16 = getattr(sgl_kernel, 'nvfp4_woq_bf16_grouped_mm' + suffix)
+    mxfp8 = getattr(sgl_kernel, 'nvfp4_woq_mxfp8_scaled_grouped_mm' + suffix)
+    target = pathlib.Path('/root/worktrees/sgl-kernel-xpu-up/pr/muse-nvfp4-woq-xe35')
+    specification = importlib.util.spec_from_file_location('independent_reference', target / 'benchmark/accuracy_reference.py')
+    reference = importlib.util.module_from_spec(specification)
+    specification.loader.exec_module(reference)
+    source_tree = pathlib.Path('/root/worktrees/sgl-kernel-xpu/muse-spark-nvfp4-woq-main-20261014')
+    specification = importlib.util.spec_from_file_location('original_scale_reference', source_tree / 'tests/nvfp4_utils.py')
+    scale_reference = importlib.util.module_from_spec(specification)
+    specification.loader.exec_module(scale_reference)
+    torch.set_num_threads(8)
+    print(json.dumps({'diagnostic_only': False, 'official_acceptance': True,
+                      'package': sgl_kernel.__file__, 'registration': sgl_kernel.common_ops.__file__,
+                      'gpu': torch.xpu.get_device_name(0), 'gpu_mask': os.environ.get('ZE_AFFINITY_MASK'),
+                      'scope': 'B8/ISL4096/OSL16/TP1/EP1', 'label': args.label, 'accuracy_only': args.accuracy_only,
+                      'round': args.round, 'phase': args.phase, 'canonical_version': args.version}), flush=True)
+    shapes = [(4, 11, 192, 64), (3, 65, 256, 128)] if args.tail_only else [(256, rows, 8192, inner) for inner in (8192, 4096) for rows in (64, 262144)]
+    results = []
+    for experts, rows, channels, inner in shapes:
+        torch.xpu.synchronize()
+        time.sleep(2)
+        torch.manual_seed(20261017 + rows + inner)
+        counts = [1, 7, 0, 3] if experts == 4 else [rows // experts] * experts
+        if experts != 4:
+            for expert in torch.randperm(experts)[:rows % experts].tolist():
+                counts[expert] += 1
+        problems = torch.tensor([[count, channels, inner] for count in counts], device='xpu', dtype=torch.int32)
+        offsets = torch.tensor([sum(counts[:expert]) for expert in range(experts)], device='xpu', dtype=torch.int32)
+        weights = torch.randint(0, 256, (experts, channels, inner // 2), device='xpu', dtype=torch.uint8)
+        raw_scales = torch.randint(1, 9, (experts, channels, inner // 16), device='xpu', dtype=torch.int8).to(torch.float8_e4m3fn)
+        global_scales = torch.exp2(torch.arange(experts, device='xpu', dtype=torch.float32) % 5 - 2)
+        multipliers, exponents = prep(raw_scales, global_scales)
+        direct_reference = args.round == 0 and args.phase in (0, 1)
+        if direct_reference:
+            for expert in range(experts):
+                expected_c, expected_sf = scale_reference.nvfp4_woq_prep_ref(raw_scales[expert:expert + 1].cpu(), global_scales[expert:expert + 1].cpu())
+                assert torch.equal(multipliers[expert:expert + 1].cpu(), expected_c)
+                assert torch.equal(exponents[expert:expert + 1].cpu(), expected_sf)
+        cache = result_dir / f'E{experts}-M{rows}-N{channels}-K{inner}'
+        cache.mkdir(exist_ok=True)
+        create = args.round == 0 and args.phase == 0
+        scales_report = {
+            'c': full_tensor_evidence(multipliers, cache, 'c', create, True),
+            'sf': full_tensor_evidence(exponents, cache, 'sf', create, True),
+        }
+        workspace = torch.empty(64 * 1024 * 1024, device='xpu', dtype=torch.uint8)
+        for mode in (('bf16', 'mxfp8') if args.tail_only else ('bf16',)):
+            torch.xpu.synchronize()
+            time.sleep(2)
+            activations = torch.randint(-4, 5, (rows, inner), device='xpu', dtype=torch.int8).to(torch.bfloat16 if mode == 'bf16' else torch.float8_e4m3fn)
+            activation_scales = torch.full((rows, inner // 32), 127, device='xpu', dtype=torch.uint8) if mode == 'mxfp8' else None
+            output = torch.empty((rows, channels), device='xpu', dtype=torch.float32)
+            if mode == 'bf16':
+                function = lambda: bf16(output, activations, weights, exponents, multipliers, problems, offsets, workspace)
+            else:
+                function = lambda: mxfp8(output, activations, weights, activation_scales, exponents, multipliers, problems, offsets, workspace)
+            function()
+            torch.xpu.synchronize()
+            independent = reference.verify_grouped_output_xe35(output, activations, weights, multipliers, exponents, counts, mode, activation_scales, max_rows=max(counts) if args.tail_only else 3) if direct_reference else {'reference': 'full output/scales compared to independently validated first port phase; identical input hashes', 'direct_reference': False}
+            mode_cache = cache / mode
+            mode_cache.mkdir(exist_ok=True)
+            output_report = full_tensor_evidence(output, mode_cache, 'output', create, mode == 'mxfp8')
+            inputs = {name: tensor_hash_xe35(tensor) for name, tensor in
+                      (('packed', weights), ('raw_scales', raw_scales), ('globals', global_scales), ('activations', activations))}
+            inputs_path = mode_cache / 'inputs.json'
+            if create:
+                inputs_path.write_text(json.dumps(inputs, sort_keys=True))
+            else:
+                assert json.loads(inputs_path.read_text()) == inputs, 'BAAB inputs must be identical'
+            torch.xpu.synchronize()
+            time.sleep(2)
+            samples = [] if args.accuracy_only else device_samples_xe35(function, args.warmup, args.iterations)
+            assert all(sample > 0 for sample in samples)
+            report = {'label': args.label, 'shape': [experts, rows, channels, inner], 'counts': counts,
+                      'mode': mode, 'round': args.round, 'phase': args.phase, 'scales': scales_report,
+                      'output': output_report, 'reference': independent, 'inputs': inputs, 'samples_us': samples}
+            oracle_limit = max(counts) if args.tail_only else 3
+            oracle_rows = [min(count, oracle_limit) for count in counts]
+            report['independent_reference_coverage'] = {
+                'compute_dtype': 'CPU FP32',
+                'direct_in_this_phase': direct_reference,
+                'max_rows_per_expert': oracle_limit,
+                'rows_per_expert_with_oracle': oracle_rows,
+                'rows_per_expert_without_direct_oracle': [count - checked for count, checked in zip(counts, oracle_rows)],
+                'full_dataset_oracle_available': sum(oracle_rows) == sum(counts),
+                'directly_checked_elements_this_phase': independent.get('checked', 0),
+                'complete_source_port_outputs': 'all chunks; first port cache then identical-input source/port comparisons',
+            }
+            results.append(report)
+            print(json.dumps(report), flush=True)
+            del activations, activation_scales, output, function
+        del weights, raw_scales, global_scales, multipliers, exponents, workspace, problems, offsets
+        torch.xpu.synchronize()
+        torch.xpu.empty_cache()
+    mappings = [line for line in pathlib.Path('/proc/self/maps').read_text().splitlines() if 'nvfp4_woq' in line and '.so' in line]
+    if args.label == 'port':
+        assert any('blockwise_moe_nvfp4_woq.so' in line for line in mappings)
+        assert all(str(expected_package) in line for line in mappings)
+        assert not any('_port_payload.so' in line for line in mappings)
+        assert not any('muse-spark-nvfp4-woq-main-20261014/build' in line for line in mappings)
+    (result_dir / f'round{args.round}-phase{args.phase}-{args.label}.json').write_text(json.dumps({'canonical_version': args.version, 'results': results, 'native_mappings': mappings, 'accuracy_only': args.accuracy_only, 'gpu': os.environ.get('ZE_AFFINITY_MASK')}, indent=2) + '\n')
+
+
+if __name__ == '__main__':
+    main()

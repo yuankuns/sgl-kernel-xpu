@@ -1,0 +1,1250 @@
+diff --git a/artifacts/position/MuseComputePosition.before.cpp b/artifacts/position/MuseComputePosition.before.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..596be553a9812a63e992c30f7fa1388b679cfcdf
+--- /dev/null
++++ b/artifacts/position/MuseComputePosition.before.cpp
+@@ -0,0 +1,143 @@
++#include <ATen/ATen.h>
++#include <c10/xpu/XPUStream.h>
++#include <torch/all.h>
++
++#include <algorithm>
++#include <sycl/sycl.hpp>
++
++#include "SYCLHelpers.h"
++
++namespace at::native::xpu {
++namespace {
++
++constexpr int kPositionWorkgroup = 256;
++
++template <typename PrefixScalar, typename SeqScalar>
++struct MuseComputePositionKernel {
++  int64_t* __restrict__ positions;
++  int32_t* __restrict__ extend_start_loc;
++  const PrefixScalar* __restrict__ prefix_lens;
++  const SeqScalar* __restrict__ seq_lens;
++  int64_t batch;
++  int64_t groups_per_request;
++  bool has_prefix;
++
++  void operator()(sycl::nd_item<1> item) const {
++    const int64_t req = item.get_group(0) / groups_per_request;
++    const int64_t tile = item.get_group(0) % groups_per_request;
++    const int64_t lane = item.get_local_id(0);
++    if (req >= batch) {
++      return;
++    }
++    int64_t start = 0;
++    for (int64_t i = 0; i < req; ++i) {
++      start += seq_lens[i];
++    }
++    const int64_t prefix = has_prefix ? prefix_lens[req] : 0;
++    const int64_t extend = seq_lens[req];
++    for (int64_t i = tile * kPositionWorkgroup + lane; i < extend; i += groups_per_request * kPositionWorkgroup) {
++      positions[start + i] = prefix + i;
++    }
++    if (tile == 0 && lane == 0) {
++      extend_start_loc[req] = static_cast<int32_t>(start);
++    }
++  }
++};
++
++}  // namespace
++
++void muse_compute_position_impl(
++    torch::Tensor positions,
++    torch::Tensor extend_start_loc,
++    torch::Tensor prefix_lens,
++    torch::Tensor seq_lens,
++    int64_t max_seq_len_hint) {
++  TORCH_CHECK(
++      positions.is_xpu() && positions.scalar_type() == at::kLong && positions.is_contiguous(),
++      "positions must be contiguous XPU int64");
++  TORCH_CHECK(
++      extend_start_loc.is_xpu() && extend_start_loc.scalar_type() == at::kInt && extend_start_loc.is_contiguous(),
++      "extend_start_loc must be contiguous XPU int32");
++  TORCH_CHECK(
++      prefix_lens.is_xpu() && (prefix_lens.scalar_type() == at::kInt || prefix_lens.scalar_type() == at::kLong) &&
++          prefix_lens.is_contiguous() && seq_lens.is_xpu() &&
++          (seq_lens.scalar_type() == at::kInt || seq_lens.scalar_type() == at::kLong) && seq_lens.is_contiguous(),
++      "lengths must be contiguous XPU int32 or int64");
++  const int64_t batch = seq_lens.numel();
++  TORCH_CHECK(
++      extend_start_loc.numel() == batch && (prefix_lens.numel() == 0 || prefix_lens.numel() == batch),
++      "lengths must match batch");
++  if (batch == 0) {
++    return;
++  }
++  auto queue = at::xpu::getCurrentXPUStream().queue();
++  const bool has_prefix = prefix_lens.numel() == batch;
++  // Spread long requests across workgroups; keep one group for short requests.
++  // The model already has a host length list. Its maximum avoids stranding a
++  // long request when the average length is diluted by empty/short requests.
++  // A stale or missing hint only changes occupancy: the kernel's strided loop
++  // still covers every sequence element.
++  const int64_t average_groups = (positions.numel() + batch * 512 - 1) / (batch * 512);
++  const int64_t hinted_groups = max_seq_len_hint > 0 ? (max_seq_len_hint + 511) / 512 : 1;
++  const int64_t groups_per_request = std::min<int64_t>(8, std::max<int64_t>({1, average_groups, hinted_groups}));
++  const auto global_size = sycl::range<1>(batch * groups_per_request * kPositionWorkgroup);
++  const auto local_size = sycl::range<1>(kPositionWorkgroup);
++  if (prefix_lens.scalar_type() == at::kInt && seq_lens.scalar_type() == at::kInt) {
++    MuseComputePositionKernel<int32_t, int32_t> kernel{
++        positions.data_ptr<int64_t>(),
++        extend_start_loc.data_ptr<int32_t>(),
++        prefix_lens.data_ptr<int32_t>(),
++        seq_lens.data_ptr<int32_t>(),
++        batch,
++        groups_per_request,
++        has_prefix};
++    sycl_kernel_submit(global_size, local_size, queue, kernel);
++  } else if (prefix_lens.scalar_type() == at::kLong && seq_lens.scalar_type() == at::kLong) {
++    MuseComputePositionKernel<int64_t, int64_t> kernel{
++        positions.data_ptr<int64_t>(),
++        extend_start_loc.data_ptr<int32_t>(),
++        prefix_lens.data_ptr<int64_t>(),
++        seq_lens.data_ptr<int64_t>(),
++        batch,
++        groups_per_request,
++        has_prefix};
++    sycl_kernel_submit(global_size, local_size, queue, kernel);
++  } else if (prefix_lens.scalar_type() == at::kInt) {
++    MuseComputePositionKernel<int32_t, int64_t> kernel{
++        positions.data_ptr<int64_t>(),
++        extend_start_loc.data_ptr<int32_t>(),
++        prefix_lens.data_ptr<int32_t>(),
++        seq_lens.data_ptr<int64_t>(),
++        batch,
++        groups_per_request,
++        has_prefix};
++    sycl_kernel_submit(global_size, local_size, queue, kernel);
++  } else {
++    MuseComputePositionKernel<int64_t, int32_t> kernel{
++        positions.data_ptr<int64_t>(),
++        extend_start_loc.data_ptr<int32_t>(),
++        prefix_lens.data_ptr<int64_t>(),
++        seq_lens.data_ptr<int32_t>(),
++        batch,
++        groups_per_request,
++        has_prefix};
++    sycl_kernel_submit(global_size, local_size, queue, kernel);
++  }
++}
++
++void muse_compute_position(
++    torch::Tensor positions, torch::Tensor extend_start_loc, torch::Tensor prefix_lens, torch::Tensor seq_lens) {
++  muse_compute_position_impl(positions, extend_start_loc, prefix_lens, seq_lens, -1);
++}
++
++void muse_compute_position_with_hint(
++    torch::Tensor positions,
++    torch::Tensor extend_start_loc,
++    torch::Tensor prefix_lens,
++    torch::Tensor seq_lens,
++    int64_t max_seq_len_hint) {
++  TORCH_CHECK(max_seq_len_hint >= 0, "max_seq_len_hint must be nonnegative");
++  muse_compute_position_impl(positions, extend_start_loc, prefix_lens, seq_lens, max_seq_len_hint);
++}
++
++}  // namespace at::native::xpu
+diff --git a/artifacts/position/bench_framework_patch.py b/artifacts/position/bench_framework_patch.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..0845d67b4f3dadac0931cbc6c0d6a35a73bd967b
+--- /dev/null
++++ b/artifacts/position/bench_framework_patch.py
+@@ -0,0 +1,168 @@
++"""Compare old and patched SGLang position wrappers with the AOT SYCL op."""
++
++import importlib
++import importlib.util
++import json
++import os
++import tempfile
++from pathlib import Path
++from statistics import median
++
++import torch
++
++
++def load_module(name, path):
++    spec = importlib.util.spec_from_file_location(name, path)
++    module = importlib.util.module_from_spec(spec)
++    spec.loader.exec_module(module)
++    return module
++
++
++def spread(samples):
++    values = sorted(samples)
++    return values[6], values[24]
++
++
++old = load_module("position_old_main", "/workspace/artifacts/position/main_position.py")
++patched = load_module(
++    "position_patched_main",
++    "/root/worktrees/sglang/muse-position-triton-split-main/python/sglang/kernels/ops/attention/position.py",
++)
++importlib.import_module("position_aot_after")
++assert torch.xpu.is_available()
++
++order = os.environ.get("POSITION_ORDER", "old-first")
++assert order in ("old-first", "patched-first")
++print(
++    json.dumps(
++        {
++            "meta": {
++                "order": order,
++                "device": torch.xpu.get_device_name(0),
++                "dtype": "int32 lengths and prefix, int64 positions, int32 starts",
++                "layout": "contiguous",
++                "timing": "torch.profiler XPU kernel event duration, microseconds",
++                "samples": 31,
++            }
++        }
++    ),
++    flush=True,
++)
++
++cases = [
++    ([1] * 8, 0),
++    ([512] * 8, 0),
++    ([1024] * 8, 0),
++    ([1536] * 8, 0),
++    ([1792] * 8, 0),
++    ([2048] * 8, 0),
++    ([4096] * 7, 0),
++    ([4096] * 8, 4096),
++    ([8193] * 8, 8193),
++    ([4096] + [0] * 7, 4096),
++    ([8193] + [0] * 7, 8193),
++    ([1, 4097, 33], 4097),
++    ([0, 17, 8193, 1], 8193),
++]
++
++for lengths, hint in cases:
++    batch, total = len(lengths), sum(lengths)
++    seq = torch.tensor(lengths, dtype=torch.int32, device="xpu")
++    prefix = torch.zeros(batch, dtype=torch.int32, device="xpu")
++    if batch == 3:
++        prefix = torch.tensor([2, 4, 6], dtype=torch.int32, device="xpu")
++    if batch == 4:
++        prefix = torch.empty(0, dtype=torch.int32, device="xpu")
++    positions_sycl = torch.empty(total, dtype=torch.int64, device="xpu")
++    starts_sycl = torch.empty(batch, dtype=torch.int32, device="xpu")
++
++    def old_call():
++        return old.compute_position_triton(prefix, seq, total)
++
++    def patched_call():
++        return patched.compute_position_triton(prefix, seq, total, hint)
++
++    def sycl_call():
++        if hint > 0:
++            torch.ops.sgl_kernel.muse_compute_position_with_hint(
++                positions_sycl, starts_sycl, prefix, seq, hint
++            )
++        else:
++            torch.ops.sgl_kernel.muse_compute_position(
++                positions_sycl, starts_sycl, prefix, seq
++            )
++        return positions_sycl, starts_sycl
++
++    expected = torch.cat(
++        [
++            torch.arange(size, dtype=torch.int64, device="xpu")
++            + (prefix[i] if prefix.numel() else 0)
++            for i, size in enumerate(lengths)
++        ]
++    )
++    expected_starts = torch.tensor(
++        [sum(lengths[:i]) for i in range(batch)], dtype=torch.int32, device="xpu"
++    )
++    for fn in (old_call, patched_call, sycl_call):
++        positions, starts = fn()
++        torch.xpu.synchronize()
++        torch.testing.assert_close(positions, expected, rtol=0, atol=0)
++        torch.testing.assert_close(starts, expected_starts, rtol=0, atol=0)
++    print(json.dumps({"accuracy": "PASS", "lengths": lengths, "hint": hint}), flush=True)
++
++    calls = (
++        (old_call, patched_call, sycl_call)
++        if order == "old-first"
++        else (patched_call, old_call, sycl_call)
++    )
++    for _ in range(5):
++        for fn in calls:
++            fn()
++    torch.xpu.synchronize()
++    with torch.profiler.profile(
++        activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.XPU]
++    ) as profile:
++        for _ in range(31):
++            for fn in calls:
++                fn()
++        torch.xpu.synchronize()
++    with tempfile.TemporaryDirectory() as directory:
++        path = Path(directory) / "trace.json"
++        profile.export_chrome_trace(str(path))
++        events = json.loads(path.read_text())["traceEvents"]
++    kernels = [
++        (float(event["ts"]), event["name"], float(event["dur"]))
++        for event in events
++        if event.get("cat") == "kernel"
++        and (
++            "compute_position_kernel" in event.get("name", "")
++            or "MuseComputePositionKernel" in event.get("name", "")
++        )
++    ]
++    kernels.sort()
++    assert len(kernels) == 93, (lengths, len(kernels), kernels[:6])
++    raw = {"old": [], "patched": [], "sycl": []}
++    names = (
++        ("old", "patched", "sycl")
++        if order == "old-first"
++        else ("patched", "old", "sycl")
++    )
++    for start in range(0, len(kernels), 3):
++        group = kernels[start : start + 3]
++        assert all("compute_position_kernel" in group[i][1] for i in (0, 1))
++        assert "MuseComputePositionKernel" in group[2][1]
++        for i, name in enumerate(names):
++            raw[name].append(group[i][2])
++    print(
++        json.dumps(
++            {
++                "lengths": lengths,
++                "hint": hint,
++                "raw_us": raw,
++                "p50_us": {name: median(values) for name, values in raw.items()},
++                "p20_p80_us": {name: spread(values) for name, values in raw.items()},
++            }
++        ),
++        flush=True,
++    )
++    torch.xpu.synchronize()
+diff --git a/artifacts/position/bench_main_split.py b/artifacts/position/bench_main_split.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..b0f3de745c298bab0fefb713f75b8dc1779de037
+--- /dev/null
++++ b/artifacts/position/bench_main_split.py
+@@ -0,0 +1,49 @@
++import json
++import os
++import tempfile
++from pathlib import Path
++from statistics import median
++
++import torch
++
++from main_position import compute_position_kernel
++from main_position_split import compute_position_kernel_split
++
++order = os.environ.get("POSITION_SPLIT_ORDER", "split-first")
++assert order in ("split-first", "main-first")
++print(json.dumps({"meta": {"length_dtype": "int32", "order": order}}), flush=True)
++for length in (16, 128, 512, 1024, 1536, 2048, 3072, 4096):
++    batch = 8
++    seq = torch.full((batch,), length, device='xpu', dtype=torch.int32)
++    prefix = torch.zeros(batch, device='xpu', dtype=torch.int32)
++    pos_old = torch.empty(batch * length, device='xpu', dtype=torch.int64)
++    pos_split = torch.empty_like(pos_old)
++    start_old = torch.empty(batch, device='xpu', dtype=torch.int32)
++    start_split = torch.empty_like(start_old)
++    groups = max(1, (length + 511) // 512)
++    def old(): compute_position_kernel[(batch,)](pos_old, start_old, prefix, seq, True)
++    def split(): compute_position_kernel_split[(batch, groups)](pos_split, start_split, prefix, seq, True, groups)
++    for _ in range(5):
++        if order == "split-first":
++            split(); old()
++        else:
++            old(); split()
++    torch.xpu.synchronize()
++    torch.testing.assert_close(pos_old, pos_split, atol=0, rtol=0)
++    torch.testing.assert_close(start_old, start_split, atol=0, rtol=0)
++    with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.XPU]) as profile:
++        for _ in range(31):
++            if order == "split-first":
++                split(); old()
++            else:
++                old(); split()
++        torch.xpu.synchronize()
++    with tempfile.TemporaryDirectory() as directory:
++        path = Path(directory) / 'trace.json'
++        profile.export_chrome_trace(str(path))
++        events = json.loads(path.read_text())['traceEvents']
++    def samples(name): return [float(e['dur']) for e in events if e.get('cat') == 'kernel' and name == e.get('name','')]
++    o, s = samples('compute_position_kernel'), samples('compute_position_kernel_split')
++    assert len(o) == len(s) == 31, (len(o), len(s), [e['name'] for e in events if e.get('cat') == 'kernel'][:5])
++    print(json.dumps({'length':length, 'groups':groups, 'main_us':o, 'split_us':s, 'main_p50':median(o), 'split_p50':median(s), 'main_span':max(o)-min(o), 'split_span':max(s)-min(s)}), flush=True)
++    torch.xpu.synchronize()
+diff --git a/artifacts/position/bench_main_split_v2.py b/artifacts/position/bench_main_split_v2.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..1c6f2f85663f3f5332d2fe12b6c9b36de5a500e2
+--- /dev/null
++++ b/artifacts/position/bench_main_split_v2.py
+@@ -0,0 +1,37 @@
++import json
++import tempfile
++from pathlib import Path
++from statistics import median
++
++import torch
++
++from main_position import compute_position_kernel
++from main_position_split import compute_position_kernel_split
++
++for length in (16, 128, 512, 1024, 1536, 2048, 3072, 4096):
++    batch = 8
++    seq = torch.full((batch,), length, device='xpu', dtype=torch.int64)
++    prefix = torch.arange(batch, device='xpu', dtype=torch.int64) * 3
++    pos_old = torch.empty(batch * length, device='xpu', dtype=torch.int64)
++    pos_split = torch.empty_like(pos_old)
++    start_old = torch.empty(batch, device='xpu', dtype=torch.int32)
++    start_split = torch.empty_like(start_old)
++    groups = max(1, (length + 511) // 512)
++    def old(): compute_position_kernel[(batch,)](pos_old, start_old, prefix, seq, True)
++    def split(): compute_position_kernel_split[(batch, groups)](pos_split, start_split, prefix, seq, True, groups)
++    for _ in range(5): old(); split()
++    torch.xpu.synchronize()
++    torch.testing.assert_close(pos_old, pos_split, atol=0, rtol=0)
++    torch.testing.assert_close(start_old, start_split, atol=0, rtol=0)
++    with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.XPU]) as profile:
++        for _ in range(31): old(); split()
++        torch.xpu.synchronize()
++    with tempfile.TemporaryDirectory() as directory:
++        path = Path(directory) / 'trace.json'
++        profile.export_chrome_trace(str(path))
++        events = json.loads(path.read_text())['traceEvents']
++    def samples(name): return [float(e['dur']) for e in events if e.get('cat') == 'kernel' and name == e.get('name','')]
++    o, s = samples('compute_position_kernel'), samples('compute_position_kernel_split')
++    assert len(o) == len(s) == 31, (len(o), len(s), [e['name'] for e in events if e.get('cat') == 'kernel'][:5])
++    print(json.dumps({'length':length, 'groups':groups, 'main_us':o, 'split_us':s, 'main_p50':median(o), 'split_p50':median(s), 'main_span':max(o)-min(o), 'split_span':max(s)-min(s)}), flush=True)
++    torch.xpu.synchronize()
+diff --git a/artifacts/position/bench_split_vs_sycl.py b/artifacts/position/bench_split_vs_sycl.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..eeb875fbcdb557edfe4bd64e8a059cd1727d92e0
+--- /dev/null
++++ b/artifacts/position/bench_split_vs_sycl.py
+@@ -0,0 +1,54 @@
++"""Compare the current SYCL position kernel to a split-grid upstream Triton variant."""
++
++import importlib
++import json
++import os
++from statistics import median
++
++import torch
++
++from bench_position_occupancy import measure, spread
++from main_position_split import compute_position_kernel_split
++
++importlib.import_module(os.environ["POSITION_EXTENSION_NAME"])
++
++for length in (1, 128, 512, 1024, 1536, 2048, 4096, 8193):
++    batch = 8
++    seq = torch.full((batch,), length, dtype=torch.int32, device="xpu")
++    prefix = torch.zeros(batch, dtype=torch.int32, device="xpu")
++    positions_t = torch.empty(batch * length, dtype=torch.int64, device="xpu")
++    positions_s = torch.empty_like(positions_t)
++    starts_t = torch.empty(batch, dtype=torch.int32, device="xpu")
++    starts_s = torch.empty_like(starts_t)
++    groups = max(1, (length + 511) // 512)
++
++    def split_triton():
++        compute_position_kernel_split[(batch, groups)](
++            positions_t, starts_t, prefix, seq, True, groups
++        )
++
++    def sycl():
++        torch.ops.sgl_kernel.muse_compute_position(positions_s, starts_s, prefix, seq)
++
++    split_triton()
++    sycl()
++    torch.xpu.synchronize()
++    torch.testing.assert_close(positions_s, positions_t, rtol=0, atol=0)
++    torch.testing.assert_close(starts_s, starts_t, rtol=0, atol=0)
++    t, s = measure(split_triton, sycl, 31, False)
++    print(
++        json.dumps(
++            {
++                "length": length,
++                "groups": groups,
++                "split_us": t,
++                "sycl_us": s,
++                "split_p50_us": median(t),
++                "sycl_p50_us": median(s),
++                "split_p20_p80_us": spread(t),
++                "sycl_p20_p80_us": spread(s),
++            }
++        ),
++        flush=True,
++    )
++    torch.xpu.synchronize()
+diff --git a/artifacts/position/build_aot_shim.py b/artifacts/position/build_aot_shim.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..00b14982f0da4f5724d6002261a7977b0e7bbdf3
+--- /dev/null
++++ b/artifacts/position/build_aot_shim.py
+@@ -0,0 +1,15 @@
++import os
++from torch.utils.cpp_extension import load
++
++os.environ["MAX_JOBS"] = "1"
++load(
++    name="position_aot_after",
++    sources=["/workspace/artifacts/position/position_register.cc"],
++    extra_cflags=["-O2"],
++    extra_ldflags=[
++        "/workspace/build/src/libsgl-ops-sycl-ComputePosition.so",
++        "-Wl,-rpath,/workspace/build/src",
++    ],
++    build_directory="/workspace/artifacts/position/extension_aot_after",
++    verbose=True,
++)
+diff --git a/artifacts/position/build_extension.py b/artifacts/position/build_extension.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..94a8bcdf3080f03f28ca3a1100d7fbf0c6a3c773
+--- /dev/null
++++ b/artifacts/position/build_extension.py
+@@ -0,0 +1,13 @@
++import os
++from torch.utils.cpp_extension import load
++
++os.environ["MAX_JOBS"] = "1"
++load(
++    name=os.environ.get("POSITION_EXTENSION_NAME", "position_baseline"),
++    sources=[os.environ.get("POSITION_SOURCE", "/workspace/artifacts/position/MuseComputePosition.before.cpp"), "/workspace/artifacts/position/position_register.cc"],
++    extra_include_paths=["/workspace/src/sycl"],
++    extra_cflags=["-O2", "-fsycl"],
++    extra_ldflags=["-fsycl"],
++    build_directory=os.environ.get("POSITION_BUILD_DIRECTORY", "/workspace/artifacts/position/extension_baseline"),
++    verbose=True,
++)
+diff --git a/artifacts/position/compare_before_after.py b/artifacts/position/compare_before_after.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..7aa927dcae1e79030ad7fb9918b760fe6d5212a7
+--- /dev/null
++++ b/artifacts/position/compare_before_after.py
+@@ -0,0 +1,35 @@
++"""Summarize paired profiler logs without discarding raw samples."""
++
++import json
++from pathlib import Path
++
++
++def read_runs(path):
++    meta = None
++    data = {}
++    for line in Path(path).read_text().splitlines():
++        try:
++            row = json.loads(line)
++        except json.JSONDecodeError:
++            continue
++        if "meta" in row and "batch" in row["meta"]:
++            meta = row["meta"]
++        elif "main_p50_us" in row:
++            key = (
++                meta["batch"],
++                meta["reverse_order"],
++                meta["skew"],
++                meta["max_seq_len_hint"],
++                row["length"],
++            )
++            data[key] = row
++    return data
++
++
++before = read_runs("artifacts/position/local-int32-before.log")
++after = read_runs("artifacts/position/local-int32-after.log")
++print("batch reverse skew hint length main_before main_after sycl_before sycl_after sycl_delta_pct")
++for key in sorted(before.keys() & after.keys()):
++    b, a = before[key], after[key]
++    delta = 100 * (a["branch_p50_us"] / b["branch_p50_us"] - 1)
++    print(*key, b["main_p50_us"], a["main_p50_us"], b["branch_p50_us"], a["branch_p50_us"], round(delta, 2))
+diff --git a/artifacts/position/do_framework_patch_gpu.sh b/artifacts/position/do_framework_patch_gpu.sh
+new file mode 100644
+index 0000000000000000000000000000000000000000..ad2fdb1d05d50bb5c2d99dbf04fc52fbc3d46351
+--- /dev/null
++++ b/artifacts/position/do_framework_patch_gpu.sh
+@@ -0,0 +1,28 @@
++#!/usr/bin/env bash
++set -euo pipefail
++cd /home/syk/worktrees/sgl-kernel-xpu/muse-spark-position-main-20261014
++trap 'printf "%s\n" "$?" > artifacts/position/framework-patch-gpu.exit' EXIT
++exec 9>/tmp/muse-gpu-bench.lock
++flock 9
++xpu-smi stats -d 0 > artifacts/position/framework-patch-gpu-stats.log 2>&1
++xpu-smi ps -d 0 > artifacts/position/framework-patch-gpu-ps.log 2>&1
++rg -q 'No data' artifacts/position/framework-patch-gpu-ps.log
++rg 'GPU Utilization' artifacts/position/framework-patch-gpu-stats.log
++printf 'host=%s date=%s kernel_main=%s sglang_main=%s patched_source=%s aot_lib=%s\n' \
++  "$(hostname)" "$(date -Is)" "$(git rev-parse origin/main)" \
++  "$(git -C /home/syk/worktrees/sglang/muse-position-triton-split-main rev-parse origin/main)" \
++  "$(sha256sum /home/syk/worktrees/sglang/muse-position-triton-split-main/python/sglang/kernels/ops/attention/position.py)" \
++  "$(sha256sum build/src/libsgl-ops-sycl-ComputePosition.so)"
++for order in old-first patched-first; do
++  SGLANG_MUSE_CONTAINER=codex-muse-position-local-20261015 \
++    /home/syk/agent-skills/cri-po-gpu-container/scripts/enter-sglang-syk.sh \
++    --gpu-lock --gpu 0 \
++    --workdir /root/worktrees/sgl-kernel-xpu/muse-spark-position-main-20261014 \
++    -- bash -c '
++      set -e
++      export PYTHONPATH=/workspace/artifacts/position:/workspace/artifacts/position/extension_aot_after
++      export POSITION_ORDER="$1"
++      cd /workspace
++      python artifacts/position/bench_framework_patch.py
++    ' bash "$order"
++done
+diff --git a/artifacts/position/do_local_build_after.sh b/artifacts/position/do_local_build_after.sh
+new file mode 100755
+index 0000000000000000000000000000000000000000..cfd003c5eea3e7716c2380380713673fc4c1bf5a
+--- /dev/null
++++ b/artifacts/position/do_local_build_after.sh
+@@ -0,0 +1,15 @@
++#!/usr/bin/env bash
++set -euo pipefail
++cd /home/syk/worktrees/sgl-kernel-xpu/muse-spark-position-main-20261014
++trap 'printf "%s\n" "$?" > artifacts/position/local-build-after.exit' EXIT
++exec 9>/tmp/muse-op-build.lock
++flock 9
++printf 'host=%s date=%s source=%s\n' "$(hostname)" "$(date -Is)" "$(sha256sum src/sycl/ComputePosition.cpp)"
++SGLANG_MUSE_CONTAINER=codex-muse-position-local-20261015 /home/syk/agent-skills/cri-po-gpu-container/scripts/enter-sglang-syk.sh --workdir /root/worktrees/sgl-kernel-xpu/muse-spark-position-main-20261014 -- bash -c '
++set -e
++export CXX=icpx MAX_JOBS=1
++export POSITION_SOURCE=/workspace/src/sycl/ComputePosition.cpp
++export POSITION_EXTENSION_NAME=position_after
++export POSITION_BUILD_DIRECTORY=/workspace/artifacts/position/extension_after
++python /workspace/artifacts/position/build_extension.py
++'
+diff --git a/artifacts/position/do_local_build_aot_shim.sh b/artifacts/position/do_local_build_aot_shim.sh
+new file mode 100755
+index 0000000000000000000000000000000000000000..ef1565c7d7aef9a5a2dd3ee43b07bb3df29bad13
+--- /dev/null
++++ b/artifacts/position/do_local_build_aot_shim.sh
+@@ -0,0 +1,8 @@
++#!/usr/bin/env bash
++set -euo pipefail
++cd /home/syk/worktrees/sgl-kernel-xpu/muse-spark-position-main-20261014
++trap 'printf "%s\n" "$?" > artifacts/position/local-build-aot-shim.exit' EXIT
++[[ $(cat artifacts/position/local-target-after-v2.exit) == 0 ]]
++exec 9>/tmp/muse-op-build.lock
++flock 9
++SGLANG_MUSE_CONTAINER=codex-muse-position-local-20261015 /home/syk/agent-skills/cri-po-gpu-container/scripts/enter-sglang-syk.sh --workdir /root/worktrees/sgl-kernel-xpu/muse-spark-position-main-20261014 -- bash -c 'export CXX=icpx MAX_JOBS=1; python /workspace/artifacts/position/build_aot_shim.py'
+diff --git a/artifacts/position/do_local_gpu_after.sh b/artifacts/position/do_local_gpu_after.sh
+new file mode 100755
+index 0000000000000000000000000000000000000000..b6123d304ef860e745d8e7c1c81aa3d8800e12c3
+--- /dev/null
++++ b/artifacts/position/do_local_gpu_after.sh
+@@ -0,0 +1,30 @@
++#!/usr/bin/env bash
++set -euo pipefail
++cd /home/syk/worktrees/sgl-kernel-xpu/muse-spark-position-main-20261014
++trap 'printf "%s\n" "$?" > artifacts/position/local-int32-after.exit' EXIT
++for required in local-int32-before local-build-after; do
++  while [[ ! -f "artifacts/position/$required.exit" ]]; do sleep 5; done
++  if [[ $(cat "artifacts/position/$required.exit") != 0 ]]; then
++    echo "Prerequisite failed: $required"
++    exit 4
++  fi
++done
++exec 9>/tmp/muse-gpu-bench.lock
++flock 9
++xpu-smi stats -d 0 > artifacts/position/local-int32-after-gpu-stats.log 2>&1
++xpu-smi ps -d 0 > artifacts/position/local-int32-after-gpu-ps.log 2>&1
++rg -q 'No data' artifacts/position/local-int32-after-gpu-ps.log
++printf 'host=%s date=%s branch=%s source=%s\n' "$(hostname)" "$(date -Is)" "$(git rev-parse HEAD)" "$(sha256sum src/sycl/ComputePosition.cpp)"
++SGLANG_MUSE_CONTAINER=codex-muse-position-local-20261015 /home/syk/agent-skills/cri-po-gpu-container/scripts/enter-sglang-syk.sh --gpu-lock --gpu 0 --workdir /root/worktrees/sgl-kernel-xpu/muse-spark-position-main-20261014 -- bash -c '
++set -e
++export PYTHONPATH=/workspace/artifacts/position:/workspace/artifacts/position/extension_after:/workspace/benchmark
++export POSITION_EXTENSION_NAME=position_after POSITION_MAIN_MODULE=main_position
++cd /workspace
++python artifacts/position/run_accuracy.py
++python benchmark/bench_position_occupancy.py --batch 8 --length-dtype int32 --prefix-mode zero --lengths 1,16,256,512,768,1024,1152,1280,1408,1536,1792,2048,4096,8193 --samples 31 --isl 4096 --osl 16 --tp 1 --ep 1
++python benchmark/bench_position_occupancy.py --batch 8 --length-dtype int32 --prefix-mode zero --lengths 1,16,256,512,768,1024,1152,1280,1408,1536,1792,2048,4096,8193 --samples 31 --isl 4096 --osl 16 --tp 1 --ep 1 --reverse-order
++python benchmark/bench_position_occupancy.py --batch 7 --length-dtype int32 --prefix-mode zero --lengths 4096 --samples 31 --isl 4096 --osl 16 --tp 1 --ep 1
++python benchmark/bench_position_occupancy.py --batch 8 --length-dtype int32 --prefix-mode zero --lengths 4096 --samples 31 --isl 4096 --osl 16 --tp 1 --ep 1 --skew --max-seq-len-hint 4096
++python benchmark/bench_position_occupancy.py --batch 8 --length-dtype int32 --prefix-mode zero --lengths 8193 --samples 31 --isl 4096 --osl 16 --tp 1 --ep 1 --skew --max-seq-len-hint 8193
++python artifacts/position/bench_split_vs_sycl.py
++'
+diff --git a/artifacts/position/do_local_gpu_aot_after.sh b/artifacts/position/do_local_gpu_aot_after.sh
+new file mode 100755
+index 0000000000000000000000000000000000000000..de112dea4934f45d161a3019186414db64f804ac
+--- /dev/null
++++ b/artifacts/position/do_local_gpu_aot_after.sh
+@@ -0,0 +1,23 @@
++#!/usr/bin/env bash
++set -euo pipefail
++cd /home/syk/worktrees/sgl-kernel-xpu/muse-spark-position-main-20261014
++trap 'printf "%s\n" "$?" > artifacts/position/local-int32-aot-after.exit' EXIT
++for required in local-build-aot-shim local-int32-after; do
++  while [[ ! -f "artifacts/position/$required.exit" ]]; do sleep 5; done
++  [[ $(cat "artifacts/position/$required.exit") == 0 ]]
++done
++exec 9>/tmp/muse-gpu-bench.lock
++flock 9
++xpu-smi stats -d 0 > artifacts/position/local-int32-aot-after-gpu-stats.log 2>&1
++xpu-smi ps -d 0 > artifacts/position/local-int32-aot-after-gpu-ps.log 2>&1
++rg -q 'No data' artifacts/position/local-int32-aot-after-gpu-ps.log
++printf 'host=%s date=%s production_lib=%s\n' "$(hostname)" "$(date -Is)" "$(sha256sum build/src/libsgl-ops-sycl-ComputePosition.so)"
++SGLANG_MUSE_CONTAINER=codex-muse-position-local-20261015 /home/syk/agent-skills/cri-po-gpu-container/scripts/enter-sglang-syk.sh --gpu-lock --gpu 0 --workdir /root/worktrees/sgl-kernel-xpu/muse-spark-position-main-20261014 -- bash -c '
++set -e
++export PYTHONPATH=/workspace/artifacts/position:/workspace/artifacts/position/extension_aot_after:/workspace/benchmark
++export POSITION_EXTENSION_NAME=position_aot_after POSITION_MAIN_MODULE=main_position
++cd /workspace
++python artifacts/position/run_accuracy.py
++python benchmark/bench_position_occupancy.py --batch 8 --length-dtype int32 --prefix-mode zero --lengths 1024,1536,1792,4096,8193 --samples 31 --isl 4096 --osl 16 --tp 1 --ep 1
++python artifacts/position/bench_split_vs_sycl.py
++'
+diff --git a/artifacts/position/do_local_gpu_before.sh b/artifacts/position/do_local_gpu_before.sh
+new file mode 100755
+index 0000000000000000000000000000000000000000..30bfdc1dea630d46f1bf842e38d23d66e2d3c54f
+--- /dev/null
++++ b/artifacts/position/do_local_gpu_before.sh
+@@ -0,0 +1,24 @@
++#!/usr/bin/env bash
++set -euo pipefail
++cd /home/syk/worktrees/sgl-kernel-xpu/muse-spark-position-main-20261014
++trap 'printf "%s\n" "$?" > artifacts/position/local-int32-before.exit' EXIT
++exec 9>/tmp/muse-gpu-bench.lock
++flock 9
++xpu-smi stats -d 0 > artifacts/position/local-int32-before-gpu-stats.log 2>&1
++xpu-smi ps -d 0 > artifacts/position/local-int32-before-gpu-ps.log 2>&1
++rg -q 'No data' artifacts/position/local-int32-before-gpu-ps.log
++printf 'host=%s date=%s branch=%s\n' "$(hostname)" "$(date -Is)" "$(git rev-parse HEAD)"
++SGLANG_MUSE_CONTAINER=codex-muse-position-local-20261015 /home/syk/agent-skills/cri-po-gpu-container/scripts/enter-sglang-syk.sh --gpu-lock --gpu 0 --workdir /root/worktrees/sgl-kernel-xpu/muse-spark-position-main-20261014 -- bash -c '
++set -e
++export PYTHONPATH=/workspace/artifacts/position:/workspace/artifacts/position/extension_baseline:/workspace/benchmark
++export POSITION_EXTENSION_NAME=position_baseline POSITION_MAIN_MODULE=main_position
++cd /workspace
++python benchmark/bench_position_occupancy.py --batch 8 --length-dtype int32 --prefix-mode zero --lengths 1,16,256,512,768,1024,1152,1280,1408,1536,1792,2048,4096,8193 --samples 31 --isl 4096 --osl 16 --tp 1 --ep 1
++python benchmark/bench_position_occupancy.py --batch 8 --length-dtype int32 --prefix-mode zero --lengths 1,16,256,512,768,1024,1152,1280,1408,1536,1792,2048,4096,8193 --samples 31 --isl 4096 --osl 16 --tp 1 --ep 1 --reverse-order
++python benchmark/bench_position_occupancy.py --batch 7 --length-dtype int32 --prefix-mode zero --lengths 4096 --samples 31 --isl 4096 --osl 16 --tp 1 --ep 1
++python benchmark/bench_position_occupancy.py --batch 8 --length-dtype int32 --prefix-mode zero --lengths 4096 --samples 31 --isl 4096 --osl 16 --tp 1 --ep 1 --skew --max-seq-len-hint 4096
++python benchmark/bench_position_occupancy.py --batch 8 --length-dtype int32 --prefix-mode zero --lengths 8193 --samples 31 --isl 4096 --osl 16 --tp 1 --ep 1 --skew --max-seq-len-hint 8193
++python artifacts/position/bench_split_vs_sycl.py
++POSITION_SPLIT_ORDER=split-first python artifacts/position/bench_main_split.py
++POSITION_SPLIT_ORDER=main-first python artifacts/position/bench_main_split.py
++'
+diff --git a/artifacts/position/do_local_target_after.sh b/artifacts/position/do_local_target_after.sh
+new file mode 100755
+index 0000000000000000000000000000000000000000..9f653ec91990c7e76799f1ac83254a79d2191e3b
+--- /dev/null
++++ b/artifacts/position/do_local_target_after.sh
+@@ -0,0 +1,11 @@
++#!/usr/bin/env bash
++set -euo pipefail
++cd /home/syk/worktrees/sgl-kernel-xpu/muse-spark-position-main-20261014
++trap 'printf "%s\n" "$?" > artifacts/position/local-target-after.exit' EXIT
++exec 9>/tmp/muse-op-build.lock
++flock 9
++SGLANG_MUSE_CONTAINER=codex-muse-position-local-20261015 /home/syk/agent-skills/cri-po-gpu-container/scripts/enter-sglang-syk.sh --workdir /root/worktrees/sgl-kernel-xpu/muse-spark-position-main-20261014 -- bash -c '
++set -e
++cmake -S /workspace -B /workspace/build -G Ninja -DCMAKE_BUILD_TYPE=Release -DDPCPP_SYCL_TARGET=cri -DPYTHON3_EXECUTABLE=/opt/gfx-deps/venv/bin/python -DSKBUILD_SABI_VERSION=3.9 -DFETCHCONTENT_SOURCE_DIR_REPO-CUTLASS-SYCL=/root/worktrees/sgl-kernel-xpu/review-validation-artifacts/fmha-study-20261015/cutlass-e878
++cmake --build /workspace/build --target sgl-ops-sycl-ComputePosition -j1
++'
+diff --git a/artifacts/position/do_local_target_after_v2.sh b/artifacts/position/do_local_target_after_v2.sh
+new file mode 100755
+index 0000000000000000000000000000000000000000..683474792658b90169d35c42d9d14c54ee9f97ef
+--- /dev/null
++++ b/artifacts/position/do_local_target_after_v2.sh
+@@ -0,0 +1,11 @@
++#!/usr/bin/env bash
++set -euo pipefail
++cd /home/syk/worktrees/sgl-kernel-xpu/muse-spark-position-main-20261014
++trap 'printf "%s\n" "$?" > artifacts/position/local-target-after-v2.exit' EXIT
++exec 9>/tmp/muse-op-build.lock
++flock 9
++SGLANG_MUSE_CONTAINER=codex-muse-position-local-20261015 /home/syk/agent-skills/cri-po-gpu-container/scripts/enter-sglang-syk.sh --workdir /root/worktrees/sgl-kernel-xpu/muse-spark-position-main-20261014 -- bash -c '
++set -e
++cmake -S /workspace -B /workspace/build -G Ninja -DCMAKE_BUILD_TYPE=Release -DDPCPP_SYCL_TARGET=cri -DPYTHON3_EXECUTABLE=/opt/gfx-deps/venv/bin/python -DSKBUILD_SABI_VERSION=3.9 -DSKBUILD_SABI_COMPONENT=Development.SABIModule -DFETCHCONTENT_SOURCE_DIR_REPO-CUTLASS-SYCL=/root/worktrees/sgl-kernel-xpu/review-validation-artifacts/fmha-study-20261015/cutlass-e878
++cmake --build /workspace/build --target sgl-ops-sycl-ComputePosition -j1
++'
+diff --git a/artifacts/position/main_position.py b/artifacts/position/main_position.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..f9196d4967d90dd2265a289a98b9908aa0835004
+--- /dev/null
++++ b/artifacts/position/main_position.py
+@@ -0,0 +1,59 @@
++import torch
++import triton
++import triton.language as tl
++
++
++def compute_position_triton(
++    extend_prefix_lens: torch.Tensor, extend_seq_lens: torch.Tensor, extend_seq_lens_sum
++):
++    """Compute positions. It is a fused version of `compute_position_torch`."""
++    batch_size = extend_seq_lens.shape[0]
++    has_prefix = extend_prefix_lens.shape[0] == batch_size
++
++    positions = torch.empty(
++        extend_seq_lens_sum, dtype=torch.int64, device=extend_seq_lens.device
++    )
++    extend_start_loc = torch.empty(
++        batch_size, dtype=torch.int32, device=extend_seq_lens.device
++    )
++
++    # Launch kernel
++    compute_position_kernel[(batch_size,)](
++        positions,
++        extend_start_loc,
++        extend_prefix_lens,
++        extend_seq_lens,
++        has_prefix,
++    )
++
++    return positions, extend_start_loc
++
++
++@triton.jit
++def compute_position_kernel(
++    positions,
++    extend_start_loc,
++    extend_prefix_lens,
++    extend_seq_lens,
++    has_prefix: tl.constexpr,
++):
++    BLOCK_SIZE: tl.constexpr = 512
++    pid = tl.program_id(0).to(tl.int64)
++
++    prefix_len = tl.load(extend_prefix_lens + pid) if has_prefix else 0
++    seq_len = tl.load(extend_seq_lens + pid)
++
++    # NOTE: This can be slow for large bs
++    cumsum_start = tl.cast(0, tl.int64)
++    for i in range(pid):
++        cumsum_start += tl.load(extend_seq_lens + i)
++
++    num_loop = tl.cdiv(seq_len, BLOCK_SIZE)
++    for i in range(num_loop):
++        offset = tl.arange(0, BLOCK_SIZE) + i * BLOCK_SIZE
++        tl.store(
++            positions + cumsum_start + offset,
++            prefix_len + offset,
++            mask=offset < seq_len,
++        )
++    tl.store(extend_start_loc + pid, cumsum_start)
+diff --git a/artifacts/position/main_position_split.py b/artifacts/position/main_position_split.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..7c897cc0d5b7f9b3b77e9553a88883eeebe98099
+--- /dev/null
++++ b/artifacts/position/main_position_split.py
+@@ -0,0 +1,28 @@
++"""Experimental split-grid variant of the upstream Triton position kernel."""
++
++import triton
++import triton.language as tl
++
++
++@triton.jit
++def compute_position_kernel_split(
++    positions,
++    extend_start_loc,
++    extend_prefix_lens,
++    extend_seq_lens,
++    has_prefix: tl.constexpr,
++    groups_per_request: tl.constexpr,
++):
++    block_size: tl.constexpr = 512
++    pid = tl.program_id(0).to(tl.int64)
++    tile = tl.program_id(1).to(tl.int64)
++    prefix_len = tl.load(extend_prefix_lens + pid) if has_prefix else 0
++    seq_len = tl.load(extend_seq_lens + pid)
++    cumsum_start = tl.cast(0, tl.int64)
++    for i in range(pid):
++        cumsum_start += tl.load(extend_seq_lens + i)
++    for i in range(tile * block_size, seq_len, groups_per_request * block_size):
++        offset = tl.arange(0, block_size) + i
++        tl.store(positions + cumsum_start + offset, prefix_len + offset, mask=offset < seq_len)
++    if tile == 0:
++        tl.store(extend_start_loc + pid, cumsum_start)
+diff --git a/artifacts/position/position-triton-candidate.patch b/artifacts/position/position-triton-candidate.patch
+new file mode 100644
+index 0000000000000000000000000000000000000000..5fe721b9efa2c6c0d3dacc42eaa8b2404b63bafe
+--- /dev/null
++++ b/artifacts/position/position-triton-candidate.patch
+@@ -0,0 +1,70 @@
++--- a/sglang/kernels/ops/attention/position.py
+++++ b/sglang/kernels/ops/attention/position.py
++@@ -4,7 +4,10 @@
++ 
++ 
++ def compute_position_triton(
++-    extend_prefix_lens: torch.Tensor, extend_seq_lens: torch.Tensor, extend_seq_lens_sum
+++    extend_prefix_lens: torch.Tensor,
+++    extend_seq_lens: torch.Tensor,
+++    extend_seq_lens_sum: int,
+++    max_seq_len_hint: int = -1,
++ ):
++     """Compute positions. It is a fused version of `compute_position_torch`."""
++     batch_size = extend_seq_lens.shape[0]
++@@ -17,13 +20,24 @@
++         batch_size, dtype=torch.int32, device=extend_seq_lens.device
++     )
++ 
++-    # Launch kernel
++-    compute_position_kernel[(batch_size,)](
+++    if batch_size == 0:
+++        return positions, extend_start_loc
+++
+++    # Spread a long request across programs while keeping one program for
+++    # short requests. A stale hint changes only occupancy, not coverage.
+++    average_groups = triton.cdiv(extend_seq_lens_sum, batch_size * 512)
+++    hinted_groups = triton.cdiv(max_seq_len_hint, 512) if max_seq_len_hint > 0 else 1
+++    useful_groups = max(1, triton.cdiv(extend_seq_lens_sum, 512))
+++    groups_per_request = min(
+++        useful_groups, max(1, average_groups, hinted_groups)
+++    )
+++    compute_position_kernel[(batch_size, groups_per_request)](
++         positions,
++         extend_start_loc,
++         extend_prefix_lens,
++         extend_seq_lens,
++         has_prefix,
+++        groups_per_request,
++     )
++ 
++     return positions, extend_start_loc
++@@ -36,9 +50,11 @@
++     extend_prefix_lens,
++     extend_seq_lens,
++     has_prefix: tl.constexpr,
+++    groups_per_request: tl.constexpr,
++ ):
++     BLOCK_SIZE: tl.constexpr = 512
++     pid = tl.program_id(0).to(tl.int64)
+++    tile = tl.program_id(1).to(tl.int64)
++ 
++     prefix_len = tl.load(extend_prefix_lens + pid) if has_prefix else 0
++     seq_len = tl.load(extend_seq_lens + pid)
++@@ -48,12 +64,12 @@
++     for i in range(pid):
++         cumsum_start += tl.load(extend_seq_lens + i)
++ 
++-    num_loop = tl.cdiv(seq_len, BLOCK_SIZE)
++-    for i in range(num_loop):
++-        offset = tl.arange(0, BLOCK_SIZE) + i * BLOCK_SIZE
+++    for i in range(tile * BLOCK_SIZE, seq_len, groups_per_request * BLOCK_SIZE):
+++        offset = tl.arange(0, BLOCK_SIZE) + i
++         tl.store(
++             positions + cumsum_start + offset,
++             prefix_len + offset,
++             mask=offset < seq_len,
++         )
++-    tl.store(extend_start_loc + pid, cumsum_start)
+++    if tile == 0:
+++        tl.store(extend_start_loc + pid, cumsum_start)
+diff --git a/artifacts/position/position_register.cc b/artifacts/position/position_register.cc
+new file mode 100644
+index 0000000000000000000000000000000000000000..5af4a28dd135a372ed6e2226e4ec24c1222e9787
+--- /dev/null
++++ b/artifacts/position/position_register.cc
+@@ -0,0 +1,17 @@
++#include <torch/library.h>
++#include <pybind11/pybind11.h>
++#include <torch/torch.h>
++
++namespace at::native::xpu {
++void muse_compute_position(torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor);
++void muse_compute_position_with_hint(torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, int64_t);
++}
++
++TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
++  m.def("muse_compute_position(Tensor! positions, Tensor! extend_start_loc, Tensor prefix_lens, Tensor seq_lens) -> ()");
++  m.impl("muse_compute_position", torch::kXPU, &at::native::xpu::muse_compute_position);
++  m.def("muse_compute_position_with_hint(Tensor! positions, Tensor! extend_start_loc, Tensor prefix_lens, Tensor seq_lens, int max_seq_len_hint) -> ()");
++  m.impl("muse_compute_position_with_hint", torch::kXPU, &at::native::xpu::muse_compute_position_with_hint);
++}
++
++PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {}
+diff --git a/artifacts/position/position_triton_candidate.py b/artifacts/position/position_triton_candidate.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..319972140a68e9b572b9a404d50317b31241b0f8
+--- /dev/null
++++ b/artifacts/position/position_triton_candidate.py
+@@ -0,0 +1,75 @@
++import torch
++import triton
++import triton.language as tl
++
++
++def compute_position_triton(
++    extend_prefix_lens: torch.Tensor,
++    extend_seq_lens: torch.Tensor,
++    extend_seq_lens_sum: int,
++    max_seq_len_hint: int = -1,
++):
++    """Compute positions. It is a fused version of `compute_position_torch`."""
++    batch_size = extend_seq_lens.shape[0]
++    has_prefix = extend_prefix_lens.shape[0] == batch_size
++
++    positions = torch.empty(
++        extend_seq_lens_sum, dtype=torch.int64, device=extend_seq_lens.device
++    )
++    extend_start_loc = torch.empty(
++        batch_size, dtype=torch.int32, device=extend_seq_lens.device
++    )
++
++    if batch_size == 0:
++        return positions, extend_start_loc
++
++    # Spread a long request across programs while keeping one program for
++    # short requests. A stale hint changes only occupancy, not coverage.
++    average_groups = triton.cdiv(extend_seq_lens_sum, batch_size * 512)
++    hinted_groups = triton.cdiv(max_seq_len_hint, 512) if max_seq_len_hint > 0 else 1
++    useful_groups = max(1, triton.cdiv(extend_seq_lens_sum, 512))
++    groups_per_request = min(
++        useful_groups, max(1, average_groups, hinted_groups)
++    )
++    compute_position_kernel[(batch_size, groups_per_request)](
++        positions,
++        extend_start_loc,
++        extend_prefix_lens,
++        extend_seq_lens,
++        has_prefix,
++        groups_per_request,
++    )
++
++    return positions, extend_start_loc
++
++
++@triton.jit
++def compute_position_kernel(
++    positions,
++    extend_start_loc,
++    extend_prefix_lens,
++    extend_seq_lens,
++    has_prefix: tl.constexpr,
++    groups_per_request: tl.constexpr,
++):
++    BLOCK_SIZE: tl.constexpr = 512
++    pid = tl.program_id(0).to(tl.int64)
++    tile = tl.program_id(1).to(tl.int64)
++
++    prefix_len = tl.load(extend_prefix_lens + pid) if has_prefix else 0
++    seq_len = tl.load(extend_seq_lens + pid)
++
++    # NOTE: This can be slow for large bs
++    cumsum_start = tl.cast(0, tl.int64)
++    for i in range(pid):
++        cumsum_start += tl.load(extend_seq_lens + i)
++
++    for i in range(tile * BLOCK_SIZE, seq_len, groups_per_request * BLOCK_SIZE):
++        offset = tl.arange(0, BLOCK_SIZE) + i
++        tl.store(
++            positions + cumsum_start + offset,
++            prefix_len + offset,
++            mask=offset < seq_len,
++        )
++    if tile == 0:
++        tl.store(extend_start_loc + pid, cumsum_start)
+diff --git a/artifacts/position/run_accuracy.py b/artifacts/position/run_accuracy.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..c1ef255343e81a0a7cb9c16baa40b863e58278a6
+--- /dev/null
++++ b/artifacts/position/run_accuracy.py
+@@ -0,0 +1,52 @@
++import os
++import subprocess
++import sys
++
++cases = [
++    "test_compute_position_with_prefix",
++    "test_compute_position_multiple_workgroups_irregular",
++    "test_compute_position_multiple_workgroups_no_prefix",
++    "test_compute_position_with_host_max_hint_skew_b8[4096]",
++    "test_compute_position_with_host_max_hint_skew_b8[8193]",
++]
++for case in cases:
++    command = [
++        sys.executable,
++        "-c",
++        "import torch,importlib,os,pytest,sys; importlib.import_module(os.environ['POSITION_EXTENSION_NAME']); sys.exit(pytest.main(['-q',sys.argv[1]]))",
++        "tests/test_compute_position.py::" + case,
++    ]
++    print("command:", command, flush=True)
++    result = subprocess.run(command, env=os.environ.copy(), check=False)
++    print("result:", case, result.returncode, flush=True)
++    if result.returncode:
++        raise SystemExit(result.returncode)
++
++import torch
++
++from main_position import compute_position_kernel
++from main_position_split import compute_position_kernel_split
++
++for lengths, prefix_values in [
++    ([1, 4097, 33], [2, 4, 6]),
++    ([0, 17, 8193, 1], []),
++]:
++    batch = len(lengths)
++    seq = torch.tensor(lengths, dtype=torch.int32, device="xpu")
++    prefix = torch.tensor(prefix_values, dtype=torch.int32, device="xpu")
++    positions = torch.empty(sum(lengths), dtype=torch.int64, device="xpu")
++    split_positions = torch.empty_like(positions)
++    starts = torch.empty(batch, dtype=torch.int32, device="xpu")
++    split_starts = torch.empty_like(starts)
++    has_prefix = len(prefix_values) == batch
++    groups = max(1, (max(lengths) + 511) // 512)
++    compute_position_kernel[(batch,)](
++        positions, starts, prefix, seq, has_prefix
++    )
++    compute_position_kernel_split[(batch, groups)](
++        split_positions, split_starts, prefix, seq, has_prefix, groups
++    )
++    torch.xpu.synchronize()
++    torch.testing.assert_close(split_positions, positions, rtol=0, atol=0)
++    torch.testing.assert_close(split_starts, starts, rtol=0, atol=0)
++    print("split accuracy:", lengths, prefix_values, "PASS", flush=True)
+diff --git a/artifacts/position/sglang-position-split-main.patch b/artifacts/position/sglang-position-split-main.patch
+new file mode 100644
+index 0000000000000000000000000000000000000000..878bfea73825f9f9d88baec6229d59f17a9b802b
+--- /dev/null
++++ b/artifacts/position/sglang-position-split-main.patch
+@@ -0,0 +1,109 @@
++diff --git a/python/sglang/kernels/ops/attention/position.py b/python/sglang/kernels/ops/attention/position.py
++index f9196d4967..81b33564f9 100644
++--- a/python/sglang/kernels/ops/attention/position.py
+++++ b/python/sglang/kernels/ops/attention/position.py
++@@ -4,7 +4,10 @@ import triton.language as tl
++ 
++ 
++ def compute_position_triton(
++-    extend_prefix_lens: torch.Tensor, extend_seq_lens: torch.Tensor, extend_seq_lens_sum
+++    extend_prefix_lens: torch.Tensor,
+++    extend_seq_lens: torch.Tensor,
+++    extend_seq_lens_sum: int,
+++    max_seq_len_hint: int = -1,
++ ):
++     """Compute positions. It is a fused version of `compute_position_torch`."""
++     batch_size = extend_seq_lens.shape[0]
++@@ -17,13 +20,22 @@ def compute_position_triton(
++         batch_size, dtype=torch.int32, device=extend_seq_lens.device
++     )
++ 
++-    # Launch kernel
++-    compute_position_kernel[(batch_size,)](
+++    if batch_size == 0:
+++        return positions, extend_start_loc
+++
+++    # Spread a long request across programs while keeping one program for
+++    # short requests. A stale hint changes only occupancy, not coverage.
+++    average_groups = triton.cdiv(extend_seq_lens_sum, batch_size * 512)
+++    hinted_groups = triton.cdiv(max_seq_len_hint, 512) if max_seq_len_hint > 0 else 1
+++    useful_groups = max(1, triton.cdiv(extend_seq_lens_sum, 512))
+++    groups_per_request = min(useful_groups, max(1, average_groups, hinted_groups))
+++    compute_position_kernel[(batch_size, groups_per_request)](
++         positions,
++         extend_start_loc,
++         extend_prefix_lens,
++         extend_seq_lens,
++         has_prefix,
+++        groups_per_request,
++     )
++ 
++     return positions, extend_start_loc
++@@ -36,9 +48,11 @@ def compute_position_kernel(
++     extend_prefix_lens,
++     extend_seq_lens,
++     has_prefix: tl.constexpr,
+++    groups_per_request: tl.constexpr,
++ ):
++     BLOCK_SIZE: tl.constexpr = 512
++     pid = tl.program_id(0).to(tl.int64)
+++    tile = tl.program_id(1).to(tl.int64)
++ 
++     prefix_len = tl.load(extend_prefix_lens + pid) if has_prefix else 0
++     seq_len = tl.load(extend_seq_lens + pid)
++@@ -48,12 +62,12 @@ def compute_position_kernel(
++     for i in range(pid):
++         cumsum_start += tl.load(extend_seq_lens + i)
++ 
++-    num_loop = tl.cdiv(seq_len, BLOCK_SIZE)
++-    for i in range(num_loop):
++-        offset = tl.arange(0, BLOCK_SIZE) + i * BLOCK_SIZE
+++    for i in range(tile * BLOCK_SIZE, seq_len, groups_per_request * BLOCK_SIZE):
+++        offset = tl.arange(0, BLOCK_SIZE) + i
++         tl.store(
++             positions + cumsum_start + offset,
++             prefix_len + offset,
++             mask=offset < seq_len,
++         )
++-    tl.store(extend_start_loc + pid, cumsum_start)
+++    if tile == 0:
+++        tl.store(extend_start_loc + pid, cumsum_start)
++diff --git a/python/sglang/srt/model_executor/forward_batch_info.py b/python/sglang/srt/model_executor/forward_batch_info.py
++index ee2e5d2bf0..2d6585ebd7 100644
++--- a/python/sglang/srt/model_executor/forward_batch_info.py
+++++ b/python/sglang/srt/model_executor/forward_batch_info.py
++@@ -1104,9 +1104,11 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
++             if ret.positions is None:
++                 ret.positions = clamp_position(batch.seq_lens)
++         else:
+++            max_seq_len_hint = -1
++             if isinstance(extend_seq_lens, list):
++                 # Main path: H2D from host lists; populate *_cpu mirrors.
++                 assert isinstance(extend_prefix_lens, list)
+++                max_seq_len_hint = max(extend_seq_lens, default=0)
++                 pin_memory = is_pin_memory_available(device)
++                 ret.extend_seq_lens = torch.tensor(
++                     extend_seq_lens, dtype=torch.int32, pin_memory=pin_memory
++@@ -1127,6 +1129,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
++                 ret.extend_prefix_lens,
++                 ret.extend_seq_lens,
++                 ret.extend_num_tokens,
+++                max_seq_len_hint,
++             )
++             if ret.positions is None:
++                 ret.positions = positions
++@@ -2123,12 +2126,14 @@ def compute_position(
++     extend_prefix_lens: torch.Tensor,
++     extend_seq_lens: torch.Tensor,
++     extend_seq_lens_sum: int,
+++    max_seq_len_hint: int = -1,
++ ):
++     if support_triton(attn_backend):
++         positions, extend_start_loc = compute_position_triton(
++             extend_prefix_lens,
++             extend_seq_lens,
++             extend_seq_lens_sum,
+++            max_seq_len_hint,
++         )
++     else:
++         positions, extend_start_loc = compute_position_torch(
+diff --git a/artifacts/position/summarize.py b/artifacts/position/summarize.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..818c2a38012bc88f2de5a39721a3721c081db217
+--- /dev/null
++++ b/artifacts/position/summarize.py
+@@ -0,0 +1,32 @@
++import json
++import sys
++from statistics import median
++
++for filename in sys.argv[1:]:
++    print(f"\n{filename}")
++    print("batch length main_p50 sycl_p50 delta_us main_p20-p80 sycl_p20-p80")
++    batch = None
++    for line in open(filename):
++        try:
++            row = json.loads(line)
++        except json.JSONDecodeError:
++            continue
++        if "meta" in row:
++            batch = row["meta"]["batch"]
++        if "length" not in row or "branch_sycl_us" not in row:
++            continue
++        main = sorted(row["main_triton_us"])
++        sycl = sorted(row["branch_sycl_us"])
++        n = len(main)
++        assert n == len(sycl)
++        p20 = round(0.2 * (n - 1))
++        p80 = round(0.8 * (n - 1))
++        print(
++            batch,
++            row["length"],
++            median(main),
++            median(sycl),
++            round(median(main) - median(sycl), 3),
++            f"{main[p20]}-{main[p80]}",
++            f"{sycl[p20]}-{sycl[p80]}",
++        )

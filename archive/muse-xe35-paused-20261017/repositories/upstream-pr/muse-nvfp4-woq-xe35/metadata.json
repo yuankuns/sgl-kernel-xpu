@@ -1,0 +1,42 @@
+{
+  "directory": "/home/syk/worktrees/sgl-kernel-xpu-up/pr/muse-nvfp4-woq-xe35",
+  "head": "833c95208dccd2af5628c121222f91186a5b2de7",
+  "branch": "pr/muse-nvfp4-woq-xe35",
+  "patch_sha256": "7420135d5fc9f3766c07c255d930cb2a33dc171221c425cea91cd47addd22af0",
+  "tracked_paths": [
+    "cmake/BuildFlags.cmake",
+    "include/sgl_kernel_ops.h",
+    "python/sgl_kernel/__init__.py",
+    "src/BuildOnLinux.cmake",
+    "src/CMakeLists.txt",
+    "src/sycl/Device.cpp",
+    "src/sycl/HCHead.cpp",
+    "src/torch_extension_sycl.cc",
+    "tests/conftest.py"
+  ],
+  "untracked_code": [
+    "benchmark/accuracy_reference.py",
+    "benchmark/bench_nvfp4_woq_group_gemm.py",
+    "include/sgl_kernel/xe35/nvfp4_woq.h",
+    "python/sgl_kernel/nvfp4.py",
+    "python/sgl_kernel/nvfp4_moe.py",
+    "src/sycl/xe35/blockwise_moe_nvfp4_woq.cpp",
+    "src/sycl/xe35/nvfp4/collective/moe_array_epilogue.hpp",
+    "src/sycl/xe35/nvfp4/collective/moe_array_mma.hpp",
+    "src/sycl/xe35/nvfp4/collective/moe_callbacks.hpp",
+    "src/sycl/xe35/nvfp4/collective/moe_dtype_policy.hpp",
+    "src/sycl/xe35/nvfp4/collective/moe_gemm_array_cooperative.hpp",
+    "src/sycl/xe35/nvfp4/collective/moe_tile_scheduler.hpp",
+    "src/sycl/xe35/nvfp4/collective/moe_tile_scheduler_params.h",
+    "src/sycl/xe35/nvfp4/device/grouped_gemm_runner.hpp",
+    "src/sycl/xe35/nvfp4/payload_compat.hpp",
+    "src/sycl/xe35/nvfp4_woq.cpp",
+    "src/sycl/xe35/nvfp4_woq_bf16_mainloop.hpp",
+    "src/sycl/xe35/nvfp4_woq_mxfp8_mainloop.hpp",
+    "src/sycl/xe35/nvfp4_woq_scale_layout.cpp",
+    "src/sycl/xe35/xe_subbyte_upconvert.hpp",
+    "tests/nvfp4_utils.py",
+    "tests/test_nvfp4_woq_moe.py"
+  ],
+  "apply_check": "PASS"
+}

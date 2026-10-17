@@ -1,0 +1,224 @@
+--- a/src/torch_extension_sycl.cc
++++ b/src/torch_extension_sycl.cc
+@@ -1,3 +1,5 @@
++#include <c10/core/DeviceGuard.h>
++
+ /* Copyright 2025 SGLang Team. All Rights Reserved.
+ 
+ Licensed under the Apache License, Version 2.0 (the "License");
+@@ -19,6 +21,20 @@
+ #include "sgl_flash_kernel_ops.h"
+ #include "sgl_kernel_ops.h"
+ #include "sgl_kernel_torch_shim.h"
++static void silu_and_mul_dispatch_xe35(at::Tensor& out, at::Tensor& input) {
++  TORCH_CHECK(input.device().type() == c10::DeviceType::XPU, "Activation dispatch requires XPU input");
++  TORCH_CHECK(out.device() == input.device(), "Activation output must be on the input device");
++  c10::DeviceGuard input_device_guard(input.device());
++#if SYCL_INTEL_TARGET == 35
++  auto input_architecture = query_device(input.get_device());
++  if (input_architecture == std::make_tuple<int64_t, int64_t>(3, 5)) {
++    silu_and_mul_xe35(out, input);
++    return;
++  }
++#endif
++  silu_and_mul(out, input);
++}
++
+ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
+   m.def("weak_ref_tensor(Tensor(a) tensor) -> Tensor(a)");
+   m.impl("weak_ref_tensor", torch::kXPU, &weak_ref_tensor);
+@@ -27,7 +43,7 @@
+   m.impl("awq_dequantize", torch::kXPU, &awq_dequantize);
+ 
+   m.def("silu_and_mul(Tensor! out, Tensor input) -> ()");
+-  m.impl("silu_and_mul", torch::kXPU, &silu_and_mul);
++  m.impl("silu_and_mul", torch::kXPU, &silu_and_mul_dispatch_xe35);
+ 
+   m.def("silu_and_mul_clamp(Tensor! out, Tensor input, float swiglu_limit) -> ()");
+   m.impl("silu_and_mul_clamp", torch::kXPU, &silu_and_mul_clamp);
+@@ -797,6 +813,8 @@
+ 
+ #if SYCL_INTEL_TARGET == 35
+ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
++  m.def("silu_and_mul_xe35(Tensor! out, Tensor input) -> ()");
++  m.impl("silu_and_mul_xe35", torch::kXPU, &silu_and_mul_xe35);
+   m.def(
+       "muse_spark_moe_routing_xe35(Tensor! topk_weights, Tensor! topk_ids, Tensor gating_output, Tensor? correction_bias, "
+       "float router_output_multiplier, float route_scale, float division_eps, Tensor? local_expert_mapping, Tensor? "
+--- a/include/sgl_kernel_ops.h
++++ b/include/sgl_kernel_ops.h
+@@ -1577,5 +1577,6 @@
+ #pragma GCC visibility pop
+ 
+ #if SYCL_INTEL_TARGET == 35
++#include "sgl_kernel/xe35/activation.h"
+ #include "sgl_kernel/xe35/routing_quant.h"
+ #endif
+--- a/python/sgl_kernel/elementwise.py
++++ b/python/sgl_kernel/elementwise.py
+@@ -223,7 +223,13 @@
+             device=input.device,
+             dtype=input.dtype,
+         )
+-    torch.ops.sgl_kernel.silu_and_mul(out, input)
++    input_device_index = input.device.index
++    if input.device.type == "xpu" and tuple(
++        torch.ops.sgl_kernel.query_device.default(input_device_index)
++    ) == (3, 5):
++        torch.ops.sgl_kernel.silu_and_mul_xe35(out, input)
++    else:
++        torch.ops.sgl_kernel.silu_and_mul(out, input)
+     return out
+ 
+ 
+--- /dev/null
++++ b/src/sycl/xe35/activation/activation.hpp
+@@ -0,0 +1,108 @@
++#pragma once
++
++#include <ATen/ATen.h>
++#include <ATen/OpMathType.h>
++#include <sycl/sycl.hpp>
++
++#include "sycl/MemoryAccess.h"
++#include "sycl/SYCLHelpers.h"
++#include "sycl/Utils.h"
++
++namespace sgl_kernel::xe35::activation {
++
++template <typename scalar_t, typename accscalar_t>
++struct silu_mul_dpcpp_functor_xe35 {
++  scalar_t operator()(scalar_t activation_value, scalar_t multiplication_value) const {
++    return (accscalar_t(activation_value)) / (1.0f + expf(accscalar_t(-activation_value))) * accscalar_t(multiplication_value);
++  }
++};
++
++template <typename scalar_t, typename func_t, int VectorWidth>
++struct op_and_mul_functor_xe35 {
++  void operator()(sycl::nd_item<1> item) const {
++    using accscalar_t = at::opmath_type<scalar_t>;
++    int64_t offset = item.get_local_linear_id();
++    int64_t step = item.get_local_range(0);
++    int64_t token_id = item.get_group(0);
++    func_t activation_function;
++    int64_t bound = dim / VectorWidth;
++    for (int64_t vector_index = offset; vector_index < bound; vector_index += step) {
++      auto unary_val = reinterpret_cast<aligned_vector_loop<scalar_t, VectorWidth>*>(input_ptr)[token_id * bound * 2 + vector_index];
++      auto mul_val = reinterpret_cast<aligned_vector_loop<scalar_t, VectorWidth>*>(input_ptr)[token_id * bound * 2 + vector_index + bound];
++#pragma unroll
++      for (int vector_index = 0; vector_index < VectorWidth; ++vector_index) {
++        auto activation_value = unary_val[vector_index], multiplication_value = mul_val[vector_index];
++        unary_val[vector_index] = activation_function(unary_val[vector_index], mul_val[vector_index]);
++      }
++      reinterpret_cast<aligned_vector_loop<scalar_t, VectorWidth>*>(output_ptr)[token_id * bound + vector_index] = unary_val;
++    }
++  }
++
++  scalar_t* input_ptr;
++  scalar_t* output_ptr;
++  int64_t num_;
++  int64_t dim;
++};
++
++#define SGL_XE35_SILU_VEC_LAUNCH(KERNEL, VectorWidth)                                                  \
++  case VectorWidth: {                                                                    \
++    op_and_mul_functor_xe35<T_to, KERNEL<T_to, at::opmath_type<T_from>>, VectorWidth> kfn = { \
++        .input_ptr = _input, .output_ptr = _out, .num_ = numel, .dim = dim};   \
++    sycl_kernel_submit(num_group* wg_size, wg_size, kernel_queue, kfn);                   \
++    break;                                                                     \
++  }
++
++template <typename ConfigScalar = float>
++void get_config_xe35(
++    const at::Tensor& input,
++    const at::Tensor& out,
++    int64_t& numel,
++    int64_t& dim,
++    int64_t& wg_size,
++    int64_t& num_group,
++    int& vec_size) {
++  auto dev_id = dpcppGetDeviceIdOfCurrentQueue();
++  int64_t max_wg_size = dpcppMaxWorkGroupSize(dev_id);
++  numel = out.numel();
++  dim = out.size(-1);
++  int64_t tokens = numel / dim;
++  wg_size = std::min(dim, max_wg_size);
++  num_group = tokens;
++
++  vec_size = sizeof(float) * 4 / sizeof(ConfigScalar);
++  while ((vec_size >> 1) * wg_size >= dim) {
++    vec_size = vec_size >> 1;
++  }
++  if (dim % vec_size != 0) vec_size = 1;
++}
++
++template <typename T_to = float, typename T_from = float>
++void silu_and_mul_sycl_xe35(sycl::queue& kernel_queue, at::Tensor& input, at::Tensor& out) {
++  auto _input = reinterpret_cast<T_to*>(input.data_ptr<T_from>());
++  auto _out = reinterpret_cast<T_to*>(out.data_ptr<T_from>());
++
++  int64_t numel;
++  int64_t dim;
++  int64_t wg_size;
++  int64_t num_group;
++  int vec_size;
++  get_config_xe35<T_to>(input, out, numel, dim, wg_size, num_group, vec_size);
++
++  using accscalar_t = at::opmath_type<T_to>;
++  switch (vec_size) {
++    SGL_XE35_SILU_VEC_LAUNCH(silu_mul_dpcpp_functor_xe35, 1);
++    SGL_XE35_SILU_VEC_LAUNCH(silu_mul_dpcpp_functor_xe35, 2);
++    SGL_XE35_SILU_VEC_LAUNCH(silu_mul_dpcpp_functor_xe35, 4);
++    SGL_XE35_SILU_VEC_LAUNCH(silu_mul_dpcpp_functor_xe35, 8);
++    SGL_XE35_SILU_VEC_LAUNCH(silu_mul_dpcpp_functor_xe35, 16);
++    default:
++      TORCH_CHECK(false, "Unsupported vector size: ", vec_size);
++  }
++
++  return;
++}
++
++
++#undef SGL_XE35_SILU_VEC_LAUNCH
++
++}
+--- /dev/null
++++ b/src/sycl/xe35/activation/silu_mul.cpp
+@@ -0,0 +1,28 @@
++#include <c10/core/DeviceGuard.h>
++#include <c10/xpu/XPUStream.h>
++
++#include "sgl_kernel_ops.h"
++#include "sgl_kernel/xe35/activation.h"
++#include "activation.hpp"
++
++void silu_and_mul_xe35(at::Tensor& out, at::Tensor& input) {
++  TORCH_CHECK(input.device().type() == c10::DeviceType::XPU, "Xe35 activation requires XPU input");
++  TORCH_CHECK(out.device() == input.device(), "Activation output must be on the input device");
++  auto input_device_index = input.get_device();
++  auto input_architecture = query_device(input_device_index);
++  TORCH_CHECK(input_architecture == std::make_tuple<int64_t, int64_t>(3, 5), "Xe35 activation requires input architecture (3, 5)");
++  c10::DeviceGuard input_device_guard(input.device());
++  input = input.contiguous();
++  out = out.contiguous();
++
++  auto stream = at::xpu::getCurrentXPUStream(input_device_index);
++  auto queue = stream.queue();
++
++  if (input.scalar_type() == at::ScalarType::Half) {
++    sgl_kernel::xe35::activation::silu_and_mul_sycl_xe35<sycl::half, at::Half>(queue, input, out);
++  } else {
++    sgl_kernel::xe35::activation::silu_and_mul_sycl_xe35<sycl::ext::oneapi::bfloat16, at::BFloat16>(queue, input, out);
++  }
++  return;
++}
++
+--- /dev/null
++++ b/include/sgl_kernel/xe35/activation.h
+@@ -0,0 +1,6 @@
++#pragma once
++
++#include <ATen/ATen.h>
++#include "sgl_kernel_export.h"
++
++SGL_KERNEL_EXPORT void silu_and_mul_xe35(at::Tensor& out, at::Tensor& input);

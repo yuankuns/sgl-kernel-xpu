@@ -1,0 +1,2401 @@
+diff --git a/benchmark/bench_memory_compare.py b/benchmark/bench_memory_compare.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..36968d04ace61639d9b7b2e0b7909105dea0f821
+--- /dev/null
++++ b/benchmark/bench_memory_compare.py
+@@ -0,0 +1,1218 @@
++"""B8 memory benchmarks with profiler/event, production and tuning modes."""
++
++import argparse
++import functools
++import importlib
++import json
++import os
++import tempfile
++from pathlib import Path
++from statistics import median
++
++
++def parse_args(argv=None):
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument(
++        "--mode",
++        choices=("profiler", "event", "tiles", "write-groups", "aux", "prefill"),
++        default="profiler",
++    )
++    parser.add_argument(
++        "--op", choices=("all", "decode", "extend", "write", "fused"), default="all"
++    )
++    parser.add_argument("--batch", type=int, default=8)
++    parser.add_argument("--samples", type=int)
++    parser.add_argument("--lengths", nargs="+", type=int)
++    parser.add_argument("--page-sizes", nargs="+", type=int, default=(64,))
++    parser.add_argument("--page-size", type=int, default=64)
++    parser.add_argument("--prefix-lengths", nargs="+", type=int)
++    parser.add_argument("--prefix-len", type=int)
++    parser.add_argument("--extend-len", type=int)
++    parser.add_argument("--repeats", type=int, default=32)
++    parser.add_argument("--production-only", action="store_true")
++    parser.add_argument("--trace-labels", action="store_true")
++    parser.add_argument("--main-only", action="store_true")
++    parser.add_argument(
++        "--cases", nargs="+", choices=("decode", "extend", "write", "fused")
++    )
++    parser.add_argument("--case", choices=("extend", "fused"))
++    parser.add_argument(
++        "--only",
++        choices=("all", "alloc_decode", "alloc_extend", "write_req_to_token_pool_xe35"),
++    )
++    args = parser.parse_args(argv)
++    if args.batch != 8 or any(
++        os.environ.get(name, "8") != "8"
++        for name in ("BATCHES", "BATCH_SIZE", "SERVING_BATCH")
++    ):
++        parser.error("Muse-Spark serving benchmarks require --batch 8")
++    if args.samples is None:
++        args.samples = {"tiles": 51, "write-groups": 51, "aux": 30}.get(args.mode, 31)
++    if args.lengths is None:
++        args.lengths = (
++            (4096,)
++            if args.mode == "prefill"
++            else (
++                (
++                    64,
++                    128,
++                    256,
++                    384,
++                    511,
++                    512,
++                    513,
++                    768,
++                    1024,
++                    1536,
++                    2047,
++                    2048,
++                    2049,
++                    3072,
++                    4096,
++                )
++                if args.mode == "tiles"
++                else (256, 511, 512, 513, 1024, 2047, 2048, 2049, 4096)
++            )
++        )
++    if args.prefix_lengths is None:
++        args.prefix_lengths = (0,) if args.mode == "prefill" else (0, 4096)
++    if (
++        args.samples < 1
++        or args.repeats < 1
++        or args.page_size < 1
++        or any(value < 1 for value in (*args.lengths, *args.page_sizes))
++        or any(value < 0 for value in args.prefix_lengths)
++    ):
++        parser.error(
++            "samples, repeats, lengths and page sizes must be positive; prefixes must be nonnegative"
++        )
++    if args.case is not None:
++        if args.op != "all" and args.op != args.case:
++            parser.error("--case and --op must agree")
++        args.op = args.case
++    if args.cases is not None and args.op != "all":
++        parser.error("choose --op or --cases, not both")
++    default_cases = (
++        ("extend", "fused")
++        if args.mode == "tiles"
++        else ("decode", "extend", "write", "fused")
++    )
++    args.cases = args.cases or (default_cases if args.op == "all" else (args.op,))
++    if args.mode == "event":
++        if (
++            args.op not in ("extend", "fused")
++            or args.prefix_len is None
++            or args.prefix_len < 0
++            or args.extend_len is None
++            or args.extend_len < 1
++        ):
++            parser.error(
++                "event mode requires --op extend/fused, --prefix-len >= 0 and --extend-len > 0"
++            )
++        args.case = args.op
++    if args.mode in ("tiles", "write-groups"):
++        allowed = ("extend", "fused") if args.mode == "tiles" else ("write",)
++        if args.op != "all" and args.op not in allowed:
++            parser.error(f"{args.mode} mode supports {allowed}")
++        if args.mode == "tiles" and any(case not in allowed for case in args.cases):
++            parser.error("tiles mode supports only extend/fused")
++    if args.mode == "aux":
++        names = {
++            "all": "all",
++            "decode": "alloc_decode",
++            "extend": "alloc_extend",
++            "write": "write_req_to_token_pool_xe35",
++        }
++        if args.op not in names:
++            parser.error("aux mode supports only all/decode/extend/write")
++        if args.only is not None and args.op != "all" and args.only != names[args.op]:
++            parser.error("--only and --op must agree")
++        args.only = args.only or names[args.op]
++    elif args.only is not None:
++        parser.error("--only is an aux-mode option")
++    if args.mode == "prefill" and args.op not in ("all", "fused"):
++        parser.error("prefill mode supports only fused")
++    if args.main_only and args.mode != "profiler":
++        parser.error("--main-only is a profiler-mode option")
++    return args
++
++
++def quantile(values, fraction):
++    ordered = sorted(values)
++    return ordered[round((len(ordered) - 1) * fraction)]
++
++
++@functools.lru_cache(maxsize=1)
++def main_memory_ops():
++    from sglang.kernels.ops.memory.allocator import (
++        alloc_decode_kernel,
++        alloc_extend_kernel,
++    )
++    from sglang.kernels.ops.memory.common import write_req_to_token_pool_triton
++
++    return alloc_extend_kernel, alloc_decode_kernel, write_req_to_token_pool_triton
++
++
++def profile_pair(name, shape, old, new, old_kernels, new_kernel, samples):
++    for _ in range(5):
++        old()
++        new()
++    torch.xpu.synchronize()
++    with torch.profiler.profile(
++        activities=[
++            torch.profiler.ProfilerActivity.CPU,
++            torch.profiler.ProfilerActivity.XPU,
++        ]
++    ) as profiler:
++        for iteration in range(samples):
++            if iteration % 2:
++                new()
++                old()
++            else:
++                old()
++                new()
++        torch.xpu.synchronize()
++    with tempfile.TemporaryDirectory() as directory:
++        trace = Path(directory) / "trace.json"
++        profiler.export_chrome_trace(str(trace))
++        events = json.loads(trace.read_text())["traceEvents"]
++    durations = {
++        needle: [
++            event["dur"]
++            for event in events
++            if event.get("cat") == "kernel" and needle in event.get("name", "")
++        ]
++        for needle in (*old_kernels, new_kernel)
++    }
++    for needle, values in durations.items():
++        if len(values) != samples:
++            raise RuntimeError(
++                f"{name} {shape}: expected {samples} kernels for {needle}, got {len(values)}"
++            )
++    old_us = [
++        sum(durations[needle][index] for needle in old_kernels)
++        for index in range(samples)
++    ]
++    new_us = durations[new_kernel]
++    report = {
++        "case": name,
++        **shape,
++        "samples": samples,
++        "timing": "torch.profiler XPU kernel event duration; alternating paired calls",
++        "main_samples_us": old_us,
++        "sycl_samples_us": new_us,
++        "main_us": {
++            "p20": quantile(old_us, 0.2),
++            "p50": median(old_us),
++            "p80": quantile(old_us, 0.8),
++            "min": min(old_us),
++            "max": max(old_us),
++        },
++        "sycl_us": {
++            "p20": quantile(new_us, 0.2),
++            "p50": median(new_us),
++            "p80": quantile(new_us, 0.8),
++            "min": min(new_us),
++            "max": max(new_us),
++        },
++    }
++    report["speedup"] = report["main_us"]["p50"] / report["sycl_us"]["p50"]
++    print(json.dumps(report), flush=True)
++    torch.xpu.synchronize()
++
++
++def profile_main(name, shape, old, old_kernels, samples):
++    for _ in range(5):
++        old()
++    torch.xpu.synchronize()
++    with torch.profiler.profile(
++        activities=[
++            torch.profiler.ProfilerActivity.CPU,
++            torch.profiler.ProfilerActivity.XPU,
++        ]
++    ) as profiler:
++        for _ in range(samples):
++            old()
++        torch.xpu.synchronize()
++    with tempfile.TemporaryDirectory() as directory:
++        trace = Path(directory) / "trace.json"
++        profiler.export_chrome_trace(str(trace))
++        events = json.loads(trace.read_text())["traceEvents"]
++    durations = {
++        needle: [
++            event["dur"]
++            for event in events
++            if event.get("cat") == "kernel" and needle in event.get("name", "")
++        ]
++        for needle in old_kernels
++    }
++    for needle, values in durations.items():
++        if len(values) != samples:
++            raise RuntimeError(
++                f"{name} {shape}: expected {samples} kernels for {needle}, got {len(values)}"
++            )
++    old_us = [
++        sum(durations[needle][index] for needle in old_kernels)
++        for index in range(samples)
++    ]
++    print(
++        json.dumps(
++            {
++                "case": name,
++                **shape,
++                "samples": samples,
++                "timing": "torch.profiler XPU kernel event duration",
++                "main_samples_us": old_us,
++                "main_us": {
++                    "p20": quantile(old_us, 0.2),
++                    "p50": median(old_us),
++                    "p80": quantile(old_us, 0.8),
++                    "min": min(old_us),
++                    "max": max(old_us),
++                },
++            }
++        ),
++        flush=True,
++    )
++    torch.xpu.synchronize()
++
++
++def compare_extend(
++    batch, prefix_len, extend_len, page_size, samples, fused, main_only=False
++):
++    alloc_extend_kernel, _, write_req_to_token_pool_triton = main_memory_ops()
++
++    prefix = torch.full((batch,), prefix_len, dtype=torch.int64, device="xpu")
++    seq = torch.full((batch,), prefix_len + extend_len, dtype=torch.int64, device="xpu")
++    extensions = torch.full((batch,), extend_len, dtype=torch.int64, device="xpu")
++    last = torch.full((batch,), prefix_len - 1, dtype=torch.int32, device="xpu")
++    free_pages = torch.arange(
++        1,
++        batch * ((extend_len + page_size - 1) // page_size) + 2,
++        dtype=torch.int64,
++        device="xpu",
++    )
++    old_out = torch.empty(batch * extend_len, dtype=torch.int64, device="xpu")
++    new_out = torch.empty_like(old_out)
++    shape = {
++        "batch": batch,
++        "prefix_len": prefix_len,
++        "extend_len": extend_len,
++        "page_size": page_size,
++        "last_dtype": "int32",
++    }
++    if fused:
++        old_pool = torch.empty(
++            (batch, prefix_len + extend_len), dtype=torch.int32, device="xpu"
++        )
++        new_pool = torch.empty_like(old_pool)
++        req_indices = torch.arange(batch, dtype=torch.int64, device="xpu")
++        prefix_values = torch.arange(
++            max(1, batch * prefix_len), dtype=torch.int64, device="xpu"
++        )
++        pointers = torch.tensor(
++            [
++                prefix_values.data_ptr() + index * prefix_len * 8
++                for index in range(batch)
++            ],
++            dtype=torch.uint64,
++            device="xpu",
++        )
++
++        def old():
++            alloc_extend_kernel[(batch,)](
++                prefix,
++                seq,
++                last,
++                free_pages,
++                old_out,
++                triton.next_power_of_2(batch),
++                page_size,
++            )
++            write_req_to_token_pool_triton[(batch,)](
++                old_pool,
++                req_indices,
++                pointers,
++                prefix,
++                seq,
++                extensions,
++                old_out,
++                old_pool.stride(0),
++            )
++
++        def new():
++            torch.ops.sgl_kernel.paged_alloc_extend_and_write_xe35(
++                prefix,
++                seq,
++                last,
++                free_pages,
++                new_out,
++                new_pool,
++                req_indices,
++                pointers,
++                page_size,
++            )
++
++        if main_only:
++            profile_main(
++                "fused",
++                shape,
++                old,
++                ("alloc_extend_kernel", "write_req_to_token_pool_triton"),
++                samples,
++            )
++            return
++        old()
++        new()
++        torch.xpu.synchronize()
++        torch.testing.assert_close(new_pool.cpu(), old_pool.cpu(), rtol=0, atol=0)
++        old_kernels = ("alloc_extend_kernel", "write_req_to_token_pool_triton")
++        new_kernel = "PagedAllocExtendAndWriteKernel"
++    else:
++
++        def old():
++            alloc_extend_kernel[(batch,)](
++                prefix,
++                seq,
++                last,
++                free_pages,
++                old_out,
++                triton.next_power_of_2(batch),
++                page_size,
++            )
++
++        def new():
++            torch.ops.sgl_kernel.paged_alloc_extend_xe35(
++                prefix, seq, last, free_pages, new_out, page_size
++            )
++
++        if main_only:
++            profile_main("extend", shape, old, ("alloc_extend_kernel",), samples)
++            return
++        old()
++        new()
++        torch.xpu.synchronize()
++        old_kernels = ("alloc_extend_kernel",)
++        new_kernel = "PagedAllocExtendKernel"
++    torch.testing.assert_close(new_out.cpu(), old_out.cpu(), rtol=0, atol=0)
++    profile_pair(
++        "fused" if fused else "extend",
++        shape,
++        old,
++        new,
++        old_kernels,
++        new_kernel,
++        samples,
++    )
++
++
++def compare_decode(samples, main_only=False):
++    _, alloc_decode_kernel, _ = main_memory_ops()
++
++    batch, page_size = 8, 64
++    seq = torch.tensor(
++        [4096, 4097, 4098, 4104, 4112, 4096, 4100, 4111],
++        dtype=torch.int64,
++        device="xpu",
++    )
++    last = torch.arange(batch, dtype=torch.int32, device="xpu") + 4095
++    free_pages = torch.arange(1, 16, dtype=torch.int64, device="xpu")
++    old_out = torch.empty(batch, dtype=torch.int64, device="xpu")
++    new_out = torch.empty_like(old_out)
++
++    def old():
++        alloc_decode_kernel[(batch,)](seq, last, free_pages, old_out, batch, page_size)
++
++    def new():
++        torch.ops.sgl_kernel.paged_alloc_decode_xe35(
++            seq, last, free_pages, new_out, page_size
++        )
++
++    if main_only:
++        profile_main(
++            "decode",
++            {"batch": batch, "page_size": page_size, "last_dtype": "int32"},
++            old,
++            ("alloc_decode_kernel",),
++            samples,
++        )
++        return
++    old()
++    new()
++    torch.xpu.synchronize()
++    torch.testing.assert_close(new_out.cpu(), old_out.cpu(), rtol=0, atol=0)
++    profile_pair(
++        "decode",
++        {"batch": batch, "page_size": page_size, "last_dtype": "int32"},
++        old,
++        new,
++        ("alloc_decode_kernel",),
++        "PagedAllocDecodeKernel",
++        samples,
++    )
++
++
++def compare_write(samples, prefix_len, extend_len, main_only=False):
++    _, _, write_req_to_token_pool_triton = main_memory_ops()
++
++    batch, seq_len = 8, prefix_len + extend_len
++    old_pool = torch.empty((batch, seq_len), dtype=torch.int32, device="xpu")
++    new_pool = torch.empty_like(old_pool)
++    req_indices = torch.arange(batch, dtype=torch.int64, device="xpu")
++    prefix_values = torch.arange(
++        max(1, batch * prefix_len), dtype=torch.int64, device="xpu"
++    )
++    pointers = torch.tensor(
++        [prefix_values.data_ptr() + index * prefix_len * 8 for index in range(batch)],
++        dtype=torch.uint64,
++        device="xpu",
++    )
++    prefix = torch.full((batch,), prefix_len, dtype=torch.int64, device="xpu")
++    seq = torch.full((batch,), seq_len, dtype=torch.int64, device="xpu")
++    extensions = torch.full((batch,), extend_len, dtype=torch.int64, device="xpu")
++    cache_loc = torch.arange(batch * extend_len, dtype=torch.int64, device="xpu")
++
++    def old():
++        write_req_to_token_pool_triton[(batch,)](
++            old_pool,
++            req_indices,
++            pointers,
++            prefix,
++            seq,
++            extensions,
++            cache_loc,
++            old_pool.stride(0),
++        )
++
++    def new():
++        torch.ops.sgl_kernel.write_req_to_token_pool_xe35(
++            new_pool, req_indices, pointers, prefix, seq, extensions, cache_loc
++        )
++
++    if main_only:
++        profile_main(
++            "write",
++            {
++                "batch": batch,
++                "prefix_len": prefix_len,
++                "extend_len": extend_len,
++                "seq_len": seq_len,
++                "pool_dtype": "int32",
++                "cache_loc_dtype": "int64",
++            },
++            old,
++            ("write_req_to_token_pool_triton",),
++            samples,
++        )
++        return
++    old()
++    new()
++    torch.xpu.synchronize()
++    torch.testing.assert_close(new_pool.cpu(), old_pool.cpu(), rtol=0, atol=0)
++    profile_pair(
++        "write",
++        {
++            "batch": batch,
++            "prefix_len": prefix_len,
++            "extend_len": extend_len,
++            "seq_len": seq_len,
++            "pool_dtype": "int32",
++            "cache_loc_dtype": "int64",
++        },
++        old,
++        new,
++        ("write_req_to_token_pool_triton",),
++        "WriteReqToTokenPoolKernel",
++        samples,
++    )
++
++
++def measure_event(args):
++    alloc_extend_kernel, _, write_req_to_token_pool_triton = main_memory_ops()
++    batch, prefix_len, extend_len, page_size = (
++        args.batch,
++        args.prefix_len,
++        args.extend_len,
++        args.page_size,
++    )
++    prefix = torch.full((batch,), prefix_len, dtype=torch.int64, device="xpu")
++    seq = torch.full((batch,), prefix_len + extend_len, dtype=torch.int64, device="xpu")
++    extensions = torch.full((batch,), extend_len, dtype=torch.int64, device="xpu")
++    last = torch.full((batch,), prefix_len - 1, dtype=torch.int32, device="xpu")
++    free_pages = torch.arange(
++        1,
++        batch * ((extend_len + page_size - 1) // page_size) + 2,
++        dtype=torch.int64,
++        device="xpu",
++    )
++    labels = (
++        ("main", "production")
++        if args.production_only
++        else ("main", "production", "tile1", "tile4", "tile16")
++    )
++    outputs = {
++        label: torch.empty(batch * extend_len, dtype=torch.int64, device="xpu")
++        for label in labels
++    }
++    if args.case == "fused":
++        pools = {
++            label: torch.empty(
++                (batch, prefix_len + extend_len), dtype=torch.int32, device="xpu"
++            )
++            for label in labels
++        }
++        req_indices = torch.arange(batch, dtype=torch.int64, device="xpu")
++        prefix_values = torch.arange(
++            max(1, batch * prefix_len), dtype=torch.int64, device="xpu"
++        )
++        pointers = torch.tensor(
++            [
++                prefix_values.data_ptr() + index * prefix_len * 8
++                for index in range(batch)
++            ],
++            dtype=torch.uint64,
++            device="xpu",
++        )
++
++        def main():
++            alloc_extend_kernel[(batch,)](
++                prefix,
++                seq,
++                last,
++                free_pages,
++                outputs["main"],
++                triton.next_power_of_2(batch),
++                page_size,
++            )
++            write_req_to_token_pool_triton[(batch,)](
++                pools["main"],
++                req_indices,
++                pointers,
++                prefix,
++                seq,
++                extensions,
++                outputs["main"],
++                pools["main"].stride(0),
++            )
++
++        def production():
++            torch.ops.sgl_kernel.paged_alloc_extend_and_write_xe35(
++                prefix,
++                seq,
++                last,
++                free_pages,
++                outputs["production"],
++                pools["production"],
++                req_indices,
++                pointers,
++                page_size,
++            )
++
++        def tiled(label, groups):
++            torch.ops.sgl_kernel.paged_alloc_extend_and_write_tiled_for_benchmark(
++                prefix,
++                seq,
++                last,
++                free_pages,
++                outputs[label],
++                pools[label],
++                req_indices,
++                pointers,
++                page_size,
++                groups,
++            )
++
++    else:
++        pools = None
++
++        def main():
++            alloc_extend_kernel[(batch,)](
++                prefix,
++                seq,
++                last,
++                free_pages,
++                outputs["main"],
++                triton.next_power_of_2(batch),
++                page_size,
++            )
++
++        def production():
++            torch.ops.sgl_kernel.paged_alloc_extend_xe35(
++                prefix,
++                seq,
++                last,
++                free_pages,
++                outputs["production"],
++                page_size,
++            )
++
++        def tiled(label, groups):
++            torch.ops.sgl_kernel.paged_alloc_extend_tiled_for_benchmark(
++                prefix,
++                seq,
++                last,
++                free_pages,
++                outputs[label],
++                page_size,
++                groups,
++            )
++
++    calls = {
++        "main": main,
++        "production": production,
++        "tile1": lambda: tiled("tile1", 1),
++        "tile4": lambda: tiled("tile4", 4),
++        "tile16": lambda: tiled("tile16", 16),
++    }
++    for _ in range(5):
++        for label in labels:
++            calls[label]()
++    torch.xpu.synchronize()
++    expected = outputs["main"].cpu()
++    for label in labels[1:]:
++        torch.testing.assert_close(outputs[label].cpu(), expected, rtol=0, atol=0)
++        if pools is not None:
++            torch.testing.assert_close(
++                pools[label].cpu(), pools["main"].cpu(), rtol=0, atol=0
++            )
++
++    durations = {label: [] for label in labels}
++    for iteration in range(args.samples):
++        rotated = labels[iteration % len(labels) :] + labels[: iteration % len(labels)]
++        for label in rotated:
++            if args.trace_labels:
++                print(f"window_start sample={iteration} variant={label}", flush=True)
++            start = torch.xpu.Event(enable_timing=True)
++            end = torch.xpu.Event(enable_timing=True)
++            start.record()
++            for _ in range(args.repeats):
++                calls[label]()
++            end.record()
++            end.synchronize()
++            durations[label].append(start.elapsed_time(end) * 1000 / args.repeats)
++            if args.trace_labels:
++                print(f"window_done sample={iteration} variant={label}", flush=True)
++
++    print(
++        json.dumps(
++            {
++                "case": args.case,
++                "batch": batch,
++                "prefix_len": prefix_len,
++                "extend_len": extend_len,
++                "page_size": page_size,
++                "dtype": {"metadata": "int64", "last": "int32", "pool": "int32"},
++                "device": torch.xpu.get_device_name(0),
++                "samples": args.samples,
++                "repeats_per_sample": args.repeats,
++                "timing": "torch.xpu.Event window / repeats, microseconds; includes gaps between enqueues",
++                "variants": {
++                    label: {
++                        "samples_us": values,
++                        "p20": quantile(values, 0.2),
++                        "p50": median(values),
++                        "p80": quantile(values, 0.8),
++                        "min": min(values),
++                        "max": max(values),
++                    }
++                    for label, values in durations.items()
++                },
++            }
++        ),
++        flush=True,
++    )
++    torch.xpu.synchronize()
++
++
++def measure_tiles(batch, prefix_len, extend_len, page_size, samples, fused):
++    alloc_extend_kernel, _, write_req_to_token_pool_triton = main_memory_ops()
++    prefix = torch.full((batch,), prefix_len, dtype=torch.int64, device="xpu")
++    seq = torch.full((batch,), prefix_len + extend_len, dtype=torch.int64, device="xpu")
++    extensions = torch.full((batch,), extend_len, dtype=torch.int64, device="xpu")
++    last = torch.full((batch,), prefix_len - 1, dtype=torch.int32, device="xpu")
++    free_pages = torch.arange(
++        1,
++        batch * ((extend_len + page_size - 1) // page_size) + 2,
++        dtype=torch.int64,
++        device="xpu",
++    )
++    expected = torch.empty(batch * extend_len, dtype=torch.int64, device="xpu")
++    alloc_extend_kernel[(batch,)](
++        prefix,
++        seq,
++        last,
++        free_pages,
++        expected,
++        triton.next_power_of_2(batch),
++        page_size,
++    )
++    outputs = {tiles: torch.empty_like(expected) for tiles in (1, 4, 16)}
++    if fused:
++        req_indices = torch.arange(batch, dtype=torch.int64, device="xpu")
++        prefix_values = torch.arange(
++            max(1, batch * prefix_len), dtype=torch.int64, device="xpu"
++        )
++        pointers = torch.tensor(
++            [
++                prefix_values.data_ptr() + index * prefix_len * 8
++                for index in range(batch)
++            ],
++            dtype=torch.uint64,
++            device="xpu",
++        )
++        expected_pool = torch.empty(
++            (batch, prefix_len + extend_len), dtype=torch.int32, device="xpu"
++        )
++        write_req_to_token_pool_triton[(batch,)](
++            expected_pool,
++            req_indices,
++            pointers,
++            prefix,
++            seq,
++            extensions,
++            expected,
++            expected_pool.stride(0),
++        )
++        pools = {tiles: torch.empty_like(expected_pool) for tiles in (1, 4, 16)}
++
++        def run(tiles):
++            torch.ops.sgl_kernel.paged_alloc_extend_and_write_tiled_for_benchmark(
++                prefix,
++                seq,
++                last,
++                free_pages,
++                outputs[tiles],
++                pools[tiles],
++                req_indices,
++                pointers,
++                page_size,
++                tiles,
++            )
++
++        needle = "PagedAllocExtendAndWriteKernel"
++    else:
++
++        def run(tiles):
++            torch.ops.sgl_kernel.paged_alloc_extend_tiled_for_benchmark(
++                prefix, seq, last, free_pages, outputs[tiles], page_size, tiles
++            )
++
++        needle = "PagedAllocExtendKernel"
++    for _ in range(5):
++        for tiles in (1, 4, 16):
++            run(tiles)
++    torch.xpu.synchronize()
++    for tiles in (1, 4, 16):
++        torch.testing.assert_close(outputs[tiles].cpu(), expected.cpu(), rtol=0, atol=0)
++        if fused:
++            torch.testing.assert_close(
++                pools[tiles].cpu(), expected_pool.cpu(), rtol=0, atol=0
++            )
++    order = []
++    with torch.profiler.profile(
++        activities=[
++            torch.profiler.ProfilerActivity.CPU,
++            torch.profiler.ProfilerActivity.XPU,
++        ]
++    ) as profiler:
++        for iteration in range(samples):
++            choices = (1, 4, 16)
++            choices = choices[iteration % 3 :] + choices[: iteration % 3]
++            for tiles in choices:
++                run(tiles)
++                order.append(tiles)
++        torch.xpu.synchronize()
++    with tempfile.TemporaryDirectory() as directory:
++        trace = Path(directory) / "trace.json"
++        profiler.export_chrome_trace(str(trace))
++        events = json.loads(trace.read_text())["traceEvents"]
++    kernels = sorted(
++        (
++            event
++            for event in events
++            if event.get("cat") == "kernel" and needle in event.get("name", "")
++        ),
++        key=lambda event: event["ts"],
++    )
++    if len(kernels) != len(order):
++        raise RuntimeError(
++            f"{needle}: expected {len(order)} device events, got {len(kernels)}"
++        )
++    durations = {tiles: [] for tiles in (1, 4, 16)}
++    for tiles, event in zip(order, kernels):
++        durations[tiles].append(event["dur"])
++    report = {
++        "case": "fused" if fused else "extend",
++        "batch": batch,
++        "prefix_len": prefix_len,
++        "extend_len": extend_len,
++        "page_size": page_size,
++        "last_dtype": "int32",
++        "samples": samples,
++        "timing": "torch.profiler XPU kernel event duration; rotated launch order",
++        "tiles": {
++            tiles: {
++                "samples_us": values,
++                "p20": quantile(values, 0.2),
++                "p50": median(values),
++                "p80": quantile(values, 0.8),
++                "min": min(values),
++                "max": max(values),
++            }
++            for tiles, values in durations.items()
++        },
++    }
++    print(json.dumps(report), flush=True)
++    torch.xpu.synchronize()
++
++
++def measure_write_groups(batch, prefix_len, extend_len, samples):
++    _, _, main_write = main_memory_ops()
++    seq_len = prefix_len + extend_len
++    prefix_lens = torch.full((batch,), prefix_len, dtype=torch.int64, device="xpu")
++    seq_lens = torch.full((batch,), seq_len, dtype=torch.int64, device="xpu")
++    extend_lens = torch.full((batch,), extend_len, dtype=torch.int64, device="xpu")
++    req_indices = torch.arange(batch, dtype=torch.int64, device="xpu")
++    prefix_values = torch.arange(
++        max(1, batch * prefix_len), dtype=torch.int64, device="xpu"
++    )
++    pointers = torch.tensor(
++        [prefix_values.data_ptr() + index * prefix_len * 8 for index in range(batch)],
++        dtype=torch.uint64,
++        device="xpu",
++    )
++    locations = torch.arange(batch * extend_len, dtype=torch.int64, device="xpu")
++    expected = torch.empty((batch, seq_len), dtype=torch.int32, device="xpu")
++    main_write[(batch,)](
++        expected,
++        req_indices,
++        pointers,
++        prefix_lens,
++        seq_lens,
++        extend_lens,
++        locations,
++        expected.stride(0),
++    )
++    outputs = {groups: torch.empty_like(expected) for groups in (1, 2, 4, 8)}
++
++    def run(groups):
++        torch.ops.sgl_kernel.write_req_to_token_pool_tiled_for_benchmark(
++            outputs[groups],
++            req_indices,
++            pointers,
++            prefix_lens,
++            seq_lens,
++            extend_lens,
++            locations,
++            groups,
++        )
++
++    for _ in range(5):
++        for groups in outputs:
++            run(groups)
++    torch.xpu.synchronize()
++    for output in outputs.values():
++        torch.testing.assert_close(output.cpu(), expected.cpu(), rtol=0, atol=0)
++    order = []
++    with torch.profiler.profile(
++        activities=[
++            torch.profiler.ProfilerActivity.CPU,
++            torch.profiler.ProfilerActivity.XPU,
++        ]
++    ) as profiler:
++        for iteration in range(samples):
++            choices = (1, 2, 4, 8)
++            choices = choices[iteration % 4 :] + choices[: iteration % 4]
++            for groups in choices:
++                run(groups)
++                order.append(groups)
++        torch.xpu.synchronize()
++    with tempfile.TemporaryDirectory() as directory:
++        trace = Path(directory) / "trace.json"
++        profiler.export_chrome_trace(str(trace))
++        events = json.loads(trace.read_text())["traceEvents"]
++    kernels = sorted(
++        (
++            event
++            for event in events
++            if event.get("cat") == "kernel"
++            and "WriteReqToTokenPoolKernel" in event.get("name", "")
++        ),
++        key=lambda event: event["ts"],
++    )
++    if len(kernels) != len(order):
++        raise RuntimeError(
++            f"expected {len(order)} writer device events, got {len(kernels)}"
++        )
++    durations = {groups: [] for groups in outputs}
++    for groups, event in zip(order, kernels):
++        durations[groups].append(event["dur"])
++    print(
++        json.dumps(
++            {
++                "case": "write_groups",
++                "batch": batch,
++                "prefix_len": prefix_len,
++                "extend_len": extend_len,
++                "samples": samples,
++                "device": torch.xpu.get_device_name(0),
++                "timing": "torch.profiler XPU kernel event duration; rotated launch order",
++                "groups": {
++                    groups: {
++                        "samples_us": values,
++                        "p20": quantile(values, 0.2),
++                        "p50": median(values),
++                        "p80": quantile(values, 0.8),
++                        "min": min(values),
++                        "max": max(values),
++                    }
++                    for groups, values in durations.items()
++                },
++            }
++        ),
++        flush=True,
++    )
++    torch.xpu.synchronize()
++
++
++def measure_aux(label, run_triton, run_sycl, old_name, new_name, check, samples, only):
++    if only != "all" and only != label:
++        return
++    for _ in range(10):
++        run_triton()
++        run_sycl()
++    torch.xpu.synchronize()
++    check()
++    with torch.profiler.profile(
++        activities=[
++            torch.profiler.ProfilerActivity.CPU,
++            torch.profiler.ProfilerActivity.XPU,
++        ]
++    ) as profiler:
++        for _ in range(samples):
++            run_triton()
++        for _ in range(samples):
++            run_sycl()
++        torch.xpu.synchronize()
++    with tempfile.TemporaryDirectory() as directory:
++        path = Path(directory) / "trace.json"
++        profiler.export_chrome_trace(str(path))
++        events = json.loads(path.read_text())["traceEvents"]
++    old = [
++        event["dur"]
++        for event in events
++        if event.get("cat") == "kernel" and old_name in event["name"]
++    ]
++    new = [
++        event["dur"]
++        for event in events
++        if event.get("cat") == "kernel" and new_name in event["name"]
++    ]
++    assert len(old) == len(new) == samples, (label, len(old), len(new))
++    old_us, new_us = median(old), median(new)
++    print(
++        f"{label}: Triton={old_us:.3f} us SYCL={new_us:.3f} us speedup={old_us / new_us:.3f}x",
++        flush=True,
++    )
++    if label in ("write_req_to_token_pool_xe35", "alloc_extend"):
++        print(
++            f"{label} samples: Triton_min={min(old):.3f} p25={sorted(old)[len(old)//4]:.3f} p75={sorted(old)[3*len(old)//4]:.3f} max={max(old):.3f}; SYCL_min={min(new):.3f} p25={sorted(new)[len(new)//4]:.3f} p75={sorted(new)[3*len(new)//4]:.3f} max={max(new):.3f}",
++            flush=True,
++        )
++    torch.xpu.synchronize()
++
++
++def run_aux(args):
++    alloc_extend_kernel, alloc_decode_kernel, write_req_to_token_pool_triton = (
++        main_memory_ops()
++    )
++
++    device = "xpu"
++    batch = args.batch
++
++    seq = torch.tensor(
++        [4096, 4097, 4098, 4104, 4112, 4096, 4100, 4111],
++        dtype=torch.int64,
++        device=device,
++    )
++    last = torch.arange(8, dtype=torch.int32, device=device) + 4095
++    free_pages = torch.arange(1, 6001, dtype=torch.int64, device=device)
++    old_out = torch.empty(8, dtype=torch.int64, device=device)
++    new_out = torch.empty_like(old_out)
++    measure_aux(
++        "alloc_decode",
++        lambda: alloc_decode_kernel[(8,)](seq, last, free_pages, old_out, 8, 64),
++        lambda: torch.ops.sgl_kernel.paged_alloc_decode_xe35(
++            seq, last, free_pages, new_out, 64
++        ),
++        "alloc_decode_kernel",
++        "PagedAllocDecodeKernel",
++        lambda: torch.testing.assert_close(
++            new_out.cpu(), old_out.cpu(), rtol=0, atol=0
++        ),
++        args.samples,
++        args.only,
++    )
++
++    prefix = torch.zeros(batch, dtype=torch.int64, device=device)
++    lengths = torch.full((batch,), 4096, dtype=torch.int64, device=device)
++    extend_last = torch.full((batch,), -1, dtype=torch.int32, device=device)
++    old_out = torch.empty(batch * 4096, dtype=torch.int64, device=device)
++    new_out = torch.empty_like(old_out)
++    measure_aux(
++        "alloc_extend",
++        lambda: alloc_extend_kernel[(batch,)](
++            prefix, lengths, extend_last, free_pages, old_out, 8, 64
++        ),
++        lambda: torch.ops.sgl_kernel.paged_alloc_extend_xe35(
++            prefix, lengths, extend_last, free_pages, new_out, 64
++        ),
++        "alloc_extend_kernel",
++        "PagedAllocExtendKernel",
++        lambda: torch.testing.assert_close(
++            new_out.cpu(), old_out.cpu(), rtol=0, atol=0
++        ),
++        args.samples,
++        args.only,
++    )
++
++    old_pool = torch.empty((batch, 4096), dtype=torch.int32, device=device)
++    new_pool = torch.empty_like(old_pool)
++    req_indices = torch.arange(batch, dtype=torch.int64, device=device)
++    dummy_prefix = torch.zeros(1, dtype=torch.int64, device=device)
++    prefix_pointers = torch.tensor(
++        [dummy_prefix.data_ptr()] * batch, dtype=torch.uint64, device=device
++    )
++    out_cache_loc = torch.arange(batch * 4096, dtype=torch.int64, device=device)
++    measure_aux(
++        "write_req_to_token_pool_xe35",
++        lambda: write_req_to_token_pool_triton[(batch,)](
++            old_pool,
++            req_indices,
++            prefix_pointers,
++            prefix,
++            lengths,
++            lengths,
++            out_cache_loc,
++            old_pool.stride(0),
++        ),
++        lambda: torch.ops.sgl_kernel.write_req_to_token_pool_xe35(
++            new_pool,
++            req_indices,
++            prefix_pointers,
++            prefix,
++            lengths,
++            lengths,
++            out_cache_loc,
++        ),
++        "write_req_to_token_pool_triton",
++        "WriteReqToTokenPoolKernel",
++        lambda: torch.testing.assert_close(
++            new_pool.cpu(), old_pool.cpu(), rtol=0, atol=0
++        ),
++        args.samples,
++        args.only,
++    )
++
++
++def run_profiler(args):
++    if "decode" in args.cases:
++        compare_decode(args.samples, args.main_only)
++    if "write" in args.cases:
++        compare_write(args.samples, 0, 4096, args.main_only)
++        compare_write(args.samples, 4096, 16, args.main_only)
++    for page_size in args.page_sizes:
++        for prefix_len in args.prefix_lengths:
++            for extend_len in args.lengths:
++                if "extend" in args.cases:
++                    compare_extend(
++                        args.batch,
++                        prefix_len,
++                        extend_len,
++                        page_size,
++                        args.samples,
++                        False,
++                        args.main_only,
++                    )
++                if "fused" in args.cases:
++                    compare_extend(
++                        args.batch,
++                        prefix_len,
++                        extend_len,
++                        page_size,
++                        args.samples,
++                        True,
++                        args.main_only,
++                    )
++
++
++def main():
++    args = parse_args()
++    global torch, triton, memory_setup
++    import torch
++    import triton
++
++    memory_setup = args
++    if not args.main_only:
++        kernel = importlib.import_module("sgl_kernel")
++        if not torch.xpu.is_available() or not kernel.is_xe3_arch():
++            raise RuntimeError("SYCL memory kernels require Xe35 compute capability 3.5")
++
++    required = []
++    if args.mode == "tiles" or (args.mode == "event" and not args.production_only):
++        cases = args.cases if args.mode == "tiles" else (args.op,)
++        required = [
++            (
++                "paged_alloc_extend_and_write_tiled_for_benchmark"
++                if case == "fused"
++                else "paged_alloc_extend_tiled_for_benchmark"
++            )
++            for case in cases
++        ]
++    elif args.mode == "write-groups":
++        required = ["write_req_to_token_pool_tiled_for_benchmark"]
++    missing = [name for name in required if not hasattr(torch.ops.sgl_kernel, name)]
++    if missing:
++        raise RuntimeError(
++            f"Selected mode requires unavailable tuning capabilities: {missing}"
++        )
++    print(
++        json.dumps(
++            {
++                "torch": torch.__version__,
++                "device": torch.xpu.get_device_name(0),
++                "main_source": "installed sglang",
++                "mode": args.mode,
++                "serving_scope": {"batch": 8, "isl": 4096, "osl": 16, "tp": 1, "ep": 1},
++            }
++        ),
++        flush=True,
++    )
++    if args.mode == "profiler":
++        run_profiler(args)
++    elif args.mode == "event":
++        measure_event(args)
++    elif args.mode == "aux":
++        run_aux(args)
++    elif args.mode == "prefill":
++        compare_extend(8, 0, 4096, 64, args.samples, fused=True)
++    else:
++        for prefix in args.prefix_lengths:
++            for length in args.lengths:
++                if args.mode == "write-groups":
++                    measure_write_groups(args.batch, prefix, length, args.samples)
++                else:
++                    for fused in (False, True):
++                        if ("fused" if fused else "extend") in args.cases:
++                            measure_tiles(
++                                args.batch,
++                                prefix,
++                                length,
++                                args.page_size,
++                                args.samples,
++                                fused,
++                            )
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/cmake/BuildFlags.cmake b/cmake/BuildFlags.cmake
+index 5dfb191b37ff61b04b4329536b487308b197cc44..086239cefe6af99520acbb1c4423744a46d9a4cc 100644
+--- a/cmake/BuildFlags.cmake
++++ b/cmake/BuildFlags.cmake
+@@ -26,7 +26,7 @@ function(CHECK_SYCL_FLAG FLAG VARIABLE_NAME)
+ endfunction()
+ 
+ # Support GCC on Linux.
+-if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
++if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" OR CMAKE_CXX_COMPILER_ID STREQUAL "IntelLLVM")
+   message(STATUS "sgl-kernel-xpu build type: ${CMAKE_BUILD_TYPE}")
+   set(SYCL_HOST_FLAGS)
+   set(SYCL_KERNEL_OPTIONS)
+@@ -185,6 +185,6 @@ if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+ 
+   set(SYCL_OFFLINE_COMPILER_FLAGS "${SYCL_OFFLINE_COMPILER_AOT_OPTIONS}${SYCL_OFFLINE_COMPILER_CG_OPTIONS}")
+ else()
+-  message("Not compiling with XPU. Currently only support GCC compiler on Linux as CXX compiler.")
++  message("Not compiling with XPU. Currently only support GNU or IntelLLVM compiler on Linux as CXX compiler.")
+   return()
+ endif()
+diff --git a/include/sgl_kernel/xe35/memory_ops.h b/include/sgl_kernel/xe35/memory_ops.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..b7d907792213b234922077d5729eae635f2fe820
+--- /dev/null
++++ b/include/sgl_kernel/xe35/memory_ops.h
+@@ -0,0 +1,40 @@
++#pragma once
++
++#include <torch/all.h>
++
++#include "sgl_kernel_export.h"
++
++namespace at::native::xpu {
++SGL_KERNEL_EXPORT void write_req_to_token_pool_xe35(
++    torch::Tensor req_to_token,
++    torch::Tensor req_pool_indices,
++    torch::Tensor prefix_pointers,
++    torch::Tensor prefix_lens,
++    torch::Tensor seq_lens,
++    torch::Tensor extend_lens,
++    torch::Tensor out_cache_loc);
++SGL_KERNEL_EXPORT void paged_alloc_extend_xe35(
++    torch::Tensor prefix_lens,
++    torch::Tensor seq_lens,
++    torch::Tensor last_loc,
++    torch::Tensor free_pages,
++    torch::Tensor out_indices,
++    int64_t page_size);
++SGL_KERNEL_EXPORT void paged_alloc_extend_and_write_xe35(
++    torch::Tensor prefix_lens,
++    torch::Tensor seq_lens,
++    torch::Tensor last_loc,
++    torch::Tensor free_pages,
++    torch::Tensor out_indices,
++    torch::Tensor req_to_token,
++    torch::Tensor req_pool_indices,
++    torch::Tensor prefix_pointers,
++    int64_t page_size);
++SGL_KERNEL_EXPORT void paged_alloc_decode_xe35(
++    torch::Tensor seq_lens,
++    torch::Tensor last_loc,
++    torch::Tensor free_pages,
++    torch::Tensor out_indices,
++    int64_t page_size);
++
++}
+diff --git a/include/sgl_kernel_ops.h b/include/sgl_kernel_ops.h
+index 0b71dcef0d0cd28a7b2bf892845c95d6c12a547f..8290d6230ad0b2e036d3e35139e6ac4b27d2c384 100644
+--- a/include/sgl_kernel_ops.h
++++ b/include/sgl_kernel_ops.h
+@@ -21,6 +21,10 @@ limitations under the License.
+ #include <torch/library.h>
+ #include <torch/torch.h>
+ 
++#if SYCL_INTEL_TARGET == 35
++#include "sgl_kernel/xe35/memory_ops.h"
++#endif
++
+ #include <optional>
+ #include <sycl/sycl.hpp>
+ #include <tuple>
+diff --git a/src/sycl/Device.cpp b/src/sycl/Device.cpp
+index 44590db8a7c078bf6d8526548e75f80608b757af..2ab1b2262242d5741f5da3d55703004c257bb013 100644
+--- a/src/sycl/Device.cpp
++++ b/src/sycl/Device.cpp
+@@ -22,7 +22,8 @@ SGL_KERNEL_EXPORT std::tuple<int64_t, int64_t> query_device(int64_t device_index
+ // Need oneAPI 2026.2 or later to support `architecture::intel_gpu_cri`. Check the release
+ // (__INTEL_LLVM_COMPILER) rather than the build date (__SYCL_COMPILER_VERSION): 2026.1.x
+ // patch releases (e.g. 2026.1.3, 20260724) are built later but still lack this enum.
+-#if defined(__INTEL_LLVM_COMPILER) && __INTEL_LLVM_COMPILER >= 20260200
++#if (defined(__INTEL_LLVM_COMPILER) && __INTEL_LLVM_COMPILER >= 20260200) || \
++    (defined(__INTEL_LLVM_COMPILER_VERSION) && __INTEL_LLVM_COMPILER_VERSION >= 20260200)
+     case syclex::architecture::intel_gpu_cri:
+       return std::make_tuple(3, 5);
+ #endif
+diff --git a/src/sycl/HCHead.cpp b/src/sycl/HCHead.cpp
+index 78464246ed88cb8056af87e388bad9fc222d4053..1b2ace4419e74f6e6276cea4a8bcffc0b2078a6e 100644
+--- a/src/sycl/HCHead.cpp
++++ b/src/sycl/HCHead.cpp
+@@ -67,7 +67,10 @@ struct FusedHCHeadKernel : public __SYCL_KER_CONFIG_CONVENTION__ {
+     slm_ = sycl::local_accessor<float, 1>(slm_size, cgh);
+   }
+ 
+-  [[sycl::reqd_work_group_size(WG_SIZE)]] [[sycl::reqd_sub_group_size(SG_SIZE)]] void
++#ifdef __SYCL_DEVICE_ONLY__
++  [[sycl::reqd_work_group_size(WG_SIZE)]] [[sycl::reqd_sub_group_size(SG_SIZE)]]
++#endif
++  void
+   operator()(sycl::nd_item<1> item) const {
+     const int token_id = static_cast<int>(item.get_group(0));
+     const int tid = static_cast<int>(item.get_local_id(0));
+diff --git a/src/sycl/xe35/PagedAlloc.cpp b/src/sycl/xe35/PagedAlloc.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..fe42848c70dba3336323cf4c30af091ed64f9864
+--- /dev/null
++++ b/src/sycl/xe35/PagedAlloc.cpp
+@@ -0,0 +1,508 @@
++#include <ATen/ATen.h>
++#include <c10/xpu/XPUStream.h>
++#include <torch/all.h>
++
++#include "sgl_kernel/xe35/memory_ops.h"
++
++#include <sycl/sycl.hpp>
++
++#include "../SYCLHelpers.h"
++
++namespace at::native::xpu {
++namespace {
++
++constexpr int kWorkgroup = 256;
++constexpr int kDecodeWorkgroup = 32;
++
++inline int64_t ceil_pages(int64_t tokens, int64_t page_size) {
++  return (tokens + page_size - 1) / page_size;
++}
++
++// Positive shifts are compile-time page-size variants; zero is a dynamic
++// power-of-two size, and -1 keeps the general division path.
++template <int PageShift>
++inline int64_t effective_page_size(int64_t page_size) {
++  if constexpr (PageShift > 0) {
++    return int64_t{1} << PageShift;
++  } else {
++    return page_size;
++  }
++}
++
++template <int PageShift>
++inline int page_shift(int64_t page_size) {
++  if constexpr (PageShift > 0) {
++    return PageShift;
++  } else if constexpr (PageShift == 0) {
++    return sycl::ctz(static_cast<uint64_t>(page_size));
++  } else {
++    return 0;
++  }
++}
++
++template <int PageShift>
++inline int64_t page_count(int64_t tokens, int64_t page_size, int shift) {
++  if constexpr (PageShift >= 0) {
++    return (tokens + page_size - 1) >> shift;
++  } else {
++    return ceil_pages(tokens, page_size);
++  }
++}
++
++template <int PageShift>
++inline int64_t page_index(int64_t position, int64_t page_size, int shift) {
++  if constexpr (PageShift >= 0) {
++    return position >> shift;
++  } else {
++    return position / page_size;
++  }
++}
++
++template <int PageShift>
++inline int64_t page_offset(int64_t position, int64_t page_size) {
++  if constexpr (PageShift >= 0) {
++    return position & (page_size - 1);
++  } else {
++    return position % page_size;
++  }
++}
++
++template <typename LastScalar, int TilesPerReq, int PageShift>
++struct PagedAllocExtendKernel {
++  const int64_t* __restrict__ prefix_lens;
++  const int64_t* __restrict__ seq_lens;
++  const LastScalar* __restrict__ last_loc;
++  const int64_t* __restrict__ free_pages;
++  int64_t* __restrict__ out_indices;
++  int64_t batch;
++  int64_t page_size;
++
++  void operator()(sycl::nd_item<1> item) const {
++    const int64_t req = item.get_group(0) / TilesPerReq;
++    const int64_t tile = item.get_group(0) % TilesPerReq;
++    const int64_t lane = item.get_local_id(0);
++    if (req >= batch) {
++      return;
++    }
++    const int64_t size = effective_page_size<PageShift>(page_size);
++    const int shift = page_shift<PageShift>(page_size);
++    int64_t output_start = 0;
++    int64_t new_page_start = 0;
++    for (int64_t i = 0; i < req; ++i) {
++      output_start += seq_lens[i] - prefix_lens[i];
++      new_page_start +=
++          page_count<PageShift>(seq_lens[i], size, shift) - page_count<PageShift>(prefix_lens[i], size, shift);
++    }
++    const int64_t prefix_len = prefix_lens[req];
++    const int64_t seq_len = seq_lens[req];
++    const int64_t old_boundary = page_count<PageShift>(prefix_len, size, shift) * size;
++    for (int64_t offset = tile * kWorkgroup + lane; offset < seq_len - prefix_len; offset += TilesPerReq * kWorkgroup) {
++      const int64_t position = prefix_len + offset;
++      int64_t location;
++      if (position < old_boundary) {
++        location = last_loc[req] + 1 + offset;
++      } else {
++        const int64_t new_page = page_index<PageShift>(position - old_boundary, size, shift);
++        location = free_pages[new_page_start + new_page] * size + page_offset<PageShift>(position, size);
++      }
++      out_indices[output_start + offset] = location;
++    }
++  }
++};
++
++// One launch produces the paged locations and writes the request table.
++template <typename LastScalar, int TilesPerReq, int PageShift>
++struct PagedAllocExtendAndWriteKernel {
++  const int64_t* __restrict__ prefix_lens;
++  const int64_t* __restrict__ seq_lens;
++  const LastScalar* __restrict__ last_loc;
++  const int64_t* __restrict__ free_pages;
++  int64_t* __restrict__ out_indices;
++  int32_t* __restrict__ req_to_token;
++  const int64_t* __restrict__ req_pool_indices;
++  const uint64_t* __restrict__ prefix_pointers;
++  int64_t batch;
++  int64_t page_size;
++  int64_t row_stride;
++
++  void operator()(sycl::nd_item<1> item) const {
++    const int64_t req = item.get_group(0) / TilesPerReq;
++    const int64_t tile = item.get_group(0) % TilesPerReq;
++    const int64_t lane = item.get_local_id(0);
++    if (req >= batch) return;
++    const int64_t size = effective_page_size<PageShift>(page_size);
++    const int shift = page_shift<PageShift>(page_size);
++    int64_t output_start = 0;
++    int64_t new_page_start = 0;
++    for (int64_t i = 0; i < req; ++i) {
++      output_start += seq_lens[i] - prefix_lens[i];
++      new_page_start +=
++          page_count<PageShift>(seq_lens[i], size, shift) - page_count<PageShift>(prefix_lens[i], size, shift);
++    }
++    const int64_t prefix_len = prefix_lens[req];
++    const int64_t seq_len = seq_lens[req];
++    const int64_t row = req_pool_indices[req] * row_stride;
++    if (prefix_len == 0) {
++      for (int64_t offset = tile * kWorkgroup + lane; offset < seq_len; offset += TilesPerReq * kWorkgroup) {
++        const int64_t location = free_pages[new_page_start + page_index<PageShift>(offset, size, shift)] * size +
++                                 page_offset<PageShift>(offset, size);
++        out_indices[output_start + offset] = location;
++        req_to_token[row + offset] = static_cast<int32_t>(location);
++      }
++      return;
++    }
++    const auto* prefix = reinterpret_cast<const int64_t*>(static_cast<uintptr_t>(prefix_pointers[req]));
++    for (int64_t pos = tile * kWorkgroup + lane; pos < prefix_len; pos += TilesPerReq * kWorkgroup) {
++      req_to_token[row + pos] = static_cast<int32_t>(prefix[pos]);
++    }
++    const int64_t old_boundary = page_count<PageShift>(prefix_len, size, shift) * size;
++    for (int64_t offset = tile * kWorkgroup + lane; offset < seq_len - prefix_len; offset += TilesPerReq * kWorkgroup) {
++      const int64_t position = prefix_len + offset;
++      int64_t location;
++      if (position < old_boundary) {
++        location = last_loc[req] + 1 + offset;
++      } else {
++        location = free_pages[new_page_start + page_index<PageShift>(position - old_boundary, size, shift)] * size +
++                   page_offset<PageShift>(position, size);
++      }
++      out_indices[output_start + offset] = location;
++      req_to_token[row + position] = static_cast<int32_t>(location);
++    }
++  }
++};
++
++template <typename LastScalar, int PageShift>
++struct PagedAllocDecodeKernel {
++  const int64_t* __restrict__ seq_lens;
++  const LastScalar* __restrict__ last_loc;
++  const int64_t* __restrict__ free_pages;
++  int64_t* __restrict__ out_indices;
++  int64_t batch;
++  int64_t page_size;
++
++  void operator()(sycl::nd_item<1> item) const {
++    const int64_t req = item.get_global_id(0);
++    if (req >= batch) {
++      return;
++    }
++    const int64_t size = effective_page_size<PageShift>(page_size);
++    const int shift = page_shift<PageShift>(page_size);
++    int64_t new_page_start = 0;
++    for (int64_t i = 0; i < req; ++i) {
++      const int64_t seq = seq_lens[i];
++      new_page_start += page_count<PageShift>(seq, size, shift) - page_count<PageShift>(seq - 1, size, shift);
++    }
++    const int64_t seq = seq_lens[req];
++    const bool need_page = page_count<PageShift>(seq, size, shift) > page_count<PageShift>(seq - 1, size, shift);
++    out_indices[req] = need_page ? free_pages[new_page_start] * size : last_loc[req] + 1;
++  }
++};
++
++void check_vector(const torch::Tensor& tensor, const char* name) {
++  TORCH_CHECK(
++      tensor.is_xpu() && tensor.dim() == 1 && tensor.is_contiguous() && tensor.scalar_type() == at::kLong,
++      name,
++      " must be a contiguous XPU int64 vector");
++}
++
++void check_last_loc(const torch::Tensor& tensor) {
++  TORCH_CHECK(
++      tensor.is_xpu() && tensor.dim() == 1 && tensor.is_contiguous() &&
++          (tensor.scalar_type() == at::kInt || tensor.scalar_type() == at::kLong),
++      "last_loc must be a contiguous XPU int32 or int64 vector");
++}
++
++template <typename LastScalar, int TilesPerReq, int PageShift>
++void launch_extend(
++    const torch::Tensor& prefix_lens,
++    const torch::Tensor& seq_lens,
++    const torch::Tensor& last_loc,
++    const torch::Tensor& free_pages,
++    torch::Tensor& out_indices,
++    int64_t page_size,
++    sycl::queue& queue) {
++  const int64_t batch = prefix_lens.numel();
++  PagedAllocExtendKernel<LastScalar, TilesPerReq, PageShift> kernel{
++      prefix_lens.data_ptr<int64_t>(),
++      seq_lens.data_ptr<int64_t>(),
++      last_loc.data_ptr<LastScalar>(),
++      free_pages.data_ptr<int64_t>(),
++      out_indices.data_ptr<int64_t>(),
++      batch,
++      page_size};
++  sycl_kernel_submit(sycl::range<1>(batch * TilesPerReq * kWorkgroup), sycl::range<1>(kWorkgroup), queue, kernel);
++}
++
++template <typename LastScalar, int PageShift>
++void dispatch_extend_tiles(
++    const torch::Tensor& prefix_lens,
++    const torch::Tensor& seq_lens,
++    const torch::Tensor& last_loc,
++    const torch::Tensor& free_pages,
++    torch::Tensor& out_indices,
++    int64_t page_size,
++    int64_t output_per_req,
++    sycl::queue& queue) {
++  if (output_per_req >= 8 * kWorkgroup) {
++    launch_extend<LastScalar, 16, PageShift>(
++        prefix_lens, seq_lens, last_loc, free_pages, out_indices, page_size, queue);
++  } else if (output_per_req >= 2 * kWorkgroup) {
++    launch_extend<LastScalar, 4, PageShift>(prefix_lens, seq_lens, last_loc, free_pages, out_indices, page_size, queue);
++  } else {
++    launch_extend<LastScalar, 1, PageShift>(prefix_lens, seq_lens, last_loc, free_pages, out_indices, page_size, queue);
++  }
++}
++
++template <typename LastScalar, int TilesPerReq, int PageShift>
++void launch_extend_and_write(
++    const torch::Tensor& prefix_lens,
++    const torch::Tensor& seq_lens,
++    const torch::Tensor& last_loc,
++    const torch::Tensor& free_pages,
++    torch::Tensor& out_indices,
++    torch::Tensor& req_to_token,
++    const torch::Tensor& req_pool_indices,
++    const torch::Tensor& prefix_pointers,
++    int64_t page_size,
++    sycl::queue& queue) {
++  const int64_t batch = prefix_lens.numel();
++  PagedAllocExtendAndWriteKernel<LastScalar, TilesPerReq, PageShift> kernel{
++      prefix_lens.data_ptr<int64_t>(),
++      seq_lens.data_ptr<int64_t>(),
++      last_loc.data_ptr<LastScalar>(),
++      free_pages.data_ptr<int64_t>(),
++      out_indices.data_ptr<int64_t>(),
++      req_to_token.data_ptr<int32_t>(),
++      req_pool_indices.data_ptr<int64_t>(),
++      prefix_pointers.data_ptr<uint64_t>(),
++      batch,
++      page_size,
++      req_to_token.stride(0)};
++  sycl_kernel_submit(sycl::range<1>(batch * TilesPerReq * kWorkgroup), sycl::range<1>(kWorkgroup), queue, kernel);
++}
++
++template <typename LastScalar, int PageShift>
++void dispatch_extend_and_write(
++    const torch::Tensor& prefix_lens,
++    const torch::Tensor& seq_lens,
++    const torch::Tensor& last_loc,
++    const torch::Tensor& free_pages,
++    torch::Tensor& out_indices,
++    torch::Tensor& req_to_token,
++    const torch::Tensor& req_pool_indices,
++    const torch::Tensor& prefix_pointers,
++    int64_t page_size,
++    sycl::queue& queue) {
++  const int64_t batch = prefix_lens.numel();
++  const int64_t output_per_req = out_indices.numel() / batch;
++  if (output_per_req >= 8 * kWorkgroup) {
++    launch_extend_and_write<LastScalar, 16, PageShift>(
++        prefix_lens,
++        seq_lens,
++        last_loc,
++        free_pages,
++        out_indices,
++        req_to_token,
++        req_pool_indices,
++        prefix_pointers,
++        page_size,
++        queue);
++  } else if (output_per_req >= 2 * kWorkgroup) {
++    launch_extend_and_write<LastScalar, 4, PageShift>(
++        prefix_lens,
++        seq_lens,
++        last_loc,
++        free_pages,
++        out_indices,
++        req_to_token,
++        req_pool_indices,
++        prefix_pointers,
++        page_size,
++        queue);
++  } else {
++    launch_extend_and_write<LastScalar, 1, PageShift>(
++        prefix_lens,
++        seq_lens,
++        last_loc,
++        free_pages,
++        out_indices,
++        req_to_token,
++        req_pool_indices,
++        prefix_pointers,
++        page_size,
++        queue);
++  }
++}
++
++template <typename LastScalar, int PageShift>
++void launch_decode(
++    const torch::Tensor& seq_lens,
++    const torch::Tensor& last_loc,
++    const torch::Tensor& free_pages,
++    torch::Tensor& out_indices,
++    int64_t page_size,
++    sycl::queue& queue) {
++  const int64_t batch = seq_lens.numel();
++  PagedAllocDecodeKernel<LastScalar, PageShift> kernel{
++      seq_lens.data_ptr<int64_t>(),
++      last_loc.data_ptr<LastScalar>(),
++      free_pages.data_ptr<int64_t>(),
++      out_indices.data_ptr<int64_t>(),
++      batch,
++      page_size};
++  sycl_kernel_submit(
++      sycl::range<1>(((batch + kDecodeWorkgroup - 1) / kDecodeWorkgroup) * kDecodeWorkgroup),
++      sycl::range<1>(kDecodeWorkgroup),
++      queue,
++      kernel);
++}
++
++template <typename Launch>
++void dispatch_page_family(int64_t page_size, Launch&& launch) {
++  switch (page_size) {
++    case 32:
++      launch.template operator()<5>();
++      break;
++    case 64:
++      launch.template operator()<6>();
++      break;
++    case 128:
++      launch.template operator()<7>();
++      break;
++    default:
++      if ((page_size & (page_size - 1)) == 0) {
++        launch.template operator()<0>();
++      } else {
++        launch.template operator()<-1>();
++      }
++  }
++}
++
++}  // namespace
++
++void paged_alloc_extend_xe35(
++    torch::Tensor prefix_lens,
++    torch::Tensor seq_lens,
++    torch::Tensor last_loc,
++    torch::Tensor free_pages,
++    torch::Tensor out_indices,
++    int64_t page_size) {
++  check_vector(prefix_lens, "prefix_lens");
++  check_vector(seq_lens, "seq_lens");
++  check_last_loc(last_loc);
++  check_vector(free_pages, "free_pages");
++  check_vector(out_indices, "out_indices");
++  TORCH_CHECK(
++      page_size > 0 && seq_lens.numel() == prefix_lens.numel() && last_loc.numel() == prefix_lens.numel(),
++      "invalid batch or page_size");
++  const int64_t batch = prefix_lens.numel();
++  if (batch == 0) {
++    return;
++  }
++  auto queue = at::xpu::getCurrentXPUStream().queue();
++  const int64_t output_per_req = out_indices.numel() / batch;
++  if (last_loc.scalar_type() == at::kInt) {
++    dispatch_page_family(page_size, [&]<int PageShift>() {
++      dispatch_extend_tiles<int32_t, PageShift>(
++          prefix_lens, seq_lens, last_loc, free_pages, out_indices, page_size, output_per_req, queue);
++    });
++  } else {
++    dispatch_page_family(page_size, [&]<int PageShift>() {
++      dispatch_extend_tiles<int64_t, PageShift>(
++          prefix_lens, seq_lens, last_loc, free_pages, out_indices, page_size, output_per_req, queue);
++    });
++  }
++}
++
++void paged_alloc_extend_and_write_xe35(
++    torch::Tensor prefix_lens,
++    torch::Tensor seq_lens,
++    torch::Tensor last_loc,
++    torch::Tensor free_pages,
++    torch::Tensor out_indices,
++    torch::Tensor req_to_token,
++    torch::Tensor req_pool_indices,
++    torch::Tensor prefix_pointers,
++    int64_t page_size) {
++  check_vector(prefix_lens, "prefix_lens");
++  check_vector(seq_lens, "seq_lens");
++  check_last_loc(last_loc);
++  check_vector(free_pages, "free_pages");
++  check_vector(out_indices, "out_indices");
++  check_vector(req_pool_indices, "req_pool_indices");
++  TORCH_CHECK(
++      prefix_pointers.is_xpu() && prefix_pointers.dim() == 1 && prefix_pointers.is_contiguous() &&
++          prefix_pointers.scalar_type() == at::kUInt64,
++      "prefix_pointers must be a contiguous XPU uint64 vector");
++  TORCH_CHECK(
++      req_to_token.is_xpu() && req_to_token.dim() == 2 && req_to_token.is_contiguous() &&
++          req_to_token.scalar_type() == at::kInt,
++      "req_to_token must be a contiguous XPU int32 matrix");
++  const int64_t batch = prefix_lens.numel();
++  TORCH_CHECK(
++      page_size > 0 && seq_lens.numel() == batch && last_loc.numel() == batch && req_pool_indices.numel() == batch &&
++          prefix_pointers.numel() == batch,
++      "invalid batch or page_size");
++  if (!batch) return;
++  auto queue = at::xpu::getCurrentXPUStream().queue();
++  if (last_loc.scalar_type() == at::kInt) {
++    dispatch_page_family(page_size, [&]<int PageShift>() {
++      dispatch_extend_and_write<int32_t, PageShift>(
++          prefix_lens,
++          seq_lens,
++          last_loc,
++          free_pages,
++          out_indices,
++          req_to_token,
++          req_pool_indices,
++          prefix_pointers,
++          page_size,
++          queue);
++    });
++  } else {
++    dispatch_page_family(page_size, [&]<int PageShift>() {
++      dispatch_extend_and_write<int64_t, PageShift>(
++          prefix_lens,
++          seq_lens,
++          last_loc,
++          free_pages,
++          out_indices,
++          req_to_token,
++          req_pool_indices,
++          prefix_pointers,
++          page_size,
++          queue);
++    });
++  }
++}
++
++void paged_alloc_decode_xe35(
++    torch::Tensor seq_lens,
++    torch::Tensor last_loc,
++    torch::Tensor free_pages,
++    torch::Tensor out_indices,
++    int64_t page_size) {
++  check_vector(seq_lens, "seq_lens");
++  check_last_loc(last_loc);
++  check_vector(free_pages, "free_pages");
++  check_vector(out_indices, "out_indices");
++  TORCH_CHECK(
++      page_size > 0 && last_loc.numel() == seq_lens.numel() && out_indices.numel() == seq_lens.numel(),
++      "invalid batch or page_size");
++  const int64_t batch = seq_lens.numel();
++  if (batch == 0) {
++    return;
++  }
++  auto queue = at::xpu::getCurrentXPUStream().queue();
++  if (last_loc.scalar_type() == at::kInt) {
++    dispatch_page_family(page_size, [&]<int PageShift>() {
++      launch_decode<int32_t, PageShift>(seq_lens, last_loc, free_pages, out_indices, page_size, queue);
++    });
++  } else {
++    dispatch_page_family(page_size, [&]<int PageShift>() {
++      launch_decode<int64_t, PageShift>(seq_lens, last_loc, free_pages, out_indices, page_size, queue);
++    });
++  }
++}
++
++}  // namespace at::native::xpu
+diff --git a/src/sycl/xe35/WriteReqToTokenPool.cpp b/src/sycl/xe35/WriteReqToTokenPool.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..aa101df4b9ed5bc334acf660748f1025064d44a4
+--- /dev/null
++++ b/src/sycl/xe35/WriteReqToTokenPool.cpp
+@@ -0,0 +1,108 @@
++#include <ATen/ATen.h>
++#include <c10/xpu/XPUStream.h>
++#include <torch/all.h>
++
++#include "sgl_kernel/xe35/memory_ops.h"
++
++#include <algorithm>
++#include <sycl/sycl.hpp>
++
++#include "../SYCLHelpers.h"
++
++namespace at::native::xpu {
++namespace {
++
++constexpr int kWorkgroup = 256;
++
++struct WriteReqToTokenPoolKernel {
++  int32_t* __restrict__ req_to_token;
++  const int64_t* __restrict__ req_pool_indices;
++  const uint64_t* __restrict__ prefix_pointers;
++  const int64_t* __restrict__ prefix_lens;
++  const int64_t* __restrict__ seq_lens;
++  const int64_t* __restrict__ extend_lens;
++  const int64_t* __restrict__ out_cache_loc;
++  int64_t num_reqs;
++  int64_t groups_per_request;
++  int64_t pool_row_stride;
++
++  void operator()(sycl::nd_item<1> item) const {
++    const int64_t req = item.get_group(0) / groups_per_request;
++    const int64_t tile = item.get_group(0) % groups_per_request;
++    const int64_t lane = item.get_local_id(0);
++    if (req >= num_reqs) {
++      return;
++    }
++    const int64_t pool_row = req_pool_indices[req];
++    const int64_t prefix_len = prefix_lens[req];
++    const int64_t extend_len = seq_lens[req] - prefix_len;
++    const auto* prefix = reinterpret_cast<const int64_t*>(static_cast<uintptr_t>(prefix_pointers[req]));
++    const int64_t pool_base = pool_row * pool_row_stride;
++    for (int64_t pos = tile * kWorkgroup + lane; pos < prefix_len; pos += groups_per_request * kWorkgroup) {
++      req_to_token[pool_base + pos] = static_cast<int32_t>(prefix[pos]);
++    }
++    int64_t extend_start = 0;
++    for (int64_t prior = 0; prior < req; ++prior) {
++      extend_start += extend_lens[prior];
++    }
++    for (int64_t pos = tile * kWorkgroup + lane; pos < extend_len; pos += groups_per_request * kWorkgroup) {
++      req_to_token[pool_base + prefix_len + pos] = static_cast<int32_t>(out_cache_loc[extend_start + pos]);
++    }
++  }
++};
++
++void check_xpu_vector(const torch::Tensor& tensor, const char* name, at::ScalarType dtype) {
++  TORCH_CHECK(
++      tensor.is_xpu() && tensor.dim() == 1 && tensor.is_contiguous() && tensor.scalar_type() == dtype,
++      name,
++      " must be a contiguous XPU vector with the expected dtype");
++}
++
++}  // namespace
++
++void write_req_to_token_pool_xe35(
++    torch::Tensor req_to_token,
++    torch::Tensor req_pool_indices,
++    torch::Tensor prefix_pointers,
++    torch::Tensor prefix_lens,
++    torch::Tensor seq_lens,
++    torch::Tensor extend_lens,
++    torch::Tensor out_cache_loc) {
++  TORCH_CHECK(
++      req_to_token.is_xpu() && req_to_token.dim() == 2 && req_to_token.is_contiguous() &&
++          req_to_token.scalar_type() == at::kInt,
++      "req_to_token must be a contiguous XPU int32 matrix");
++  check_xpu_vector(req_pool_indices, "req_pool_indices", at::kLong);
++  check_xpu_vector(prefix_pointers, "prefix_pointers", at::kUInt64);
++  check_xpu_vector(prefix_lens, "prefix_lens", at::kLong);
++  check_xpu_vector(seq_lens, "seq_lens", at::kLong);
++  check_xpu_vector(extend_lens, "extend_lens", at::kLong);
++  check_xpu_vector(out_cache_loc, "out_cache_loc", at::kLong);
++  const int64_t num_reqs = req_pool_indices.numel();
++  TORCH_CHECK(
++      prefix_pointers.numel() == num_reqs && prefix_lens.numel() == num_reqs && seq_lens.numel() == num_reqs &&
++          extend_lens.numel() == num_reqs,
++      "request metadata lengths must match");
++  if (num_reqs == 0) {
++    return;
++  }
++  auto queue = at::xpu::getCurrentXPUStream().queue();
++  // The cache-location vector estimates extension length without reading XPU metadata on the host.
++  const int64_t groups_per_request =
++      std::min<int64_t>(8, std::max<int64_t>(1, (out_cache_loc.numel() + num_reqs * 512 - 1) / (num_reqs * 512)));
++  WriteReqToTokenPoolKernel kernel{
++      req_to_token.data_ptr<int32_t>(),
++      req_pool_indices.data_ptr<int64_t>(),
++      prefix_pointers.data_ptr<uint64_t>(),
++      prefix_lens.data_ptr<int64_t>(),
++      seq_lens.data_ptr<int64_t>(),
++      extend_lens.data_ptr<int64_t>(),
++      out_cache_loc.data_ptr<int64_t>(),
++      num_reqs,
++      groups_per_request,
++      req_to_token.stride(0)};
++  sycl_kernel_submit(
++      sycl::range<1>(num_reqs * groups_per_request * kWorkgroup), sycl::range<1>(kWorkgroup), queue, kernel);
++}
++
++}  // namespace at::native::xpu
+diff --git a/src/torch_extension_sycl.cc b/src/torch_extension_sycl.cc
+index 8603e536b016ae275cc7e77d48e1a312532d48c2..8af4a70a2c040d6cdb6198a61acc7fe35b3e64b5 100644
+--- a/src/torch_extension_sycl.cc
++++ b/src/torch_extension_sycl.cc
+@@ -58,6 +58,30 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
+   m.def("hadamard_transform(Tensor input, float scale=1.0) -> Tensor");
+   m.impl("hadamard_transform", torch::kXPU, &at::native::xpu::hadamard_transform);
+ 
++#if SYCL_INTEL_TARGET == 35
++  m.def(
++      "write_req_to_token_pool_xe35(Tensor(a!) req_to_token, Tensor req_pool_indices, Tensor prefix_pointers, "
++      "Tensor prefix_lens, Tensor seq_lens, Tensor extend_lens, Tensor out_cache_loc) -> ()");
++  m.impl("write_req_to_token_pool_xe35", torch::kXPU, &at::native::xpu::write_req_to_token_pool_xe35);
++
++  m.def(
++      "paged_alloc_extend_xe35(Tensor prefix_lens, Tensor seq_lens, Tensor last_loc, Tensor free_pages, Tensor! "
++      "out_indices, int page_size) -> ()");
++  m.impl("paged_alloc_extend_xe35", torch::kXPU, &at::native::xpu::paged_alloc_extend_xe35);
++
++  m.def(
++      "paged_alloc_extend_and_write_xe35(Tensor prefix_lens, Tensor seq_lens, Tensor last_loc, Tensor free_pages, "
++      "Tensor(a!) out_indices, Tensor(b!) req_to_token, Tensor req_pool_indices, Tensor prefix_pointers, int "
++      "page_size) -> ()");
++  m.impl("paged_alloc_extend_and_write_xe35", torch::kXPU, &at::native::xpu::paged_alloc_extend_and_write_xe35);
++
++  m.def(
++      "paged_alloc_decode_xe35(Tensor seq_lens, Tensor last_loc, Tensor free_pages, Tensor! out_indices, int page_size) -> "
++      "()");
++  m.impl("paged_alloc_decode_xe35", torch::kXPU, &at::native::xpu::paged_alloc_decode_xe35);
++
++#endif
++
+   m.def("topk_softmax(Tensor! topk_weights, Tensor! topk_indices, Tensor gating_output, bool renormalize) -> ()");
+   m.impl("topk_softmax", torch::kXPU, &at::native::xpu::topk_softmax);
+ 
+diff --git a/tests/test_memory_benchmark_scope.py b/tests/test_memory_benchmark_scope.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..79514c331086fb4eb3089508ba473c77b4cc2ec7
+--- /dev/null
++++ b/tests/test_memory_benchmark_scope.py
+@@ -0,0 +1,119 @@
++import importlib.util
++import subprocess
++import sys
++from pathlib import Path
++
++import pytest
++
++
++@pytest.mark.parametrize("batch", [1, 7, 9])
++@pytest.mark.parametrize(
++    "mode", ["profiler", "event", "tiles", "write-groups", "aux", "prefill"]
++)
++def test_memory_benchmark_rejects_serving_batch_override(batch, mode):
++    benchmark = (
++        Path(__file__).resolve().parents[1] / "benchmark" / "bench_memory_compare.py"
++    )
++    command = [
++        sys.executable,
++        "-S",
++        str(benchmark),
++        "--mode",
++        mode,
++        "--batch",
++        str(batch),
++    ]
++    result = subprocess.run(command, capture_output=True, text=True, timeout=10)
++    assert result.returncode == 2
++    assert "Muse-Spark serving benchmarks require --batch 8" in result.stderr
++    assert "ModuleNotFoundError" not in result.stderr
++
++
++@pytest.mark.parametrize(
++    "mode", ["profiler", "event", "tiles", "write-groups", "aux", "prefill"]
++)
++def test_memory_benchmark_help_without_device_imports(mode):
++    benchmark = (
++        Path(__file__).resolve().parents[1] / "benchmark" / "bench_memory_compare.py"
++    )
++    result = subprocess.run(
++        [sys.executable, "-S", str(benchmark), "--mode", mode, "--help"],
++        capture_output=True,
++        text=True,
++        timeout=10,
++    )
++    assert result.returncode == 0
++    assert "--op" in result.stdout
++    assert "ModuleNotFoundError" not in result.stderr
++
++
++def test_memory_benchmark_rejects_library_override():
++    benchmark = (
++        Path(__file__).resolve().parents[1] / "benchmark" / "bench_memory_compare.py"
++    )
++    result = subprocess.run(
++        [sys.executable, "-S", str(benchmark), "--test-library", "tuning.so"],
++        capture_output=True,
++        text=True,
++        timeout=10,
++    )
++    assert result.returncode == 2
++    assert "unrecognized arguments: --test-library" in result.stderr
++    assert "ModuleNotFoundError" not in result.stderr
++
++
++@pytest.mark.parametrize(
++    "arguments,mode,samples",
++    [
++        ([], "profiler", 31),
++        (
++            [
++                "--mode",
++                "event",
++                "--op",
++                "extend",
++                "--prefix-len",
++                "0",
++                "--extend-len",
++                "4096",
++                "--production-only",
++            ],
++            "event",
++            31,
++        ),
++        (["--mode", "tiles"], "tiles", 51),
++        (["--mode", "write-groups"], "write-groups", 51),
++        (["--mode", "aux"], "aux", 30),
++        (["--mode", "prefill"], "prefill", 31),
++    ],
++)
++def test_memory_benchmark_mode_defaults(arguments, mode, samples):
++    benchmark = (
++        Path(__file__).resolve().parents[1] / "benchmark" / "bench_memory_compare.py"
++    )
++    spec = importlib.util.spec_from_file_location("memory_benchmark_cli", benchmark)
++    module = importlib.util.module_from_spec(spec)
++    spec.loader.exec_module(module)
++    parsed = module.parse_args(arguments)
++    assert parsed.mode == mode
++    assert parsed.samples == samples
++    assert parsed.batch == 8
++    if mode == "tiles":
++        assert parsed.cases == ("extend", "fused")
++        assert parsed.lengths == (
++            64,
++            128,
++            256,
++            384,
++            511,
++            512,
++            513,
++            768,
++            1024,
++            1536,
++            2047,
++            2048,
++            2049,
++            3072,
++            4096,
++        )
+diff --git a/tests/test_paged_alloc.py b/tests/test_paged_alloc.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..b2263ffbe33988e8dc8a79eb783375d56faf88fb
+--- /dev/null
++++ b/tests/test_paged_alloc.py
+@@ -0,0 +1,177 @@
++import pytest
++import sgl_kernel
++import torch
++
++
++pytestmark = pytest.mark.skipif(
++    not torch.xpu.is_available() or not sgl_kernel.is_xe3_arch(),
++    reason="Xe35 kernels require compute capability 3.5",
++)
++
++
++@pytest.mark.parametrize("last_dtype", [torch.int32, torch.int64])
++def test_paged_alloc_extend_crosses_page_boundaries(last_dtype):
++    if not torch.xpu.is_available():
++        pytest.skip("XPU unavailable")
++    device = "xpu"
++    pre = torch.tensor([2, 4, 7, 1], device=device, dtype=torch.int64)
++    seq = torch.tensor([5, 6, 10, 3], device=device, dtype=torch.int64)
++    last = torch.tensor([101, -1, 202, 400], device=device, dtype=last_dtype)
++    free_pages = torch.tensor([10, 20, 30], device=device, dtype=torch.int64)
++    out = torch.empty(10, device=device, dtype=torch.int64)
++    torch.ops.sgl_kernel.paged_alloc_extend_xe35(pre, seq, last, free_pages, out, 4)
++    expected = torch.tensor(
++        [102, 103, 40, 80, 81, 203, 120, 121, 401, 402],
++        device=device,
++        dtype=torch.int64,
++    )
++    torch.xpu.synchronize()
++    torch.testing.assert_close(out.cpu(), expected.cpu(), rtol=0, atol=0)
++
++
++@pytest.mark.parametrize("last_dtype", [torch.int32, torch.int64])
++@pytest.mark.parametrize("page_size", [4, 32, 64, 128])
++def test_paged_alloc_decode_reuses_or_opens_page(last_dtype, page_size):
++    if not torch.xpu.is_available():
++        pytest.skip("XPU unavailable")
++    device = "xpu"
++    seq = torch.tensor(
++        [page_size, page_size + 1, 2 * page_size, 2 * page_size + 1],
++        device=device,
++        dtype=torch.int64,
++    )
++    last = torch.tensor([23, 31, 39, 47], device=device, dtype=last_dtype)
++    free_pages = torch.tensor([11, 12], device=device, dtype=torch.int64)
++    out = torch.empty_like(seq)
++    torch.ops.sgl_kernel.paged_alloc_decode_xe35(seq, last, free_pages, out, page_size)
++    expected = torch.tensor(
++        [24, 11 * page_size, 40, 12 * page_size], device=device, dtype=torch.int64
++    )
++    torch.xpu.synchronize()
++    torch.testing.assert_close(out.cpu(), expected.cpu(), rtol=0, atol=0)
++
++
++@pytest.mark.parametrize("last_dtype", [torch.int32, torch.int64])
++def test_paged_alloc_extend_page64_partial_and_new_pages(last_dtype):
++    if not torch.xpu.is_available():
++        pytest.skip("XPU unavailable")
++    pre = torch.tensor([62, 64, 127], device="xpu", dtype=torch.int64)
++    seq = torch.tensor([66, 130, 130], device="xpu", dtype=torch.int64)
++    last = torch.tensor([300, -1, 511], device="xpu", dtype=last_dtype)
++    free_pages = torch.tensor([10, 20, 30, 40], device="xpu", dtype=torch.int64)
++    out = torch.empty(73, device="xpu", dtype=torch.int64)
++    torch.ops.sgl_kernel.paged_alloc_extend_xe35(pre, seq, last, free_pages, out, 64)
++    expected = torch.tensor(
++        [301, 302, 640, 641] + list(range(1280, 1344)) + [1920, 1921, 512, 2560, 2561],
++        device="xpu",
++        dtype=torch.int64,
++    )
++    torch.xpu.synchronize()
++    torch.testing.assert_close(out.cpu(), expected.cpu(), rtol=0, atol=0)
++
++
++@pytest.mark.parametrize("page_size", [7, 32, 64, 128])
++@pytest.mark.parametrize("last_dtype", [torch.int32, torch.int64])
++def test_paged_alloc_extend_and_write_matches_split_with_prefix(page_size, last_dtype):
++    if not torch.xpu.is_available():
++        pytest.skip("XPU unavailable")
++    prefix_lens = torch.tensor(
++        [2, page_size, page_size - 1], device="xpu", dtype=torch.int64
++    )
++    seq_lens = torch.tensor(
++        [page_size + 2, page_size + 3, page_size + 2], device="xpu", dtype=torch.int64
++    )
++    extend_lens = seq_lens - prefix_lens
++    last = torch.tensor([101, 200, 301], device="xpu", dtype=last_dtype)
++    free_pages = torch.arange(10, 16, device="xpu", dtype=torch.int64)
++    total_extend = int(extend_lens.sum().item())
++    split_out = torch.empty(total_extend, device="xpu", dtype=torch.int64)
++    fused_out = torch.empty_like(split_out)
++    pool_width = int(seq_lens.max().item())
++    split_pool = torch.full((3, pool_width), -1, device="xpu", dtype=torch.int32)
++    fused_pool = split_pool.clone()
++    req_indices = torch.tensor([2, 0, 1], device="xpu", dtype=torch.int64)
++    prefixes = [
++        torch.arange(int(length), device="xpu", dtype=torch.int64) + 1000 * (index + 1)
++        for index, length in enumerate(prefix_lens.tolist())
++    ]
++    pointers = torch.tensor(
++        [tensor.data_ptr() for tensor in prefixes], device="xpu", dtype=torch.uint64
++    )
++    torch.ops.sgl_kernel.paged_alloc_extend_xe35(
++        prefix_lens, seq_lens, last, free_pages, split_out, page_size
++    )
++    torch.ops.sgl_kernel.write_req_to_token_pool_xe35(
++        split_pool, req_indices, pointers, prefix_lens, seq_lens, extend_lens, split_out
++    )
++    torch.ops.sgl_kernel.paged_alloc_extend_and_write_xe35(
++        prefix_lens,
++        seq_lens,
++        last,
++        free_pages,
++        fused_out,
++        fused_pool,
++        req_indices,
++        pointers,
++        page_size,
++    )
++    torch.xpu.synchronize()
++    torch.testing.assert_close(fused_out.cpu(), split_out.cpu(), rtol=0, atol=0)
++    torch.testing.assert_close(fused_pool.cpu(), split_pool.cpu(), rtol=0, atol=0)
++
++
++@pytest.mark.parametrize("last_dtype", [torch.int32, torch.int64])
++def test_paged_alloc_prefill_and_decode_exact(last_dtype):
++    # Muse serving is B8/ISL4096/OSL16/TP1/EP1; page_size64 is not a batch size.
++    if not torch.xpu.is_available():
++        pytest.skip("XPU unavailable")
++    batch, input_length, output_length, page_size = 8, 4096, 16, 64
++    prefix_lens = torch.zeros(batch, device="xpu", dtype=torch.int64)
++    seq_lens = torch.full_like(prefix_lens, input_length)
++    last = torch.full((batch,), -1, device="xpu", dtype=last_dtype)
++    free_pages = torch.arange(1, batch * input_length // page_size + 1, device="xpu")
++    locations = torch.empty(batch * input_length, device="xpu", dtype=torch.int64)
++    pool = torch.full(
++        (batch, input_length + output_length), -1, device="xpu", dtype=torch.int32
++    )
++    req_indices = torch.arange(batch - 1, -1, -1, device="xpu", dtype=torch.int64)
++    empty_prefix = torch.zeros(1, device="xpu", dtype=torch.int64)
++    pointers = torch.full(
++        (batch,), empty_prefix.data_ptr(), device="xpu", dtype=torch.uint64
++    )
++    torch.ops.sgl_kernel.paged_alloc_extend_and_write_xe35(
++        prefix_lens,
++        seq_lens,
++        last,
++        free_pages,
++        locations,
++        pool,
++        req_indices,
++        pointers,
++        page_size,
++    )
++    expected_locations = torch.arange(
++        page_size, page_size + batch * input_length, dtype=torch.int64
++    )
++    torch.testing.assert_close(locations.cpu(), expected_locations, rtol=0, atol=0)
++    expected_pool = torch.full(
++        (batch, input_length + output_length), -1, dtype=torch.int32
++    )
++    expected_pool[:, :input_length] = (
++        expected_locations.reshape(batch, input_length).flip(0).int()
++    )
++    torch.testing.assert_close(pool.cpu(), expected_pool, rtol=0, atol=0)
++
++    last = locations.reshape(batch, input_length)[:, -1].to(last_dtype).contiguous()
++    decode_pages = torch.arange(1000, 1000 + batch, device="xpu", dtype=torch.int64)
++    expected_decode = torch.arange(1000, 1000 + batch, dtype=torch.int64) * page_size
++    decode_locations = torch.empty(batch, device="xpu", dtype=torch.int64)
++    for step in range(output_length):
++        seq_lens.fill_(input_length + step + 1)
++        torch.ops.sgl_kernel.paged_alloc_decode_xe35(
++            seq_lens, last, decode_pages, decode_locations, page_size
++        )
++        torch.testing.assert_close(
++            decode_locations.cpu(), expected_decode + step, rtol=0, atol=0
++        )
++        last = decode_locations.to(last_dtype)
+diff --git a/tests/test_write_req_to_token_pool.py b/tests/test_write_req_to_token_pool.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..401d2237f667ee2cb4ece486bd6567227ecbed3b
+--- /dev/null
++++ b/tests/test_write_req_to_token_pool.py
+@@ -0,0 +1,88 @@
++import pytest
++import torch
++import sgl_kernel
++
++
++pytestmark = pytest.mark.skipif(
++    not torch.xpu.is_available() or not sgl_kernel.is_xe3_arch(),
++    reason="Xe35 kernels require compute capability 3.5",
++)
++
++
++def test_write_req_to_token_pool_prefix_and_extension():
++    if not torch.xpu.is_available():
++        pytest.skip("XPU unavailable")
++    device = "xpu"
++    pool = torch.full((5, 8), -1, device=device, dtype=torch.int32)
++    req_indices = torch.tensor([3, 1, 4], device=device, dtype=torch.int64)
++    prefixes = [
++        torch.tensor([20, 21], device=device, dtype=torch.int64),
++        torch.empty(0, device=device, dtype=torch.int64),
++        torch.tensor([30, 31, 32], device=device, dtype=torch.int64),
++    ]
++    pointers = torch.tensor(
++        [p.data_ptr() for p in prefixes], device=device, dtype=torch.uint64
++    )
++    prefix_lens = torch.tensor([2, 0, 3], device=device, dtype=torch.int64)
++    seq_lens = torch.tensor([4, 2, 4], device=device, dtype=torch.int64)
++    extend_lens = torch.tensor([2, 2, 1], device=device, dtype=torch.int64)
++    out_cache_loc = torch.tensor([10, 11, 12, 13, 14], device=device, dtype=torch.int64)
++    torch.ops.sgl_kernel.write_req_to_token_pool_xe35(
++        pool,
++        req_indices,
++        pointers,
++        prefix_lens,
++        seq_lens,
++        extend_lens,
++        out_cache_loc,
++    )
++    torch.xpu.synchronize()
++    pool_cpu = pool.cpu()
++    torch.testing.assert_close(
++        pool_cpu[3],
++        torch.tensor([20, 21, 10, 11, -1, -1, -1, -1], dtype=torch.int32),
++        rtol=0,
++        atol=0,
++    )
++    torch.testing.assert_close(
++        pool_cpu[1],
++        torch.tensor([12, 13, -1, -1, -1, -1, -1, -1], dtype=torch.int32),
++        rtol=0,
++        atol=0,
++    )
++    torch.testing.assert_close(
++        pool_cpu[4],
++        torch.tensor([30, 31, 32, 14, -1, -1, -1, -1], dtype=torch.int32),
++        rtol=0,
++        atol=0,
++    )
++
++
++def test_write_req_to_token_pool_multigroup_irregular_prefix():
++    if not torch.xpu.is_available():
++        pytest.skip("XPU unavailable")
++    pool = torch.full((3, 5200), -1, device="xpu", dtype=torch.int32)
++    prefix = torch.arange(3001, device="xpu", dtype=torch.int64) + 20
++    empty_prefix = torch.empty(0, device="xpu", dtype=torch.int64)
++    pointers = torch.tensor(
++        [prefix.data_ptr(), empty_prefix.data_ptr()], device="xpu", dtype=torch.uint64
++    )
++    req_indices = torch.tensor([2, 0], device="xpu", dtype=torch.int64)
++    prefix_lens = torch.tensor([3001, 0], device="xpu", dtype=torch.int64)
++    seq_lens = torch.tensor([5050, 1], device="xpu", dtype=torch.int64)
++    extend_lens = torch.tensor([2049, 1], device="xpu", dtype=torch.int64)
++    loc = torch.arange(2050, device="xpu", dtype=torch.int64) + 10000
++    torch.ops.sgl_kernel.write_req_to_token_pool_xe35(
++        pool, req_indices, pointers, prefix_lens, seq_lens, extend_lens, loc
++    )
++    torch.xpu.synchronize()
++    pool_cpu = pool.cpu()
++    expected = torch.cat((prefix.cpu(), loc[:2049].cpu())).int()
++    torch.testing.assert_close(pool_cpu[2, :5050], expected, rtol=0, atol=0)
++    torch.testing.assert_close(
++        pool_cpu[2, 5050:], torch.full((150,), -1, dtype=torch.int32), rtol=0, atol=0
++    )
++    torch.testing.assert_close(pool_cpu[0, 0], loc[-1].cpu().int(), rtol=0, atol=0)
++    torch.testing.assert_close(
++        pool_cpu[0, 1:], torch.full((5199,), -1, dtype=torch.int32), rtol=0, atol=0
++    )

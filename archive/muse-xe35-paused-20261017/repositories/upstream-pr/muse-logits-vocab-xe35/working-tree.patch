@@ -1,0 +1,1289 @@
+diff --git a/benchmark/bench_logits_vocab_sweep.py b/benchmark/bench_logits_vocab_sweep.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..396845c1839c87b9a18163010669e001c9c4b526
+--- /dev/null
++++ b/benchmark/bench_logits_vocab_sweep.py
+@@ -0,0 +1,509 @@
++"""Compare SGLang main and XPU logits/vocab paths across tensor sizes."""
++
++import argparse
++import os
++
++if __name__ == "__main__":
++    scope_parser_xe35 = argparse.ArgumentParser(add_help=False)
++    scope_parser_xe35.add_argument("--batch", "--serving-batch", type=int, default=8)
++    scope_parser_xe35.add_argument("--isl", type=int, default=4096)
++    scope_parser_xe35.add_argument("--osl", type=int, default=16)
++    scope_parser_xe35.add_argument("--tp", type=int, default=1)
++    scope_parser_xe35.add_argument("--ep", type=int, default=1)
++    scope_xe35, _unknown_xe35 = scope_parser_xe35.parse_known_args()
++    if (scope_xe35.batch, scope_xe35.isl, scope_xe35.osl, scope_xe35.tp, scope_xe35.ep) != (
++        8, 4096, 16, 1, 1
++    ) or any(
++        os.environ.get(name, "8") != "8"
++        for name in ("BATCHES", "BATCH_SIZE", "SERVING_BATCH")
++    ):
++        scope_parser_xe35.error("Muse-Spark serving scope requires B8/ISL4096/OSL16/TP1/EP1")
++
++import json
++import math
++import tempfile
++from pathlib import Path
++from statistics import median
++
++import sgl_kernel
++import torch
++import torch.nn.functional as F
++import triton
++import triton.language as tl
++from triton.language.extra import libdevice
++
++from sglang.kernels.ops.activation.softcap import (
++    softcap_inplace_logits,
++    softcap_inplace_logits_kernel,
++)
++
++
++@triton.jit
++def softcap_flat_kernel(logits, cap, numel, BLOCK_SIZE: tl.constexpr):
++    offsets = tl.program_id(0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
++    x = tl.load(logits + offsets, mask=offsets < numel)
++    x = libdevice.tanh(x / cap) * cap
++    tl.store(logits + offsets, x, mask=offsets < numel)
++
++
++@triton.jit
++def softcap_flat_recip_kernel(
++    logits, cap, reciprocal_cap, numel, BLOCK_SIZE: tl.constexpr
++):
++    offsets = tl.program_id(0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
++    x = tl.load(logits + offsets, mask=offsets < numel)
++    x = libdevice.tanh(x * reciprocal_cap) * cap
++    tl.store(logits + offsets, x, mask=offsets < numel)
++
++
++def summarize(values):
++    ordered = sorted(values)
++
++    def quantile(q):
++        index = (len(ordered) - 1) * q
++        lo, hi = math.floor(index), math.ceil(index)
++        return ordered[lo] + (ordered[hi] - ordered[lo]) * (index - lo)
++
++    return {"p20_us": quantile(0.2), "p50_us": median(values), "p80_us": quantile(0.8)}
++
++
++def measure(fn, reps, warmup=5):
++    for _ in range(warmup):
++        fn()
++    torch.xpu.synchronize()
++    with torch.profiler.profile(
++        activities=[
++            torch.profiler.ProfilerActivity.CPU,
++            torch.profiler.ProfilerActivity.XPU,
++        ]
++    ) as profiler:
++        for _ in range(reps):
++            fn()
++        torch.xpu.synchronize()
++    with tempfile.TemporaryDirectory() as directory:
++        trace_path = Path(directory) / "trace.json"
++        profiler.export_chrome_trace(str(trace_path))
++        events = json.loads(trace_path.read_text())["traceEvents"]
++    kernels = sorted(
++        (event for event in events if event.get("cat") == "kernel"),
++        key=lambda event: event["ts"],
++    )
++    if len(kernels) % reps:
++        raise RuntimeError(
++            f"kernel count {len(kernels)} is not divisible by reps {reps}"
++        )
++    per_call = len(kernels) // reps
++    if per_call == 0:
++        raise RuntimeError("profiler recorded no XPU kernels")
++    durations = [
++        sum(event["dur"] for event in kernels[i : i + per_call])
++        for i in range(0, len(kernels), per_call)
++    ]
++    return durations, sorted({event["name"] for event in kernels})
++
++
++def measure_paired(cases, op, reps, warmup, order):
++    primary = "triton" if op == "softcap" else "compiled"
++    selected = {primary: cases[primary], "sycl": cases["sycl"]}
++    names = list(selected)
++    if order == "sycl-first":
++        names.reverse()
++    for _ in range(warmup):
++        for name in names:
++            selected[name]()
++    torch.xpu.synchronize()
++    with torch.profiler.profile(
++        activities=[
++            torch.profiler.ProfilerActivity.CPU,
++            torch.profiler.ProfilerActivity.XPU,
++        ]
++    ) as profiler:
++        for _ in range(reps):
++            for name in names:
++                selected[name]()
++        torch.xpu.synchronize()
++    with tempfile.TemporaryDirectory() as directory:
++        path = Path(directory) / "trace.json"
++        profiler.export_chrome_trace(str(path))
++        events = json.loads(path.read_text())["traceEvents"]
++    patterns = {
++        "triton": "softcap_inplace_logits_kernel",
++        "compiled": "triton_poi_fused",
++        "sycl": "SoftcapLogits" if op == "softcap" else "VocabMaskKernel",
++    }
++    samples = {}
++    kernels = {}
++    for name in names:
++        observed = [
++            event
++            for event in events
++            if event.get("cat") == "kernel" and patterns[name] in event["name"]
++        ]
++        if len(observed) != reps:
++            raise RuntimeError(
++                f"{name}: expected {reps} device samples, got {len(observed)}"
++            )
++        samples[name] = [event["dur"] for event in observed]
++        kernels[name] = sorted({event["name"] for event in observed})
++    return samples, kernels
++
++
++def softcap_cases(
++    batch,
++    width,
++    cap,
++    include_sycl,
++    include_flat,
++    include_recip,
++    include_wrapper,
++    block_size,
++    num_warps,
++):
++    source = torch.randn(batch, width, device="xpu", dtype=torch.float32)
++    triton_logits = source.clone()
++    sycl_logits = source.clone()
++    flat_logits = source.clone()
++    recip_logits = source.clone()
++    wrapper_logits = source.clone()
++
++    def run_triton():
++        if triton_logits.is_contiguous():
++            nrows, ncols = 1, triton_logits.numel()
++            row_stride = ncols
++        else:
++            nrows, ncols = triton_logits.shape
++            row_stride = triton_logits.stride(0)
++        softcap_inplace_logits_kernel[(triton.cdiv(ncols, block_size), nrows)](
++            triton_logits, cap, ncols, row_stride, block_size, num_warps=num_warps
++        )
++
++    def run_sycl():
++        torch.ops.sgl_kernel.softcap_logits_xe35(sycl_logits, cap)
++
++    def run_triton_flat():
++        softcap_flat_kernel[(triton.cdiv(flat_logits.numel(), block_size),)](
++            flat_logits, cap, flat_logits.numel(), block_size, num_warps=num_warps
++        )
++
++    def run_triton_recip():
++        softcap_flat_recip_kernel[(triton.cdiv(recip_logits.numel(), block_size),)](
++            recip_logits,
++            cap,
++            1.0 / cap,
++            recip_logits.numel(),
++            block_size,
++            num_warps=num_warps,
++        )
++
++    def run_pytorch():
++        return cap * torch.tanh(source / cap)
++
++    def run_wrapper():
++        return softcap_inplace_logits(wrapper_logits, cap)
++
++    run_triton()
++    pytorch_result = run_pytorch()
++    expected = cap * torch.tanh(source.cpu() / cap)
++    torch.testing.assert_close(triton_logits.cpu(), expected, atol=3e-5, rtol=3e-5)
++    torch.testing.assert_close(pytorch_result.cpu(), expected, atol=3e-5, rtol=3e-5)
++    cases = {"triton": run_triton, "pytorch": run_pytorch}
++    if include_flat:
++        run_triton_flat()
++        torch.testing.assert_close(flat_logits.cpu(), expected, atol=3e-5, rtol=3e-5)
++        cases["triton_flat"] = run_triton_flat
++    if include_recip:
++        run_triton_recip()
++        torch.testing.assert_close(recip_logits.cpu(), expected, atol=3e-5, rtol=3e-5)
++        cases["triton_recip"] = run_triton_recip
++    if include_wrapper:
++        run_wrapper()
++        torch.testing.assert_close(wrapper_logits.cpu(), expected, atol=3e-5, rtol=3e-5)
++        cases["triton_wrapper"] = run_wrapper
++    if include_sycl:
++        run_sycl()
++        torch.testing.assert_close(sycl_logits.cpu(), expected, atol=3e-5, rtol=3e-5)
++        cases["sycl"] = run_sycl
++    return cases
++
++
++def vocab_cases(count, id_dtype, include_sycl):
++    from sglang.srt.layers.vocab_parallel_embedding import get_masked_input_and_mask
++
++    bounds = (0, 100, 16, 200, 207)
++    values = [0, 1, 99, 100, 199, 200, 206, 207, -1]
++    ids = torch.tensor(
++        (values * triton.cdiv(count, len(values)))[:count],
++        device="xpu",
++        dtype=id_dtype,
++    )
++    compiled = get_masked_input_and_mask
++    eager = compiled.__wrapped__
++
++    def run_compiled():
++        return compiled(ids, *bounds)
++
++    def run_sycl():
++        return torch.ops.sgl_kernel.vocab_mask_xe35(ids, *bounds)
++
++    def run_pytorch():
++        return eager(ids, *bounds)
++
++    ids_cpu = ids.cpu().long()
++    original = (ids_cpu >= 0) & (ids_cpu < 100)
++    added = (ids_cpu >= 200) & (ids_cpu < 207)
++    expected = (
++        torch.where(original, ids_cpu, torch.where(added, ids_cpu - 84, 0)),
++        ~(original | added),
++    )
++    methods = (
++        (run_compiled, run_pytorch, run_sycl)
++        if include_sycl
++        else (run_compiled, run_pytorch)
++    )
++    for method in methods:
++        actual = method()
++        for got, want in zip(actual, expected):
++            torch.testing.assert_close(got.cpu(), want, atol=0, rtol=0)
++    if include_sycl:
++        return {"compiled": run_compiled, "sycl": run_sycl, "pytorch": run_pytorch}
++    return {"compiled": run_compiled, "pytorch": run_pytorch}
++
++
++def embedding_cases(count, hidden, include_sycl, include_triton, block_h, num_warps):
++    from sglang.kernels.ops.embeddings.vocab_parallel_embedding import (
++        _vocab_parallel_embedding_kernel,
++    )
++    from sglang.srt.layers.vocab_parallel_embedding import get_masked_input_and_mask
++
++    bounds = (0, 512, 0, 1010, 1026)
++    values = [0, 1, 511, 512, 1009, 1010, 1025, 1026, -1]
++    ids = torch.tensor(
++        (values * triton.cdiv(count, len(values)))[:count],
++        device="xpu",
++        dtype=torch.int64,
++    )
++    weight = torch.randn(528, hidden, device="xpu", dtype=torch.bfloat16)
++    output = torch.empty(count, hidden, device="xpu", dtype=weight.dtype)
++
++    def run_main():
++        mapped, invalid = get_masked_input_and_mask(ids, *bounds)
++        result = F.embedding(mapped.long(), weight)
++        result.masked_fill_(invalid.unsqueeze(-1), 0)
++        return result
++
++    def run_sycl():
++        torch.ops.sgl_kernel.vocab_parallel_embedding_xe35(ids, weight, output, *bounds)
++        return output
++
++    def run_triton():
++        _vocab_parallel_embedding_kernel[(count, triton.cdiv(hidden, block_h))](
++            ids,
++            weight,
++            output,
++            hidden,
++            weight.stride(0),
++            *bounds,
++            BLOCK_H=block_h,
++            num_warps=num_warps,
++        )
++        return output
++
++    ids_cpu = ids.cpu()
++    original = (ids_cpu >= 0) & (ids_cpu < 512)
++    added = (ids_cpu >= 1010) & (ids_cpu < 1026)
++    mapped = torch.where(original, ids_cpu, torch.where(added, ids_cpu - 498, 0))
++    expected = weight.cpu()[mapped]
++    expected[~(original | added)] = 0
++    torch.testing.assert_close(run_main().cpu(), expected, atol=0, rtol=0)
++    cases = {"main_pytorch": run_main}
++    if include_triton:
++        torch.testing.assert_close(run_triton().cpu(), expected, atol=0, rtol=0)
++        cases["main_triton_xpu"] = run_triton
++    if include_sycl:
++        torch.testing.assert_close(run_sycl().cpu(), expected, atol=0, rtol=0)
++        cases["sycl"] = run_sycl
++    return cases
++
++
++def main():
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument(
++        "--op", choices=("softcap", "vocab", "embedding"), required=True
++    )
++    parser.add_argument("--mode", choices=("sweep", "paired"), default="sweep")
++    parser.add_argument("--sizes", type=int, nargs="+")
++    parser.add_argument("--vocab", type=int)
++    parser.add_argument("--tokens", type=int)
++    parser.add_argument("--batch", "--serving-batch", type=int, default=8)
++    parser.add_argument("--isl", type=int, default=4096)
++    parser.add_argument("--osl", type=int, default=16)
++    parser.add_argument("--tp", type=int, default=1)
++    parser.add_argument("--ep", type=int, default=1)
++    parser.add_argument("--cap", type=float, default=20.0)
++    parser.add_argument("--hidden", type=int, default=4096)
++    parser.add_argument("--triton-block-size", type=int, default=1024)
++    parser.add_argument("--triton-num-warps", type=int, default=4)
++    parser.add_argument("--id-dtype", choices=("int32", "int64"), default="int64")
++    parser.add_argument("--reps", "--samples", type=int, default=40)
++    parser.add_argument("--warmup", type=int, default=5)
++    parser.add_argument(
++        "--order", choices=("triton-first", "sycl-first"), default="triton-first"
++    )
++    parser.add_argument("--rounds", type=int, default=3)
++    parser.add_argument("--main-only", action="store_true")
++    parser.add_argument("--softcap-flat", action="store_true")
++    parser.add_argument("--softcap-recip", action="store_true")
++    parser.add_argument("--softcap-wrapper", action="store_true")
++    parser.add_argument("--embedding-triton-xpu", action="store_true")
++    parser.add_argument("--embedding-block-h", type=int, default=None)
++    parser.add_argument("--embedding-num-warps", type=int, default=8)
++    args = parser.parse_args()
++    if not torch.xpu.is_available() or not sgl_kernel.is_xe3_arch():
++        parser.error("SYCL logits/vocab kernels require Xe35 compute capability 3.5")
++    if args.batch != 8:
++        parser.error("Muse-Spark serving workload requires B=8")
++    if (args.isl, args.osl, args.tp, args.ep) != (4096, 16, 1, 1):
++        parser.error("Muse-Spark workload requires ISL4096/OSL16/TP1/EP1")
++    if sum(value is not None for value in (args.sizes, args.vocab, args.tokens)) > 1:
++        parser.error("choose exactly one of sizes, vocab, or tokens")
++    if args.vocab is not None and args.op != "softcap":
++        parser.error(
++            "vocab is the softcap width option; use tokens for vocab-mask or embedding"
++        )
++    if args.tokens is not None and args.op == "softcap":
++        parser.error("use vocab or sizes for softcap")
++    args.sizes = args.sizes or [
++        (
++            args.vocab
++            if args.vocab is not None
++            else (
++                args.tokens
++                if args.tokens is not None
++                else 202048 if args.op == "softcap" else 8
++            )
++        )
++    ]
++    if args.warmup < 1 or (
++        args.mode == "paired" and (args.op == "embedding" or args.main_only)
++    ):
++        parser.error(
++            "warmup must be positive; paired mode requires softcap/vocab and the SYCL backend"
++        )
++    if (
++        any(size <= 0 for size in args.sizes)
++        or args.reps <= 0
++        or args.rounds <= 0
++        or args.hidden <= 0
++    ):
++        parser.error("sizes, reps, rounds, and hidden must be positive")
++    if args.triton_block_size <= 0 or args.triton_num_warps <= 0:
++        parser.error("Triton block size and warps must be positive")
++    if (
++        args.embedding_block_h is not None and args.embedding_block_h <= 0
++    ) or args.embedding_num_warps <= 0:
++        parser.error("embedding block size and warps must be positive")
++    embedding_block_h = args.embedding_block_h or min(
++        1024, triton.next_power_of_2(args.hidden)
++    )
++    print(
++        json.dumps(
++            {
++                "device": torch.xpu.get_device_name(0),
++                "torch": torch.__version__,
++                "op": args.op,
++                "mode": args.mode,
++                "order": args.order,
++                "batch": args.batch,
++                "hidden": args.hidden,
++                "isl": args.isl,
++                "osl": args.osl,
++                "tp": args.tp,
++                "ep": args.ep,
++                "sizes": args.sizes,
++                "id_dtype": args.id_dtype,
++                "reps": args.reps,
++                "rounds": args.rounds,
++                "triton_block_size": args.triton_block_size,
++                "triton_num_warps": args.triton_num_warps,
++                "main_only": args.main_only,
++                "softcap_flat": args.softcap_flat,
++                "softcap_recip": args.softcap_recip,
++                "softcap_wrapper": args.softcap_wrapper,
++                "embedding_triton_xpu": args.embedding_triton_xpu,
++                "embedding_block_h": embedding_block_h,
++                "embedding_num_warps": args.embedding_num_warps,
++                "timing": "torch.profiler XPU kernel duration sum per call, microseconds",
++            }
++        ),
++        flush=True,
++    )
++    for size in args.sizes:
++        if args.op == "softcap":
++            cases = softcap_cases(
++                args.batch,
++                size,
++                args.cap,
++                not args.main_only,
++                args.softcap_flat,
++                args.softcap_recip,
++                args.softcap_wrapper,
++                args.triton_block_size,
++                args.triton_num_warps,
++            )
++        elif args.op == "vocab":
++            cases = vocab_cases(size, getattr(torch, args.id_dtype), not args.main_only)
++        else:
++            cases = embedding_cases(
++                size,
++                args.hidden,
++                not args.main_only,
++                args.embedding_triton_xpu,
++                embedding_block_h,
++                args.embedding_num_warps,
++            )
++        samples = {name: [] for name in cases}
++        kernel_names = {name: [] for name in cases}
++        names = list(cases)
++        if args.order == "sycl-first" and "sycl" in names:
++            names.remove("sycl")
++            names.insert(0, "sycl")
++        for round_index in range(args.rounds):
++            if args.mode == "paired":
++                paired_order = (
++                    args.order
++                    if round_index % 2 == 0
++                    else (
++                        "sycl-first" if args.order == "triton-first" else "triton-first"
++                    )
++                )
++                observed, observed_kernels = measure_paired(
++                    cases, args.op, args.reps, args.warmup, paired_order
++                )
++                if round_index == 0:
++                    samples = {name: [] for name in observed}
++                for name, values in observed.items():
++                    samples[name].extend(values)
++                kernel_names = observed_kernels
++                continue
++            order = names if round_index % 2 == 0 else list(reversed(names))
++            for name in order:
++                times, observed_names = measure(cases[name], args.reps, args.warmup)
++                samples[name].extend(times)
++                kernel_names[name] = observed_names
++        print(
++            json.dumps(
++                {
++                    "shape": [args.batch, size] if args.op == "softcap" else [size],
++                    "summary": {
++                        name: summarize(values) for name, values in samples.items()
++                    },
++                    "kernels": kernel_names,
++                    "samples_us": samples,
++                }
++            ),
++            flush=True,
++        )
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/cmake/BuildFlags.cmake b/cmake/BuildFlags.cmake
+index 5dfb191b37ff61b04b4329536b487308b197cc44..086239cefe6af99520acbb1c4423744a46d9a4cc 100644
+--- a/cmake/BuildFlags.cmake
++++ b/cmake/BuildFlags.cmake
+@@ -26,7 +26,7 @@ function(CHECK_SYCL_FLAG FLAG VARIABLE_NAME)
+ endfunction()
+ 
+ # Support GCC on Linux.
+-if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
++if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" OR CMAKE_CXX_COMPILER_ID STREQUAL "IntelLLVM")
+   message(STATUS "sgl-kernel-xpu build type: ${CMAKE_BUILD_TYPE}")
+   set(SYCL_HOST_FLAGS)
+   set(SYCL_KERNEL_OPTIONS)
+@@ -185,6 +185,6 @@ if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+ 
+   set(SYCL_OFFLINE_COMPILER_FLAGS "${SYCL_OFFLINE_COMPILER_AOT_OPTIONS}${SYCL_OFFLINE_COMPILER_CG_OPTIONS}")
+ else()
+-  message("Not compiling with XPU. Currently only support GCC compiler on Linux as CXX compiler.")
++  message("Not compiling with XPU. Currently only support GNU or IntelLLVM compiler on Linux as CXX compiler.")
+   return()
+ endif()
+diff --git a/include/sgl_kernel/xe35/logits_vocab_ops.h b/include/sgl_kernel/xe35/logits_vocab_ops.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..9648ad197eef885a1749ff0d3850868aa948ecb4
+--- /dev/null
++++ b/include/sgl_kernel/xe35/logits_vocab_ops.h
+@@ -0,0 +1,26 @@
++#pragma once
++
++#include <torch/all.h>
++
++#include "sgl_kernel_export.h"
++
++namespace at::native::xpu {
++SGL_KERNEL_EXPORT std::tuple<torch::Tensor, torch::Tensor> vocab_mask_xe35(
++    torch::Tensor input,
++    int64_t org_start,
++    int64_t org_end,
++    int64_t num_org_padding,
++    int64_t added_start,
++    int64_t added_end);
++SGL_KERNEL_EXPORT void vocab_parallel_embedding_xe35(
++    torch::Tensor input,
++    torch::Tensor weight,
++    torch::Tensor output,
++    int64_t org_start,
++    int64_t org_end,
++    int64_t num_org_padding,
++    int64_t added_start,
++    int64_t added_end);
++SGL_KERNEL_EXPORT void softcap_logits_xe35(torch::Tensor logits, double cap);
++
++}
+diff --git a/include/sgl_kernel_ops.h b/include/sgl_kernel_ops.h
+index 0b71dcef0d0cd28a7b2bf892845c95d6c12a547f..41f80fcce15aa332f1084c95fa55d639b6d1271f 100644
+--- a/include/sgl_kernel_ops.h
++++ b/include/sgl_kernel_ops.h
+@@ -21,6 +21,10 @@ limitations under the License.
+ #include <torch/library.h>
+ #include <torch/torch.h>
+ 
++#if SYCL_INTEL_TARGET == 35
++#include "sgl_kernel/xe35/logits_vocab_ops.h"
++#endif
++
+ #include <optional>
+ #include <sycl/sycl.hpp>
+ #include <tuple>
+diff --git a/src/sycl/Device.cpp b/src/sycl/Device.cpp
+index 44590db8a7c078bf6d8526548e75f80608b757af..2ab1b2262242d5741f5da3d55703004c257bb013 100644
+--- a/src/sycl/Device.cpp
++++ b/src/sycl/Device.cpp
+@@ -22,7 +22,8 @@ SGL_KERNEL_EXPORT std::tuple<int64_t, int64_t> query_device(int64_t device_index
+ // Need oneAPI 2026.2 or later to support `architecture::intel_gpu_cri`. Check the release
+ // (__INTEL_LLVM_COMPILER) rather than the build date (__SYCL_COMPILER_VERSION): 2026.1.x
+ // patch releases (e.g. 2026.1.3, 20260724) are built later but still lack this enum.
+-#if defined(__INTEL_LLVM_COMPILER) && __INTEL_LLVM_COMPILER >= 20260200
++#if (defined(__INTEL_LLVM_COMPILER) && __INTEL_LLVM_COMPILER >= 20260200) || \
++    (defined(__INTEL_LLVM_COMPILER_VERSION) && __INTEL_LLVM_COMPILER_VERSION >= 20260200)
+     case syclex::architecture::intel_gpu_cri:
+       return std::make_tuple(3, 5);
+ #endif
+diff --git a/src/sycl/HCHead.cpp b/src/sycl/HCHead.cpp
+index 78464246ed88cb8056af87e388bad9fc222d4053..1b2ace4419e74f6e6276cea4a8bcffc0b2078a6e 100644
+--- a/src/sycl/HCHead.cpp
++++ b/src/sycl/HCHead.cpp
+@@ -67,7 +67,10 @@ struct FusedHCHeadKernel : public __SYCL_KER_CONFIG_CONVENTION__ {
+     slm_ = sycl::local_accessor<float, 1>(slm_size, cgh);
+   }
+ 
+-  [[sycl::reqd_work_group_size(WG_SIZE)]] [[sycl::reqd_sub_group_size(SG_SIZE)]] void
++#ifdef __SYCL_DEVICE_ONLY__
++  [[sycl::reqd_work_group_size(WG_SIZE)]] [[sycl::reqd_sub_group_size(SG_SIZE)]]
++#endif
++  void
+   operator()(sycl::nd_item<1> item) const {
+     const int token_id = static_cast<int>(item.get_group(0));
+     const int tid = static_cast<int>(item.get_local_id(0));
+diff --git a/src/sycl/xe35/SoftcapLogits.cpp b/src/sycl/xe35/SoftcapLogits.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..75a7a13286891c5b822d4bea474c73446ab32b0f
+--- /dev/null
++++ b/src/sycl/xe35/SoftcapLogits.cpp
+@@ -0,0 +1,122 @@
++#include <ATen/ATen.h>
++#include <c10/xpu/XPUStream.h>
++#include <torch/all.h>
++
++#include "sgl_kernel/xe35/logits_vocab_ops.h"
++
++#include <algorithm>
++#include <sycl/sycl.hpp>
++
++#include "../MemoryAccess.h"
++#include "../SYCLHelpers.h"
++
++namespace at::native::xpu {
++namespace {
++
++constexpr int kSoftcapWorkgroup = 128;
++
++template <typename Scalar, bool Contiguous>
++struct SoftcapLogitsKernel {
++  Scalar* __restrict__ logits;
++  int64_t nrows;
++  int64_t ncols;
++  int64_t row_stride;
++  float cap;
++
++  void operator()(sycl::nd_item<1> item) const {
++    const int64_t index = item.get_global_id(0);
++    if (index >= nrows * ncols) {
++      return;
++    }
++    int64_t address;
++    if constexpr (Contiguous) {
++      address = index;
++    } else {
++      const int64_t row = index / ncols;
++      const int64_t col = index % ncols;
++      address = row * row_stride + col;
++    }
++    const float value = static_cast<float>(logits[address]);
++    logits[address] = static_cast<Scalar>(sycl::tanh(value / cap) * cap);
++  }
++};
++
++struct SoftcapLogitsFloat4Kernel {
++  float* __restrict__ logits;
++  int64_t numel;
++  float cap;
++
++  void operator()(sycl::nd_item<1> item) const {
++    const int64_t index = item.get_global_id(0) * 4;
++    if (index >= numel) {
++      return;
++    }
++    using Vec = aligned_vector_loop<float, 4>;
++    const Vec x = *reinterpret_cast<const Vec*>(logits + index);
++    Vec y;
++    for (int i = 0; i < 4; ++i) {
++      y[i] = sycl::tanh(x[i] / cap) * cap;
++    }
++    *reinterpret_cast<Vec*>(logits + index) = y;
++  }
++};
++
++}  // namespace
++
++void softcap_logits_xe35(torch::Tensor logits, double cap) {
++  TORCH_CHECK(logits.is_xpu(), "logits must be on XPU");
++  TORCH_CHECK(
++      logits.scalar_type() == at::kFloat || logits.scalar_type() == at::kBFloat16 || logits.scalar_type() == at::kHalf,
++      "logits must be float32, bfloat16, or float16");
++  TORCH_CHECK(
++      logits.is_contiguous() || (logits.dim() == 2 && logits.stride(1) == 1),
++      "logits must be contiguous or a matrix with contiguous columns");
++  TORCH_CHECK(cap > 0.0, "cap must be positive");
++  if (logits.numel() == 0) {
++    return;
++  }
++  const bool contiguous = logits.is_contiguous();
++  const int64_t nrows = contiguous ? 1 : logits.size(0);
++  const int64_t ncols = contiguous ? logits.numel() : logits.size(1);
++  const int64_t row_stride = contiguous ? ncols : logits.stride(0);
++  auto queue = at::xpu::getCurrentXPUStream().queue();
++  const auto global_size = ((logits.numel() + kSoftcapWorkgroup - 1) / kSoftcapWorkgroup) * kSoftcapWorkgroup;
++  if (logits.scalar_type() == at::kFloat) {
++    if (contiguous && logits.numel() % 4 == 0 && reinterpret_cast<uintptr_t>(logits.data_ptr()) % 16 == 0) {
++      const auto vector_groups = (logits.numel() / 4 + kSoftcapWorkgroup - 1) / kSoftcapWorkgroup;
++      SoftcapLogitsFloat4Kernel kernel{logits.data_ptr<float>(), logits.numel(), static_cast<float>(cap)};
++      sycl_kernel_submit(
++          sycl::range<1>(vector_groups * kSoftcapWorkgroup), sycl::range<1>(kSoftcapWorkgroup), queue, kernel);
++    } else if (contiguous) {
++      SoftcapLogitsKernel<float, true> kernel{
++          logits.data_ptr<float>(), nrows, ncols, row_stride, static_cast<float>(cap)};
++      sycl_kernel_submit(sycl::range<1>(global_size), sycl::range<1>(kSoftcapWorkgroup), queue, kernel);
++    } else {
++      SoftcapLogitsKernel<float, false> kernel{
++          logits.data_ptr<float>(), nrows, ncols, row_stride, static_cast<float>(cap)};
++      sycl_kernel_submit(sycl::range<1>(global_size), sycl::range<1>(kSoftcapWorkgroup), queue, kernel);
++    }
++  } else if (logits.scalar_type() == at::kBFloat16) {
++    if (contiguous) {
++      SoftcapLogitsKernel<at::BFloat16, true> kernel{
++          logits.data_ptr<at::BFloat16>(), nrows, ncols, row_stride, static_cast<float>(cap)};
++      sycl_kernel_submit(sycl::range<1>(global_size), sycl::range<1>(kSoftcapWorkgroup), queue, kernel);
++    } else {
++      SoftcapLogitsKernel<at::BFloat16, false> kernel{
++          logits.data_ptr<at::BFloat16>(), nrows, ncols, row_stride, static_cast<float>(cap)};
++      sycl_kernel_submit(sycl::range<1>(global_size), sycl::range<1>(kSoftcapWorkgroup), queue, kernel);
++    }
++  } else {
++    if (contiguous) {
++      SoftcapLogitsKernel<at::Half, true> kernel{
++          logits.data_ptr<at::Half>(), nrows, ncols, row_stride, static_cast<float>(cap)};
++      sycl_kernel_submit(sycl::range<1>(global_size), sycl::range<1>(kSoftcapWorkgroup), queue, kernel);
++    } else {
++      SoftcapLogitsKernel<at::Half, false> kernel{
++          logits.data_ptr<at::Half>(), nrows, ncols, row_stride, static_cast<float>(cap)};
++      sycl_kernel_submit(sycl::range<1>(global_size), sycl::range<1>(kSoftcapWorkgroup), queue, kernel);
++    }
++  }
++}
++
++}  // namespace at::native::xpu
+diff --git a/src/sycl/xe35/VocabMask.cpp b/src/sycl/xe35/VocabMask.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..6df6879db3077d627ec9aee7be59dddab8ffa633
+--- /dev/null
++++ b/src/sycl/xe35/VocabMask.cpp
+@@ -0,0 +1,256 @@
++#include <ATen/ATen.h>
++#include <c10/xpu/XPUStream.h>
++#include <torch/all.h>
++
++#include "sgl_kernel/xe35/logits_vocab_ops.h"
++
++#include <sycl/sycl.hpp>
++
++#include "../MemoryAccess.h"
++#include "../SYCLHelpers.h"
++
++namespace at::native::xpu {
++namespace {
++
++template <typename Scalar>
++struct VocabMaskKernel {
++  const Scalar* __restrict__ input;
++  int64_t* __restrict__ mapped;
++  bool* __restrict__ invalid;
++  int64_t count;
++  int64_t org_start;
++  int64_t org_end;
++  int64_t added_start;
++  int64_t added_end;
++  int64_t added_offset;
++
++  void operator()(sycl::nd_item<1> item) const {
++    const int64_t i = item.get_global_id(0);
++    if (i >= count) {
++      return;
++    }
++    const int64_t value = static_cast<int64_t>(input[i]);
++    const bool org_valid = value >= org_start && value < org_end;
++    const bool added_valid = value >= added_start && value < added_end;
++    const bool valid = org_valid || added_valid;
++    const int64_t offset = (org_valid ? org_start : 0) + (added_valid ? added_offset : 0);
++    mapped[i] = valid ? value - offset : 0;
++    invalid[i] = !valid;
++  }
++};
++
++}  // namespace
++
++std::tuple<torch::Tensor, torch::Tensor> vocab_mask_xe35(
++    torch::Tensor input,
++    int64_t org_start,
++    int64_t org_end,
++    int64_t num_org_padding,
++    int64_t added_start,
++    int64_t added_end) {
++  TORCH_CHECK(input.is_xpu(), "input must be on XPU");
++  TORCH_CHECK(input.scalar_type() == at::kInt || input.scalar_type() == at::kLong, "input must be int32 or int64");
++  TORCH_CHECK(input.is_contiguous(), "input must be contiguous");
++  auto mapped = torch::empty(input.sizes(), input.options().dtype(at::kLong));
++  auto invalid = torch::empty(input.sizes(), input.options().dtype(at::kBool));
++  const int64_t count = input.numel();
++  if (count == 0) {
++    return {mapped, invalid};
++  }
++  constexpr int Workgroup = 256;
++  const auto global_size = ((count + Workgroup - 1) / Workgroup) * Workgroup;
++  const auto added_offset = added_start - (org_end - org_start) - num_org_padding;
++  auto queue = at::xpu::getCurrentXPUStream().queue();
++  if (input.scalar_type() == at::kInt) {
++    VocabMaskKernel<int32_t> kernel{
++        input.data_ptr<int32_t>(),
++        mapped.data_ptr<int64_t>(),
++        invalid.data_ptr<bool>(),
++        count,
++        org_start,
++        org_end,
++        added_start,
++        added_end,
++        added_offset};
++    sycl_kernel_submit(sycl::range<1>(global_size), sycl::range<1>(Workgroup), queue, kernel);
++  } else {
++    VocabMaskKernel<int64_t> kernel{
++        input.data_ptr<int64_t>(),
++        mapped.data_ptr<int64_t>(),
++        invalid.data_ptr<bool>(),
++        count,
++        org_start,
++        org_end,
++        added_start,
++        added_end,
++        added_offset};
++    sycl_kernel_submit(sycl::range<1>(global_size), sycl::range<1>(Workgroup), queue, kernel);
++  }
++  return {mapped, invalid};
++}
++
++namespace {
++
++template <typename Id, typename Scalar, bool Vectorized>
++struct MuseVocabEmbeddingKernel {
++  const Id* __restrict__ input;
++  const Scalar* __restrict__ weight;
++  Scalar* __restrict__ output;
++  int64_t n_tokens;
++  int64_t hidden;
++  int64_t row_stride;
++  int64_t groups_per_row;
++  int64_t org_start;
++  int64_t org_end;
++  int64_t added_start;
++  int64_t added_end;
++  int64_t added_offset;
++
++  void operator()(sycl::nd_item<1> item) const {
++    constexpr int Workgroup = 256;
++    constexpr int ValuesPerThread = Vectorized ? 8 : 4;
++    const int64_t row = item.get_group(0) / groups_per_row;
++    const int64_t tile = item.get_group(0) % groups_per_row;
++    const int64_t col = (tile * Workgroup + item.get_local_id(0)) * ValuesPerThread;
++    if (row >= n_tokens) return;
++    const int64_t token = static_cast<int64_t>(input[row]);
++    const bool original = token >= org_start && token < org_end;
++    const bool added = token >= added_start && token < added_end;
++    const bool valid = original || added;
++    const int64_t local = original ? token - org_start : token - added_offset;
++    if constexpr (Vectorized) {
++      using Vec = aligned_vector_loop<Scalar, 8>;
++      Vec result{};
++      if (valid) {
++        result = *reinterpret_cast<const Vec*>(weight + local * row_stride + col);
++      }
++      *reinterpret_cast<Vec*>(output + row * hidden + col) = result;
++    } else {
++      for (int j = 0; j < ValuesPerThread; ++j) {
++        if (col + j < hidden) {
++          output[row * hidden + col + j] = valid ? weight[local * row_stride + col + j] : static_cast<Scalar>(0.0f);
++        }
++      }
++    }
++  }
++};
++
++template <typename Id, typename Scalar, bool Vectorized>
++void launch_vocab_embedding(
++    const torch::Tensor& input,
++    const torch::Tensor& weight,
++    torch::Tensor& output,
++    int64_t org_start,
++    int64_t org_end,
++    int64_t added_start,
++    int64_t added_end,
++    int64_t added_offset,
++    sycl::queue& queue) {
++  constexpr int Workgroup = 256;
++  constexpr int ValuesPerThread = Vectorized ? 8 : 4;
++  const int64_t hidden = weight.size(1);
++  const int64_t groups_per_row = (hidden + Workgroup * ValuesPerThread - 1) / (Workgroup * ValuesPerThread);
++  MuseVocabEmbeddingKernel<Id, Scalar, Vectorized> kernel{
++      input.data_ptr<Id>(),
++      weight.data_ptr<Scalar>(),
++      output.data_ptr<Scalar>(),
++      input.numel(),
++      hidden,
++      weight.stride(0),
++      groups_per_row,
++      org_start,
++      org_end,
++      added_start,
++      added_end,
++      added_offset};
++  sycl_kernel_submit(
++      sycl::range<1>(input.numel() * groups_per_row * Workgroup), sycl::range<1>(Workgroup), queue, kernel);
++}
++
++template <typename Id>
++void dispatch_vocab_embedding(
++    const torch::Tensor& input,
++    const torch::Tensor& weight,
++    torch::Tensor& output,
++    int64_t org_start,
++    int64_t org_end,
++    int64_t added_start,
++    int64_t added_end,
++    int64_t added_offset,
++    sycl::queue& queue) {
++  const auto vector_aligned = [&](int64_t width) {
++    return weight.size(1) % 8 == 0 && weight.stride(0) % 8 == 0 &&
++           reinterpret_cast<uintptr_t>(weight.data_ptr()) % width == 0 &&
++           reinterpret_cast<uintptr_t>(output.data_ptr()) % width == 0;
++  };
++  if (weight.scalar_type() == at::kBFloat16) {
++    if (vector_aligned(16)) {
++      launch_vocab_embedding<Id, at::BFloat16, true>(
++          input, weight, output, org_start, org_end, added_start, added_end, added_offset, queue);
++    } else {
++      launch_vocab_embedding<Id, at::BFloat16, false>(
++          input, weight, output, org_start, org_end, added_start, added_end, added_offset, queue);
++    }
++  } else if (weight.scalar_type() == at::kHalf) {
++    if (vector_aligned(16)) {
++      launch_vocab_embedding<Id, at::Half, true>(
++          input, weight, output, org_start, org_end, added_start, added_end, added_offset, queue);
++    } else {
++      launch_vocab_embedding<Id, at::Half, false>(
++          input, weight, output, org_start, org_end, added_start, added_end, added_offset, queue);
++    }
++  } else {
++    if (vector_aligned(32)) {
++      launch_vocab_embedding<Id, float, true>(
++          input, weight, output, org_start, org_end, added_start, added_end, added_offset, queue);
++    } else {
++      launch_vocab_embedding<Id, float, false>(
++          input, weight, output, org_start, org_end, added_start, added_end, added_offset, queue);
++    }
++  }
++}
++
++}  // namespace
++
++void vocab_parallel_embedding_xe35(
++    torch::Tensor input,
++    torch::Tensor weight,
++    torch::Tensor output,
++    int64_t org_start,
++    int64_t org_end,
++    int64_t num_org_padding,
++    int64_t added_start,
++    int64_t added_end) {
++  TORCH_CHECK(input.is_xpu() && weight.is_xpu() && output.is_xpu(), "vocab embedding requires XPU tensors");
++  TORCH_CHECK(
++      (input.scalar_type() == at::kInt || input.scalar_type() == at::kLong) && input.is_contiguous(),
++      "vocab embedding requires contiguous int32/int64 IDs");
++  TORCH_CHECK(
++      weight.dim() == 2 && weight.stride(1) == 1 &&
++          (weight.scalar_type() == at::kBFloat16 || weight.scalar_type() == at::kHalf ||
++           weight.scalar_type() == at::kFloat),
++      "invalid vocab embedding weights");
++  TORCH_CHECK(
++      output.scalar_type() == weight.scalar_type() && output.is_contiguous() && output.dim() == input.dim() + 1 &&
++          output.size(-1) == weight.size(1),
++      "invalid vocab embedding output");
++  for (int64_t i = 0; i < input.dim(); ++i) {
++    TORCH_CHECK(output.size(i) == input.size(i), "vocab embedding leading dimensions must match");
++  }
++  TORCH_CHECK(
++      org_start >= 0 && org_start <= org_end && added_start <= added_end && num_org_padding >= 0 &&
++          org_end - org_start + num_org_padding + added_end - added_start <= weight.size(0),
++      "vocab embedding windows exceed the local shard");
++  if (input.numel() == 0 || weight.size(1) == 0) return;
++  auto queue = at::xpu::getCurrentXPUStream().queue();
++  const int64_t added_offset = added_start - (org_end - org_start) - num_org_padding;
++  if (input.scalar_type() == at::kInt) {
++    dispatch_vocab_embedding<int32_t>(
++        input, weight, output, org_start, org_end, added_start, added_end, added_offset, queue);
++  } else {
++    dispatch_vocab_embedding<int64_t>(
++        input, weight, output, org_start, org_end, added_start, added_end, added_offset, queue);
++  }
++}
++
++}  // namespace at::native::xpu
+diff --git a/src/torch_extension_sycl.cc b/src/torch_extension_sycl.cc
+index 8603e536b016ae275cc7e77d48e1a312532d48c2..559fc1dbade28b6733ab3e3d554a9cb24321a919 100644
+--- a/src/torch_extension_sycl.cc
++++ b/src/torch_extension_sycl.cc
+@@ -58,6 +58,22 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
+   m.def("hadamard_transform(Tensor input, float scale=1.0) -> Tensor");
+   m.impl("hadamard_transform", torch::kXPU, &at::native::xpu::hadamard_transform);
+ 
++#if SYCL_INTEL_TARGET == 35
++  m.def(
++      "vocab_mask_xe35(Tensor input, int org_start, int org_end, int num_org_padding, int added_start, "
++      "int added_end) -> (Tensor, Tensor)");
++  m.impl("vocab_mask_xe35", torch::kXPU, &at::native::xpu::vocab_mask_xe35);
++
++  m.def(
++      "vocab_parallel_embedding_xe35(Tensor input, Tensor weight, Tensor! output, int org_start, "
++      "int org_end, int num_org_padding, int added_start, int added_end) -> ()");
++  m.impl("vocab_parallel_embedding_xe35", torch::kXPU, &at::native::xpu::vocab_parallel_embedding_xe35);
++
++  m.def("softcap_logits_xe35(Tensor(a!) logits, float cap) -> ()");
++  m.impl("softcap_logits_xe35", torch::kXPU, &at::native::xpu::softcap_logits_xe35);
++
++#endif
++
+   m.def("topk_softmax(Tensor! topk_weights, Tensor! topk_indices, Tensor gating_output, bool renormalize) -> ()");
+   m.impl("topk_softmax", torch::kXPU, &at::native::xpu::topk_softmax);
+ 
+diff --git a/tests/test_logits_benchmark_scope.py b/tests/test_logits_benchmark_scope.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..4283c4595c6a1abff66ebfea2b0438a73cb6608a
+--- /dev/null
++++ b/tests/test_logits_benchmark_scope.py
+@@ -0,0 +1,33 @@
++import os
++import subprocess
++import sys
++from pathlib import Path
++
++import pytest
++
++
++@pytest.mark.parametrize("batch", [1, 7, 9])
++def test_logits_benchmark_rejects_serving_batch_before_imports(batch):
++    benchmark = Path(__file__).resolve().parents[1] / "benchmark" / "bench_logits_vocab_sweep.py"
++    result = subprocess.run(
++        [sys.executable, "-S", str(benchmark), "--batch", str(batch)],
++        capture_output=True,
++        text=True,
++        timeout=10,
++    )
++    assert result.returncode == 2
++    assert "B8/ISL4096/OSL16/TP1/EP1" in result.stderr
++    assert "ModuleNotFoundError" not in result.stderr
++
++
++def test_logits_benchmark_rejects_environment_batch_before_imports():
++    benchmark = Path(__file__).resolve().parents[1] / "benchmark" / "bench_logits_vocab_sweep.py"
++    result = subprocess.run(
++        [sys.executable, "-S", str(benchmark)],
++        env={**os.environ, "BATCHES": "7"},
++        capture_output=True,
++        text=True,
++        timeout=10,
++    )
++    assert result.returncode == 2
++    assert "ModuleNotFoundError" not in result.stderr
+diff --git a/tests/test_softcap_logits.py b/tests/test_softcap_logits.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..bc492db46894a9d2dfc1a3062dc9e9bd052fd7e5
+--- /dev/null
++++ b/tests/test_softcap_logits.py
+@@ -0,0 +1,82 @@
++import pytest
++import sgl_kernel
++import torch
++
++
++pytestmark = pytest.mark.skipif(
++    not torch.xpu.is_available() or not sgl_kernel.is_xe3_arch(),
++    reason="Xe35 kernels require compute capability 3.5",
++)
++
++
++def _softcap_tolerance(dtype):
++    return {
++        torch.bfloat16: 5e-3,
++        torch.float16: 1e-3,
++        torch.float32: 3e-5,
++    }[dtype]
++
++
++def test_softcap_logits_strided():
++    if not torch.xpu.is_available():
++        pytest.skip("XPU unavailable")
++    source = torch.randn(3, 17, device="xpu", dtype=torch.float32)
++    logits = source[:, :13]
++    before = logits.clone()
++    tail = source[:, 13:].clone()
++    torch.ops.sgl_kernel.softcap_logits_xe35(logits, 30.0)
++    torch.testing.assert_close(logits, torch.tanh(before / 30.0) * 30.0)
++    torch.testing.assert_close(source[:, 13:], tail, atol=0, rtol=0)
++
++
++@pytest.mark.parametrize("width", [32, 33])
++@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.float16])
++def test_softcap_logits_contiguous(width, dtype):
++    if not torch.xpu.is_available():
++        pytest.skip("XPU unavailable")
++    source = (
++        torch.linspace(-90, 90, 4 * width, device="xpu").to(dtype).reshape(4, width)
++    )
++    logits = source.clone()
++    torch.ops.sgl_kernel.softcap_logits_xe35(logits, 30.0)
++    expected = torch.tanh(source.cpu().float() / 30.0) * 30.0
++    tolerance = _softcap_tolerance(dtype)
++    torch.testing.assert_close(
++        logits.float().cpu(), expected, rtol=tolerance, atol=tolerance
++    )
++
++
++def test_softcap_logits_vector_accuracy_across_zero_and_saturation():
++    if not torch.xpu.is_available():
++        pytest.skip("XPU unavailable")
++    source = torch.linspace(-900.0, 900.0, 2048, device="xpu", dtype=torch.float32)
++    source[:8] = torch.tensor(
++        [0.0, 1e-6, -1e-6, 0.001, -0.001, 2.99, 3.01, -3.01],
++        device="xpu",
++        dtype=torch.float32,
++    )
++    logits = source.clone().reshape(8, 256)
++    torch.ops.sgl_kernel.softcap_logits_xe35(logits, 30.0)
++    torch.testing.assert_close(
++        logits, (torch.tanh(source / 30.0) * 30.0).reshape(8, 256), rtol=3e-5, atol=3e-5
++    )
++
++
++@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.float16])
++@pytest.mark.parametrize("width", [33, 4097, 202048])
++def test_softcap_logits_independent_reference(width, dtype):
++    if not torch.xpu.is_available():
++        pytest.skip("XPU unavailable")
++    # Muse-Spark production softcap: B8, vocab202048, TP1/EP1; other widths are tails.
++    source_cpu = (
++        torch.linspace(-100, 100, 8 * width, dtype=torch.float64)
++        .to(dtype)
++        .reshape(8, width)
++    )
++    expected = 20 * torch.tanh(source_cpu.double() / 20)
++    logits = source_cpu.to("xpu")
++    torch.ops.sgl_kernel.softcap_logits_xe35(logits, 20.0)
++    tolerance = _softcap_tolerance(dtype)
++    torch.testing.assert_close(
++        logits.cpu().double(), expected, atol=tolerance, rtol=tolerance
++    )
+diff --git a/tests/test_vocab_mask.py b/tests/test_vocab_mask.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..c82a78450b40f1e8f1dd51cb8b9454d77816acbc
+--- /dev/null
++++ b/tests/test_vocab_mask.py
+@@ -0,0 +1,126 @@
++import pytest
++import sgl_kernel
++import torch
++
++
++pytestmark = pytest.mark.skipif(
++    not torch.xpu.is_available() or not sgl_kernel.is_xe3_arch(),
++    reason="Xe35 kernels require compute capability 3.5",
++)
++
++
++@pytest.mark.parametrize("id_dtype", [torch.int32, torch.int64])
++@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.float16])
++@pytest.mark.parametrize("vocab,hidden", [(128, 33), (202048, 4096)])
++def test_vocab_parallel_embedding_independent_exact(vocab, hidden, dtype, id_dtype):
++    if not torch.xpu.is_available():
++        pytest.skip("XPU unavailable")
++    # Muse-Spark production embedding: B8, vocab202048, hidden4096, TP1/EP1.
++    ids_cpu = torch.tensor(
++        [-1, 0, 1, vocab // 2, vocab - 2, vocab - 1, vocab, vocab + 1], dtype=id_dtype
++    )
++    columns_cpu = (torch.arange(hidden, dtype=torch.float64) % 16) * 0.0625
++    rows = torch.arange(vocab, device="xpu", dtype=torch.float32).view(-1, 1) * 0.125
++    weight = (rows + columns_cpu.float().to("xpu")).to(dtype)
++    output = torch.empty(8, hidden, device="xpu", dtype=dtype)
++    torch.ops.sgl_kernel.vocab_parallel_embedding_xe35(
++        ids_cpu.to("xpu"), weight, output, 0, vocab, 0, vocab, vocab
++    )
++    invalid = (ids_cpu < 0) | (ids_cpu >= vocab)
++    expected = (
++        ids_cpu.clamp(0, vocab - 1).double().view(-1, 1) * 0.125 + columns_cpu
++    ).to(dtype)
++    expected[invalid] = 0
++    torch.testing.assert_close(output.cpu(), expected, atol=0, rtol=0)
++
++
++@pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
++def test_vocab_mask_boundaries(dtype):
++    if not torch.xpu.is_available():
++        pytest.skip("XPU unavailable")
++    org_start, org_end, padding = 100, 151, 13
++    added_start, added_end = 200, 207
++    values = [
++        -1,
++        0,
++        org_start - 1,
++        org_start,
++        org_end - 1,
++        org_end,
++        added_start - 1,
++        added_start,
++        added_end - 1,
++        added_end,
++        100000,
++    ]
++    input_ids = torch.tensor(values * 3, dtype=dtype, device="xpu")
++    mapped, invalid = torch.ops.sgl_kernel.vocab_mask_xe35(
++        input_ids, org_start, org_end, padding, added_start, added_end
++    )
++    org_valid = (input_ids >= org_start) & (input_ids < org_end)
++    added_valid = (input_ids >= added_start) & (input_ids < added_end)
++    offset = (
++        org_start * org_valid
++        + (added_start - (org_end - org_start) - padding) * added_valid
++    )
++    valid = org_valid | added_valid
++    torch.testing.assert_close(mapped, (input_ids - offset) * valid)
++    torch.testing.assert_close(invalid, ~valid)
++
++
++@pytest.mark.parametrize("tp_rank", [0, 1])
++@pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
++def test_vocab_mask_tp2_shards(tp_rank, dtype):
++    """Check both TP2 shard index mappings on one XPU without multi-GPU collectives."""
++    if not torch.xpu.is_available():
++        pytest.skip("XPU unavailable")
++
++    device = torch.device("xpu:0")
++    ids = torch.tensor(
++        [0, 511, 512, 1009, 1010, 1025, 1026, -1],
++        device=device,
++        dtype=dtype,
++    )
++    if tp_rank == 0:
++        # 1010 original tokens are padded to 1024, then 16 added tokens.
++        args = (0, 512, 0, 1010, 1026)
++        mapped = [0, 511, 0, 0, 512, 527, 0, 0]
++        invalid = [False, False, True, True, False, False, True, True]
++    else:
++        args = (512, 1010, 14, 1026, 1026)
++        mapped = [0, 0, 0, 497, 0, 0, 0, 0]
++        invalid = [True, True, False, False, True, True, True, True]
++
++    actual_mapped, actual_invalid = torch.ops.sgl_kernel.vocab_mask_xe35(ids, *args)
++    torch.testing.assert_close(
++        actual_mapped, torch.tensor(mapped, device=device, dtype=torch.int64)
++    )
++    torch.testing.assert_close(
++        actual_invalid, torch.tensor(invalid, device=device, dtype=torch.bool)
++    )
++    assert actual_mapped.device == device
++    assert actual_invalid.device == device
++
++    # Also exercise the framework dispatch, which must route XPU inputs here.
++    from sglang.srt.layers.vocab_parallel_embedding import get_masked_input_and_mask
++
++    mapped_from_layer, invalid_from_layer = get_masked_input_and_mask(ids, *args)
++    torch.testing.assert_close(mapped_from_layer, actual_mapped)
++    torch.testing.assert_close(invalid_from_layer, actual_invalid)
++
++
++def test_vocab_mask_subgroup_size_boundary():
++    if not torch.xpu.is_available():
++        pytest.skip("XPU unavailable")
++    ids = torch.tensor(
++        [0, 511, 512, 1009, 1010, 1025, 1026, -1] * 4, device="xpu", dtype=torch.int64
++    )
++    mapped, invalid = torch.ops.sgl_kernel.vocab_mask_xe35(ids, 0, 512, 0, 1010, 1026)
++    expected_mapped = torch.tensor(
++        [0, 511, 0, 0, 512, 527, 0, 0] * 4, device="xpu", dtype=torch.int64
++    )
++    expected_invalid = torch.tensor(
++        [False, False, True, True, False, False, True, True] * 4, device="xpu"
++    )
++    torch.testing.assert_close(mapped, expected_mapped)
++    torch.testing.assert_close(invalid, expected_invalid)

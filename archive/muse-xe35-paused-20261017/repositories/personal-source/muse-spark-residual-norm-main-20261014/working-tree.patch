@@ -1,0 +1,683 @@
+diff --git a/benchmark/bench_fused_norm_residual_graph_review.py b/benchmark/bench_fused_norm_residual_graph_review.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..f5395a84b38bcd700cf4f55abff8129dc699656f
+--- /dev/null
++++ b/benchmark/bench_fused_norm_residual_graph_review.py
+@@ -0,0 +1,130 @@
++"""Paired graph replay timings for the residual norm review."""
++
++import argparse
++import json
++import os
++import statistics
++import time
++
++import torch
++
++from bench_fused_norm_residual_review import (
++    framework_triton_components,
++    fused,
++    framework_triton,
++    framework_triton_w4,
++    framework_triton_w16,
++    framework_triton_w32,
++    inputs,
++    main_sycl,
++    parse_shape,
++)
++
++
++PROVIDERS = {
++    "fused": fused,
++    "framework_triton": framework_triton,
++    "framework_triton_w4": framework_triton_w4,
++    "framework_triton_w16": framework_triton_w16,
++    "framework_triton_w32": framework_triton_w32,
++    "main_sycl": main_sycl,
++}
++
++
++def capture(op, args, tensors):
++    for _ in range(args.warmup):
++        op(args, tensors)
++    torch.xpu.synchronize()
++    graph = torch.xpu.XPUGraph()
++    with torch.xpu.graph(graph):
++        for _ in range(args.graph_iterations):
++            op(args, tensors)
++    torch.xpu.synchronize()
++    for _ in range(3):
++        graph.replay()
++    torch.xpu.synchronize()
++    return graph
++
++
++def run(args):
++    _, resolve, _ = framework_triton_components()
++    print(
++        json.dumps({
++            "device": torch.xpu.get_device_name(0),
++            "gpu_index": 0,
++            "host_gpu_affinity": os.environ.get("ZE_AFFINITY_MASK"),
++            "torch": torch.__version__,
++            "timing": "torch.xpu.Event enclosing one graph replay",
++            "graph_iterations": args.graph_iterations,
++            "samples": args.samples,
++            "providers": args.providers,
++            "dtype": "branch/weights/output BF16; stream/alpha/beta FP32",
++            "layout": "row-major contiguous; identical tensors per provider",
++            "eps": [1e-8, 1e-5],
++            "round_pre_norm_input": True,
++        }),
++        flush=True,
++    )
++    for rows, hidden in args.shape:
++        tensors = inputs(rows, hidden)
++        m_bucket = 0 if rows <= 256 else (1 if rows <= 2048 else 2)
++        warps, stages, extra = resolve(hidden, m_bucket, rows, False)
++        print(
++            json.dumps({
++                "rows": rows,
++                "hidden": hidden,
++                "triton_resolved": {
++                    "num_warps": warps, "num_stages": stages, "extra": extra
++                },
++                "post_mode": args.post_mode,
++            }),
++            flush=True,
++        )
++        graphs = {
++            name: capture(PROVIDERS[name], args, tensors)
++            for name in args.providers
++        }
++        samples = {name: [] for name in graphs}
++        for repeat in range(args.samples):
++            names = list(graphs)
++            if repeat % 2:
++                names.reverse()
++            for name in names:
++                start = torch.xpu.Event(enable_timing=True)
++                end = torch.xpu.Event(enable_timing=True)
++                start.record()
++                graphs[name].replay()
++                end.record()
++                end.synchronize()
++                samples[name].append(
++                    start.elapsed_time(end) * 1000 / args.graph_iterations
++                )
++        for name, values in samples.items():
++            print(
++                json.dumps({
++                    "provider": name,
++                    "rows": rows,
++                    "hidden": hidden,
++                    "post_mode": args.post_mode,
++                    "samples_us": values,
++                    "p50_us": statistics.median(values),
++                    "range_us": [min(values), max(values)],
++                }),
++                flush=True,
++            )
++        del graphs, tensors
++        torch.xpu.synchronize()
++        time.sleep(2)
++
++
++if __name__ == "__main__":
++    parser = argparse.ArgumentParser()
++    parser.add_argument("--shape", type=parse_shape, action="append", required=True)
++    parser.add_argument("--post-mode", choices=["none", "weight"], default="none")
++    parser.add_argument("--providers", nargs="+", choices=PROVIDERS, default=list(PROVIDERS))
++    parser.add_argument("--warmup", type=int, default=15)
++    parser.add_argument("--graph-iterations", type=int, default=40)
++    parser.add_argument("--samples", type=int, default=11)
++    args = parser.parse_args()
++    args.round_pre_norm_input = True
++    run(args)
+diff --git a/benchmark/bench_fused_norm_residual_review.py b/benchmark/bench_fused_norm_residual_review.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..f4b69373a714c10638daaca49c954c67b281e4f9
+--- /dev/null
++++ b/benchmark/bench_fused_norm_residual_review.py
+@@ -0,0 +1,296 @@
++"""Device-event comparison of fused post norm/residual/pre norm and main PyTorch."""
++
++import argparse
++from functools import lru_cache
++import json
++import os
++from pathlib import Path
++import statistics
++import time
++
++import sgl_kernel  # noqa: F401
++import torch
++
++
++def inputs(rows: int, hidden: int):
++    torch.manual_seed(1000 + rows + hidden)
++    branch = torch.randn(rows, hidden, device="xpu", dtype=torch.bfloat16)
++    stream = torch.randn(rows, hidden, device="xpu", dtype=torch.float32)
++    post_weight = torch.randn(hidden, device="xpu", dtype=torch.bfloat16)
++    pre_weight = torch.randn(hidden, device="xpu", dtype=torch.bfloat16)
++    alpha = torch.rand(hidden, device="xpu")
++    beta = torch.rand(hidden, device="xpu")
++    output = torch.empty_like(branch)
++    new_stream = torch.empty_like(stream)
++    post_identity = torch.ones_like(post_weight)
++    post_result = torch.empty_like(branch)
++    return branch, stream, post_weight, pre_weight, alpha, beta, output, new_stream, post_identity, post_result
++
++
++def parse_shape(value: str):
++    try:
++        rows, hidden = (int(part) for part in value.split(":"))
++    except (ValueError, TypeError) as exc:
++        raise argparse.ArgumentTypeError("shape must be ROWS:HIDDEN") from exc
++    if rows <= 0 or hidden <= 0 or hidden % 8:
++        raise argparse.ArgumentTypeError("ROWS must be positive and HIDDEN a positive multiple of 8")
++    return rows, hidden
++
++
++def fused(args, tensors):
++    branch, stream, post_weight, pre_weight, alpha, beta, output, new_stream = tensors[:8]
++    torch.ops.sgl_kernel.fused_post_norm_residual_pre_norm(
++        branch,
++        stream,
++        post_weight if args.post_mode != "none" else post_weight[:0],
++        pre_weight,
++        alpha,
++        beta,
++        output,
++        new_stream,
++        1e-8,
++        1e-5,
++        args.post_mode == "input_scale",
++        args.round_pre_norm_input,
++        None,
++    )
++    return output, new_stream
++
++
++def main_torch(args, tensors, return_post=False):
++    branch, stream, post_weight, pre_weight, alpha, beta, _, _ = tensors[:8]
++    post_input = branch.float()
++    if args.post_mode == "input_scale":
++        post_input = post_input * post_weight.float()
++    post_rstd = torch.rsqrt(post_input.square().mean(dim=-1, keepdim=True) + 1e-8)
++    normed = post_input * post_rstd
++    if args.post_mode == "weight":
++        normed = normed * post_weight.float()
++    rounded_post = normed.bfloat16()
++    new_stream = alpha * stream + beta * rounded_post.float()
++    pre_input = (
++        new_stream.bfloat16().float()
++        if args.round_pre_norm_input
++        else new_stream
++    )
++    pre_rstd = torch.rsqrt(pre_input.square().mean(dim=-1, keepdim=True) + 1e-5)
++    output = (pre_input * pre_rstd * pre_weight.float()).bfloat16()
++    if return_post:
++        return output, new_stream, rounded_post
++    return output, new_stream
++
++
++def main_sycl(args, tensors):
++    if args.post_mode == "input_scale" or not args.round_pre_norm_input:
++        raise ValueError(
++            "main BF16 rmsnorm composition requires post input scaling off "
++            "and BF16 rounding before pre norm"
++        )
++    branch, stream, post_weight, pre_weight, alpha, beta, output, _ = tensors[:8]
++    post_identity = tensors[8]
++    post_result = tensors[9]
++    torch.ops.sgl_kernel.rmsnorm(
++        post_result,
++        branch,
++        post_weight if args.post_mode == "weight" else post_identity,
++        1e-8,
++    )
++    new_stream = alpha * stream + beta * post_result.float()
++    pre_input = new_stream.bfloat16()
++    torch.ops.sgl_kernel.rmsnorm(output, pre_input, pre_weight, 1e-5)
++    return output, new_stream
++
++
++@lru_cache(maxsize=1)
++def framework_triton_components():
++    import triton
++    from sglang_meta_common.ops.fused_norm_residual import (
++        _fused_norm_residual_config,
++        _fused_norm_residual_triton_kernel,
++    )
++    return triton, _fused_norm_residual_config, _fused_norm_residual_triton_kernel
++
++
++def framework_triton(args, tensors, warp_override=None):
++    if args.post_mode == "input_scale":
++        raise ValueError("framework Triton input-scale path has an extra BF16 pre-normalization round")
++    triton, _fused_norm_residual_config, _fused_norm_residual_triton_kernel = framework_triton_components()
++
++    branch, stream, post_weight, pre_weight, alpha, beta, output, new_stream = tensors[:8]
++    rows, hidden = branch.shape
++    m_bucket = 0 if rows <= 256 else (1 if rows <= 2048 else 2)
++    num_warps, num_stages, extra = _fused_norm_residual_config(
++        hidden, m_bucket, rows, False
++    )
++    if warp_override is not None:
++        num_warps = warp_override
++    _fused_norm_residual_triton_kernel[(rows,)](
++        branch,
++        stream,
++        output,
++        new_stream,
++        new_stream,
++        post_weight if args.post_mode == "weight" else post_weight[:0],
++        pre_weight,
++        alpha,
++        beta,
++        1e-8,
++        1e-5,
++        hidden,
++        triton.next_power_of_2(hidden),
++        False,
++        True,
++        True,
++        args.post_mode == "weight",
++        True,
++        False,
++        args.round_pre_norm_input,
++        m_bucket,
++        num_warps=num_warps,
++        num_stages=num_stages,
++        **extra,
++    )
++    return output, new_stream
++
++
++def framework_triton_w4(args, tensors):
++    return framework_triton(args, tensors, warp_override=4)
++
++
++def framework_triton_w16(args, tensors):
++    return framework_triton(args, tensors, warp_override=16)
++
++
++def framework_triton_w32(args, tensors):
++    return framework_triton(args, tensors, warp_override=32)
++
++
++def measure(providers, args, tensors):
++    for name, op in providers.items():
++        if name.startswith("wg"):
++            os.environ["SGL_KERNEL_REVIEW_WG"] = name[2:]
++        else:
++            os.environ.pop("SGL_KERNEL_REVIEW_WG", None)
++        for _ in range(args.warmup):
++            op(args, tensors)
++    torch.xpu.synchronize()
++    samples = {name: [] for name in providers}
++    for repeat in range(args.repeats):
++        order = list(providers)
++        if repeat % 2:
++            order.reverse()
++        for name in order:
++            if name.startswith("wg"):
++                os.environ["SGL_KERNEL_REVIEW_WG"] = name[2:]
++            else:
++                os.environ.pop("SGL_KERNEL_REVIEW_WG", None)
++            start = torch.xpu.Event(enable_timing=True)
++            end = torch.xpu.Event(enable_timing=True)
++            start.record()
++            for _ in range(args.iterations):
++                providers[name](args, tensors)
++            end.record()
++            end.synchronize()
++            samples[name].append(start.elapsed_time(end) * 1000 / args.iterations)
++    return samples
++
++
++def run(args):
++    loaded_fused_libraries = sorted(
++        {
++            line.split()[-1]
++            for line in Path("/proc/self/maps").read_text().splitlines()
++            if "libsgl-ops-sycl-FusedNormResidual.so" in line
++        }
++    )
++    print(
++        json.dumps(
++            {
++                "device": torch.xpu.get_device_name(0),
++                "gpu_index": 0,
++                "torch": torch.__version__,
++                "package": sgl_kernel.__file__,
++                "loaded_fused_libraries": loaded_fused_libraries,
++                "branch_dtype": "bfloat16",
++                "stream_dtype": "float32",
++                "weight_dtype": "bfloat16",
++                "factor_dtype": "float32",
++                "layout": "row-major contiguous",
++                "timing": "torch.xpu.Event, microseconds per invocation",
++                "order": "alternated per repeat",
++                "initial_warmup": args.initial_warmup,
++                "warmup": args.warmup,
++                "repeats": args.repeats,
++                "iterations": args.iterations,
++                "serving": "Muse Spark B8/ISL4096/OSL16/TP1/EP1",
++            }
++        ),
++        flush=True,
++    )
++    available = {
++        "fused": fused,
++        "main_torch": main_torch,
++        "main_sycl": main_sycl,
++        "framework_triton": framework_triton,
++        "framework_triton_w4": framework_triton_w4,
++        "framework_triton_w16": framework_triton_w16,
++        "framework_triton_w32": framework_triton_w32,
++        "wg256": fused,
++        "wg512": fused,
++        "wg1024": fused,
++    }
++    providers = {name: available[name] for name in args.providers}
++    initial = inputs(8, 8192)
++    for name, op in providers.items():
++        if name.startswith("wg"):
++            os.environ["SGL_KERNEL_REVIEW_WG"] = name[2:]
++        else:
++            os.environ.pop("SGL_KERNEL_REVIEW_WG", None)
++        for _ in range(args.initial_warmup):
++            op(args, initial)
++    torch.xpu.synchronize()
++    time.sleep(2)
++    shapes = args.shape or [(rows, hidden) for rows in args.rows for hidden in args.hidden]
++    for rows, hidden in shapes:
++        tensors = inputs(rows, hidden)
++        measured = measure(providers, args, tensors)
++        for provider, samples in measured.items():
++            result = {
++                "provider": provider,
++                "rows": rows,
++                "hidden": hidden,
++                "post_mode": args.post_mode,
++                "round_pre_norm_input": args.round_pre_norm_input,
++                "samples_us": samples,
++                "p50_us": statistics.median(samples),
++                "range_us": [min(samples), max(samples)],
++            }
++            print(json.dumps(result), flush=True)
++        torch.xpu.synchronize()
++        time.sleep(2)
++
++
++if __name__ == "__main__":
++    parser = argparse.ArgumentParser()
++    parser.add_argument("--rows", type=int, nargs="+", default=[8, 32768])
++    parser.add_argument("--hidden", type=int, nargs="+", default=[8192])
++    parser.add_argument("--shape", type=parse_shape, action="append")
++    parser.add_argument(
++        "--post-mode", choices=["none", "weight", "input_scale"], default="none"
++    )
++    parser.add_argument("--round-pre-norm-input", action="store_true")
++    parser.add_argument("--warmup", type=int, default=5)
++    parser.add_argument("--initial-warmup", type=int, default=50)
++    parser.add_argument("--repeats", type=int, default=7)
++    parser.add_argument("--iterations", type=int, default=20)
++    parser.add_argument(
++        "--providers",
++        choices=[
++            "fused", "main_torch", "main_sycl", "framework_triton",
++            "framework_triton_w4", "framework_triton_w16", "framework_triton_w32",
++            "wg256", "wg512", "wg1024",
++        ],
++        nargs="+",
++        default=["fused", "main_torch"],
++    )
++    run(parser.parse_args())
+diff --git a/benchmark/build_fused_norm_residual_review_ops.py b/benchmark/build_fused_norm_residual_review_ops.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..a450311b1476be4d9420eb33924846d0e047a8b5
+--- /dev/null
++++ b/benchmark/build_fused_norm_residual_review_ops.py
+@@ -0,0 +1,33 @@
++"""Build only the registration needed for targeted residual-norm source tests."""
++
++import os
++from pathlib import Path
++
++from torch.utils.cpp_extension import load
++
++
++ROOT = Path(__file__).resolve().parents[1]
++BUILD = ROOT / "review_logs" / "ops"
++BUILD.mkdir(parents=True, exist_ok=True)
++os.environ["MAX_JOBS"] = "1"
++
++load(
++    name="sgl_kernel_review_ops",
++    sources=[str(ROOT / "benchmark" / "fused_norm_residual_review_ops.cpp")],
++    extra_include_paths=[str(ROOT / "include")],
++    extra_ldflags=[
++        str(ROOT / "build" / "src" / "libsgl-ops-sycl-FusedNormResidual.so"),
++        str(ROOT / "build" / "src" / "libsgl-ops-sycl-RMSNorm.so"),
++        f"-Wl,-rpath,{ROOT / 'build' / 'src'}",
++    ],
++    build_directory=str(BUILD),
++    is_python_module=False,
++    verbose=True,
++)
++
++site = ROOT / "review_logs" / "local_site" / "sgl_kernel"
++site.mkdir(parents=True, exist_ok=True)
++(site / "__init__.py").write_text(
++    "import torch\n"
++    f"torch.ops.load_library({str(BUILD / 'sgl_kernel_review_ops.so')!r})\n"
++)
+diff --git a/benchmark/check_fused_norm_residual_review.py b/benchmark/check_fused_norm_residual_review.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..c82e07d867a9d201fc48cd420aaa0819c2917760
+--- /dev/null
++++ b/benchmark/check_fused_norm_residual_review.py
+@@ -0,0 +1,161 @@
++"""Check residual-norm outputs against an independent CPU PyTorch evaluation."""
++
++import argparse
++import json
++import time
++
++import torch
++
++from bench_fused_norm_residual_review import (
++    framework_triton,
++    framework_triton_w16,
++    framework_triton_w32,
++    fused,
++    inputs,
++    main_sycl,
++    main_torch,
++    parse_shape,
++)
++
++
++def bf16_ordered(value):
++    bits = value.view(torch.int16).to(torch.int32) & 0xFFFF
++    return torch.where(bits & 0x8000 != 0, 0x8000 - (bits & 0x7FFF), 0x8000 + bits)
++
++
++def main():
++    parser = argparse.ArgumentParser()
++    parser.add_argument("--rows", type=int, nargs="+", default=[8])
++    parser.add_argument("--hidden", type=int, nargs="+", default=[8192])
++    parser.add_argument("--shape", type=parse_shape, action="append")
++    parser.add_argument(
++        "--post-mode", choices=["none", "weight", "input_scale"], default="none"
++    )
++    parser.add_argument("--round-pre-norm-input", action="store_true")
++    parser.add_argument(
++        "--providers",
++        choices=[
++            "fused", "main_torch", "main_sycl", "framework_triton",
++            "framework_triton_w16", "framework_triton_w32",
++        ],
++        nargs="+",
++        default=["fused", "main_torch"],
++    )
++    args = parser.parse_args()
++    providers = {
++        "fused": fused,
++        "main_torch": main_torch,
++        "main_sycl": main_sycl,
++        "framework_triton": framework_triton,
++        "framework_triton_w16": framework_triton_w16,
++        "framework_triton_w32": framework_triton_w32,
++    }
++    shapes = args.shape or [(rows, hidden) for rows in args.rows for hidden in args.hidden]
++    acceptance = {name: {"shapes_pass": 0, "shapes_fail": 0, "output_fail": 0, "stream_fail": 0} for name in args.providers}
++    for rows, hidden in shapes:
++        tensors = inputs(rows, hidden)
++        selected = (
++            [0, 1, rows // 2, rows - 1] if rows > 1024 else slice(None)
++        )
++        cpu_tensors = tuple(
++            (t[selected] if t.dim() == 2 else t).cpu() for t in tensors[:6]
++        ) + (None, None)
++        expected_output, expected_stream, rounded_post = main_torch(args, cpu_tensors, return_post=True)
++        upper = torch.nextafter(rounded_post, torch.full_like(rounded_post, float("inf")))
++        lower = torch.nextafter(rounded_post, torch.full_like(rounded_post, float("-inf")))
++        post_ulp = torch.maximum(
++            upper.float() - rounded_post.float(),
++            rounded_post.float() - lower.float(),
++        )
++        stream_bound = 1e-5 + cpu_tensors[5].abs() * post_ulp
++        output_bound = 0.02 + 0.02 * expected_output.float().abs()
++        values = {}
++        for provider in args.providers:
++            output, stream = providers[provider](args, tensors)
++            output = output[selected].cpu()
++            stream = stream[selected].cpu()
++            values[provider] = (output, stream)
++            ulps = (bf16_ordered(output) - bf16_ordered(expected_output)).abs()
++            output_error = (output.float() - expected_output.float()).abs()
++            stream_error = (stream - expected_stream).abs()
++            output_bad = output_error > output_bound
++            stream_bad = stream_error > stream_bound
++            output_fail = int(output_bad.sum())
++            stream_fail = int(stream_bad.sum())
++            accepted = output_fail == 0 and stream_fail == 0
++            acceptance[provider]["shapes_pass" if accepted else "shapes_fail"] += 1
++            acceptance[provider]["output_fail"] += output_fail
++            acceptance[provider]["stream_fail"] += stream_fail
++            worst = int(ulps.reshape(-1).argmax())
++            worst_output = int((output_error - output_bound).reshape(-1).argmax())
++            worst_stream = int((stream_error - stream_bound).reshape(-1).argmax())
++            print(
++                json.dumps(
++                    {
++                        "provider": provider,
++                        "rows": rows,
++                        "hidden": hidden,
++                        "checked_rows": 4 if rows > 1024 else rows,
++                        "post_mode": args.post_mode,
++                        "round_pre_norm_input": args.round_pre_norm_input,
++                        "output_max_ulp": int(ulps.max()),
++                        "output_over_2_ulp": int((ulps > 2).sum()),
++                        "output_max_abs": float(output_error.max()),
++                        "worst_ulp_expected": float(
++                            expected_output.reshape(-1)[worst]
++                        ),
++                        "worst_ulp_actual": float(output.reshape(-1)[worst]),
++                        "stream_max_abs": float(stream_error.max()),
++                        "stream_mean_abs": float(stream_error.mean()),
++                        "criterion": "output abs<=0.02+0.02*abs(CPU); stream abs<=1e-5+abs(beta)*post_BF16_ULP",
++                        "output_fail_count": output_fail,
++                        "stream_fail_count": stream_fail,
++                        "accepted": accepted,
++                        "output_max_excess": float((output_error - output_bound).max()),
++                        "stream_max_excess": float((stream_error - stream_bound).max()),
++                        "worst_output_expected": float(expected_output.reshape(-1)[worst_output]),
++                        "worst_output_actual": float(output.reshape(-1)[worst_output]),
++                        "worst_stream_expected": float(expected_stream.reshape(-1)[worst_stream]),
++                        "worst_stream_actual": float(stream.reshape(-1)[worst_stream]),
++                    }
++                ),
++                flush=True,
++            )
++        if "fused" in values:
++            fused_output, fused_stream = values["fused"]
++            for other in (
++                "main_sycl", "framework_triton",
++                "framework_triton_w16", "framework_triton_w32",
++            ):
++                if other not in values:
++                    continue
++                other_output, other_stream = values[other]
++                pair_output_error = (fused_output.float() - other_output.float()).abs()
++                pair_worst = int(pair_output_error.reshape(-1).argmax())
++                print(
++                    json.dumps(
++                        {
++                            "pair": f"fused-{other}",
++                            "rows": rows,
++                            "hidden": hidden,
++                            "output_max_ulp": int(
++                                (bf16_ordered(fused_output) - bf16_ordered(other_output)).abs().max()
++                            ),
++                            "output_max_abs": float(pair_output_error.max()),
++                            "stream_max_abs": float((fused_stream - other_stream).abs().max()),
++                            "worst_pair_cpu": float(expected_output.reshape(-1)[pair_worst]),
++                            "worst_pair_fused": float(fused_output.reshape(-1)[pair_worst]),
++                            "worst_pair_other": float(other_output.reshape(-1)[pair_worst]),
++                        }
++                    ),
++                    flush=True,
++                )
++        torch.xpu.synchronize()
++        time.sleep(2)
++    print(json.dumps({"acceptance_summary": acceptance}), flush=True)
++    if any(result["shapes_fail"] for result in acceptance.values()):
++        raise SystemExit(1)
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/benchmark/fused_norm_residual_review_ops.cpp b/benchmark/fused_norm_residual_review_ops.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..14d707ba6a76391de107d8b0ab48f35d6442c773
+--- /dev/null
++++ b/benchmark/fused_norm_residual_review_ops.cpp
+@@ -0,0 +1,33 @@
++#include <torch/all.h>
++
++#include <optional>
++
++namespace at::native::xpu {
++void rmsnorm(torch::Tensor& output, torch::Tensor& input, torch::Tensor& weight, double eps);
++void fused_post_norm_residual_pre_norm(
++    torch::Tensor branch,
++    torch::Tensor stream,
++    torch::Tensor post_weight,
++    torch::Tensor pre_weight,
++    torch::Tensor alpha,
++    torch::Tensor beta,
++    torch::Tensor output,
++    torch::Tensor new_stream,
++    double post_eps,
++    double pre_eps,
++    bool post_norm_input_scale,
++    bool round_pre_norm_input,
++    const std::optional<torch::Tensor>& output_fp32);
++}
++
++// Small registration target for targeted source builds. It avoids linking the
++// unrelated common_ops dependencies when validating this kernel alone.
++TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
++  m.def("rmsnorm(Tensor! output, Tensor input, Tensor weight, float eps) -> ()");
++  m.impl("rmsnorm", torch::kXPU, &at::native::xpu::rmsnorm);
++  m.def(
++      "fused_post_norm_residual_pre_norm(Tensor branch, Tensor stream, Tensor post_weight, Tensor pre_weight, Tensor "
++      "alpha, Tensor beta, Tensor! output, Tensor! new_stream, float post_eps, float pre_eps, bool "
++      "post_norm_input_scale, bool round_pre_norm_input, Tensor(a!)? output_fp32=None) -> ()");
++  m.impl("fused_post_norm_residual_pre_norm", torch::kXPU, &at::native::xpu::fused_post_norm_residual_pre_norm);
++}

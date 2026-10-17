@@ -1,0 +1,16 @@
+cmake_minimum_required(VERSION 3.19.2)
+project(qk_native_abi_diagnostic LANGUAGES CXX)
+find_package(Python3 REQUIRED COMPONENTS Interpreter)
+execute_process(COMMAND ${Python3_EXECUTABLE} -c "import torch; print(torch.utils.cmake_prefix_path)"
+                OUTPUT_VARIABLE TORCH_PREFIX OUTPUT_STRIP_TRAILING_WHITESPACE COMMAND_ERROR_IS_FATAL ANY)
+list(APPEND CMAKE_PREFIX_PATH ${TORCH_PREFIX})
+find_package(Torch REQUIRED)
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+add_library(port_kernel SHARED IMPORTED)
+set_target_properties(port_kernel PROPERTIES IMPORTED_LOCATION "${PORT_KERNEL}")
+add_library(qk_abi_forward SHARED xe35/FusedQKNormRopeAbiForward.cpp)
+target_include_directories(qk_abi_forward PRIVATE "${OFFICIAL_TARGET}/include")
+target_link_libraries(qk_abi_forward PRIVATE port_kernel ${TORCH_LIBRARIES})
+set_target_properties(qk_abi_forward PROPERTIES OUTPUT_NAME "sgl-ops-sycl-FusedQKNormRope"
+                      INSTALL_RPATH "$ORIGIN" BUILD_WITH_INSTALL_RPATH TRUE)

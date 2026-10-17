@@ -1,0 +1,43 @@
+:: setting up Intel GPU environment ...
+ 
+:: initializing oneAPI environment ...
+   bash: BASH_VERSION = 5.2.21(1)-release
+   args: Using "$@" for setvars.sh arguments: --force
+:: umf -- latest
+:: oneAPI environment initialized ::
+ 
+   umf: OK
+   oneccl: OK  (ONECCL_ROOT=/opt/gfx-deps/oneccl)
+   dpcpp: OK
+   cobalt: SKIPPED (set ENABLE_COBALT=1 to activate)
+:: environment ready.
+--- tests/test_fused_qk_norm_rope.py
++++ tests/test_fused_qk_norm_rope.py
+@@ -1156,9 +1156,16 @@
+ 
+     benchmark = Path(__file__).resolve().parents[1] / "benchmark"
+     result = subprocess.run(
+-        [sys.executable, str(benchmark / "validate_qk_norm_rope_b8.py"),
+-         "--tokens", str(tokens), "--entry", "xe35"],
+-        capture_output=True, text=True,
++        [
++            sys.executable,
++            str(benchmark / "validate_qk_norm_rope_b8.py"),
++            "--tokens",
++            str(tokens),
++            "--entry",
++            "xe35",
++        ],
++        capture_output=True,
++        text=True,
+     )
+     print(result.stdout)
+     assert result.returncode == 0, result.stdout + result.stderr
+@@ -1170,6 +1177,7 @@
+ @pytest.mark.parametrize("execution", ["cold_graph", "streams"])
+ def test_frequency_lifetime_and_generic_dispatch_xe35(dtype, execution):
+     import time
++
+     torch.manual_seed(127)
+     tokens, dim = 8, 64
+     original = torch.randn(tokens, 288 * dim, device="xpu:0", dtype=dtype)

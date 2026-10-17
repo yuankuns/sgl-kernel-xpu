@@ -1,0 +1,9 @@
+{
+  "directory": "/home/syk/worktrees/sgl-kernel-xpu/muse-spark-fmha-main-20261014",
+  "head": "08955d90fad52a40779705f259569db93e570a22",
+  "branch": "muse_fmha",
+  "patch_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "tracked_paths": [],
+  "untracked_code": [],
+  "apply_check": "NO_CHANGES"
+}

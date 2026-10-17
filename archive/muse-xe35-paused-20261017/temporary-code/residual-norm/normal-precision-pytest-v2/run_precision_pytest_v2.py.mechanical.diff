@@ -1,0 +1,37 @@
+--- run_precision_pytest_v1.py
++++ run_precision_pytest_v2.py
+@@ -4,7 +4,7 @@
+ import sys
+ import time
+ 
+-import precision_pytest_v1 as check
++import precision_pytest_v2 as check
+ 
+ 
+ def command(name, argv):
+@@ -28,7 +28,7 @@
+     os.environ["PYTHONDONTWRITEBYTECODE"] = "1"
+     container = "/root/" + str(check.ROOT).removeprefix("/home/syk/")
+     wrapper = "/home/syk/agent-skills/cri-po-gpu-container/scripts/enter-sglang-syk.sh"
+-    script = container + "/precision_pytest_container_v1.sh"
++    script = container + "/precision_pytest_container_v2.sh"
+     status = command("CPU-wrapper", [wrapper, "--workdir", container, "taskset", "-c", "48-63", "bash", script, "preflight"])
+     if status:
+         return status
+@@ -37,6 +37,7 @@
+     drain = subprocess.check_output(["ps", "-eo", "pid,ppid,args"], text=True)
+     check.write("physical9-drain-snapshot.json", dict(epoch=time.time(), lock_probe_exit=0,
+         process_snapshot=drain, coordinator_reports_NV9_physically_drained=True))
++    assert all(not os.path.exists(f"/proc/{pid}") for pid in (3278336, 3283576))
+     binding = json.loads((check.OUTPUT / "binding.json").read_text())
+     release = dict(binding, issuer="main coordinator user authorization", phase=check.PHASE,
+         coordinator_release=True, gpu=9, CPU="48-63", accuracy_only=True,
+@@ -49,7 +50,7 @@
+     patch += "".join("+" + line + "\n" for line in json.dumps(release, indent=2).splitlines())
+     subprocess.run(["apply_patch", patch + "*** End Patch\n"], check=True)
+     check.BARRIER.chmod(0o444)
+-    print(json.dumps(dict(handle="normal-precision-pytest-v1", host_pid=os.getpid(),
++    print(json.dumps(dict(handle="normal-precision-pytest-v2", host_pid=os.getpid(),
+         epoch=release["start_epoch"], grant=str(check.BARRIER), stage="CPU gates0; future+120")), flush=True)
+     while time.time() < release["start_epoch"]:
+         time.sleep(1)

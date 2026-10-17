@@ -1,0 +1,28 @@
+{
+  "directory": "/home/syk/worktrees/sgl-kernel-xpu-up/pr/muse-qk-norm-rope-xe35",
+  "head": "833c95208dccd2af5628c121222f91186a5b2de7",
+  "branch": "pr/muse-qk-norm-rope-xe35",
+  "patch_sha256": "e8ce74beb4d7f22d3767368d024b98e8ed3c288a43be1645fc39af614e260536",
+  "tracked_paths": [
+    "cmake/BuildFlags.cmake",
+    "include/sgl_kernel_ops.h",
+    "python/sgl_kernel/__init__.py",
+    "python/sgl_kernel/elementwise.py",
+    "src/BuildOnLinux.cmake",
+    "src/sycl/Device.cpp",
+    "src/sycl/FusedQKNormRope.cpp",
+    "src/sycl/HCHead.cpp",
+    "src/torch_extension_sycl.cc",
+    "tests/test_fused_qk_norm_rope.py"
+  ],
+  "untracked_code": [
+    "benchmark/bench_muse_qk_norm_rope.py",
+    "benchmark/muse_scope.py",
+    "benchmark/validate_qk_norm_rope_b8.py",
+    "include/sgl_kernel/xe35/fused_qk_norm_rope.h",
+    "src/sycl/xe35/FusedQKNormRope.cpp",
+    "src/sycl/xe35/FusedQKNormRopeFrequency.h",
+    "src/sycl/xe35/FusedQKNormRopeKernel.h"
+  ],
+  "apply_check": "PASS"
+}

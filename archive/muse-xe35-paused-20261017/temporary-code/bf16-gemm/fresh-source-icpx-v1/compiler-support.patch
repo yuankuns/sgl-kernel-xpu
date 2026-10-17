@@ -1,0 +1,9 @@
+*** Begin Patch
+*** Update File: /home/syk/worktrees/sgl-kernel-xpu-up/muse-upstream-artifacts-20261017/bf16-gemm/fresh-source-icpx-v1/source/cmake/BuildFlags.cmake
+@@
+-if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
++if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" OR CMAKE_CXX_COMPILER_ID STREQUAL "IntelLLVM")
+@@
+-  message("Not compiling with XPU. Currently only support GCC compiler on Linux as CXX compiler.")
++  message("Not compiling with XPU. Currently only support GNU or IntelLLVM compiler on Linux as CXX compiler.")
+*** End Patch

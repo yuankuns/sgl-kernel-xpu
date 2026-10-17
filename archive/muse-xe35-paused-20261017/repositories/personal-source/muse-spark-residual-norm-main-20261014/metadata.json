@@ -1,0 +1,15 @@
+{
+  "directory": "/home/syk/worktrees/sgl-kernel-xpu/muse-spark-residual-norm-main-20261014",
+  "head": "ec29f7a6a14c4f1fac42fb93526236ca03ab894b",
+  "branch": "muse_residual_norm",
+  "patch_sha256": "7f578d12dbe14d832bbfb407a1d5932835656d52a1e8ce8a3d57015f01e85e0c",
+  "tracked_paths": [],
+  "untracked_code": [
+    "benchmark/bench_fused_norm_residual_graph_review.py",
+    "benchmark/bench_fused_norm_residual_review.py",
+    "benchmark/build_fused_norm_residual_review_ops.py",
+    "benchmark/check_fused_norm_residual_review.py",
+    "benchmark/fused_norm_residual_review_ops.cpp"
+  ],
+  "apply_check": "PASS"
+}

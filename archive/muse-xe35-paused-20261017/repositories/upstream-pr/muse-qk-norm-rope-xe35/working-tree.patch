@@ -1,0 +1,1671 @@
+diff --git a/benchmark/bench_muse_qk_norm_rope.py b/benchmark/bench_muse_qk_norm_rope.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..1d42efe9d155ab237cc599a41971fb6520fa1fcd
+--- /dev/null
++++ b/benchmark/bench_muse_qk_norm_rope.py
+@@ -0,0 +1,151 @@
++from muse_scope import require_muse_arch_xe35, require_muse_b8_xe35
++
++require_muse_b8_xe35()
++
++import argparse
++import hashlib
++import json
++import statistics
++from pathlib import Path
++
++import torch
++from sgl_kernel import fused_qk_norm_rope
++
++DTYPE_MAP = {"bf16": torch.bfloat16}
++parser = argparse.ArgumentParser(
++    description="B8 production SOURCE versus PORT graph benchmark"
++)
++parser.add_argument("--tokens", type=int, choices=(8, 32768), required=True)
++parser.add_argument("--output", type=Path, required=True)
++args = parser.parse_args()
++args.tokens = [args.tokens]
++args.repeats, args.samples, args.warmup = 32, 21, 5
++args.q_heads, args.k_heads, args.tail_heads, args.head_dim = 128, 16, 144, 64
++args.dtype = "bf16"
++args.profile = False
++
++
++def benchmark_graph_xe35():
++    require_muse_arch_xe35()
++    torch.manual_seed(42)
++    tokens, repeats, samples, warmup = (
++        args.tokens[0],
++        args.repeats,
++        args.samples,
++        args.warmup,
++    )
++    nq, nk, nv, hd = args.q_heads, args.k_heads, args.tail_heads, args.head_dim
++    # Muse-Spark B8 uses T8/T32768, Q128/K16/D64 and gated tail144; other dimensions are generic corners.
++    dtype = DTYPE_MAP[args.dtype]
++    scale = 43.7840518911 / (hd**0.5)
++    qkv = torch.randn(tokens, (nq + nk + nv) * hd, device="xpu:0", dtype=dtype)
++    initial = qkv.clone()
++    q_weight = torch.full((hd,), scale, device="xpu:0", dtype=dtype)
++    k_weight = torch.ones(hd, device="xpu:0", dtype=dtype)
++    positions = torch.arange(tokens, device="xpu:0", dtype=torch.int32) % 4096
++
++    def fn():
++        fused_qk_norm_rope(
++            qkv,
++            nq,
++            nk,
++            nv,
++            hd,
++            1e-5,
++            q_weight,
++            k_weight,
++            500000.0,
++            False,
++            positions,
++            rotary_dim=hd,
++        )
++
++    if args.profile:
++        median_ms, min_ms, max_ms = profile_fused_qk_norm_rope(fn, samples=samples)
++        print(
++            f"profiler p50_us={median_ms * 1000:.3f} "
++            f"min_us={min_ms * 1000:.3f} max_us={max_ms * 1000:.3f}"
++        )
++    for _ in range(5):
++        fn()
++    torch.xpu.synchronize()
++    qkv.copy_(initial)
++    graph = torch.xpu.XPUGraph()
++    with torch.xpu.graph(graph):
++        for _ in range(repeats):
++            fn()
++    torch.xpu.synchronize()
++
++    paths = {
++        line.split()[-1]
++        for line in Path("/proc/self/maps").read_text().splitlines()
++        if "libsgl-ops-sycl-FusedQKNormRope" in line
++    }
++    loaded_libraries = {}
++    for path in sorted(paths):
++        digest = hashlib.sha256(Path(path).read_bytes()).hexdigest()
++        loaded_libraries[path] = digest
++        print(f"loaded_lib={path} sha256={digest}", flush=True)
++
++    for _ in range(warmup):
++        qkv.copy_(initial)
++        graph.replay()
++    torch.xpu.synchronize()
++    values = []
++    for _ in range(samples):
++        qkv.copy_(initial)
++        torch.xpu.synchronize()
++        start = torch.xpu.Event(enable_timing=True)
++        end = torch.xpu.Event(enable_timing=True)
++        start.record()
++        graph.replay()
++        end.record()
++        end.synchronize()
++        values.append(start.elapsed_time(end) * 1000 / repeats)
++
++    ordered = sorted(values)
++    median = statistics.median(values)
++    mad = statistics.median(abs(value - median) for value in values)
++    p20 = ordered[int((samples - 1) * 0.2)]
++    p80 = ordered[int((samples - 1) * 0.8)]
++    device_name = torch.xpu.get_device_name(0)
++    print(
++        f"graph tokens={tokens} dtype={args.dtype} heads={nq},{nk},{nv} hd={hd} "
++        f"repeats={repeats} samples={samples} warmup={warmup} "
++        f"device={device_name}",
++        flush=True,
++    )
++    print(
++        f"tokens={tokens} raw_us={','.join(f'{value:.3f}' for value in values)} "
++        f"p50_us={median:.3f} mad_us={mad:.3f} p20_us={p20:.3f} p80_us={p80:.3f}",
++        flush=True,
++    )
++    if args.output:
++        args.output.parent.mkdir(parents=True, exist_ok=True)
++        args.output.write_text(
++            json.dumps(
++                dict(
++                    mode="graph",
++                    tokens=tokens,
++                    dtype=args.dtype,
++                    heads=[nq, nk, nv],
++                    head_dim=hd,
++                    repeats=repeats,
++                    samples=samples,
++                    warmup=warmup,
++                    device=device_name,
++                    loaded_libraries=loaded_libraries,
++                    raw_us=values,
++                    p50_us=median,
++                    mad_us=mad,
++                    p20_us=p20,
++                    p80_us=p80,
++                ),
++                indent=2,
++            )
++            + "\n"
++        )
++
++
++if __name__ == "__main__":
++    benchmark_graph_xe35()
+diff --git a/benchmark/muse_scope.py b/benchmark/muse_scope.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..d583ecc79f1f781dd81ec2860de506de57befc43
+--- /dev/null
++++ b/benchmark/muse_scope.py
+@@ -0,0 +1,29 @@
++import os
++
++
++def require_muse_b8_xe35():
++    expected = {
++        "BATCHES": "8",
++        "BATCH_SIZE": "8",
++        "BATCH": "8",
++        "SERVING_BATCH": "8",
++        "SERVING_BATCH_SIZE": "8",
++        "SGLANG_BATCH_SIZE": "8",
++        "ISL": "4096",
++        "OSL": "16",
++        "TP": "1",
++        "EP": "1",
++    }
++    for name, value in expected.items():
++        if os.environ.get(name, value) != value:
++            raise SystemExit(f"scope error: {name} must be {value}; Muse B8 only")
++
++
++def require_muse_arch_xe35():
++    from _bench import current_arch
++
++    architecture = current_arch()
++    if architecture != "xe35":
++        raise SystemExit(
++            f"QK Muse port requires Xe35 XPU architecture 3.5; running arch={architecture}"
++        )
+diff --git a/benchmark/validate_qk_norm_rope_b8.py b/benchmark/validate_qk_norm_rope_b8.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..cb1248e75e92a4758c3873630591acefe4d0eabf
+--- /dev/null
++++ b/benchmark/validate_qk_norm_rope_b8.py
+@@ -0,0 +1,185 @@
++"""Validate the full Muse B8 prefill launch at batch and tail boundaries."""
++
++from muse_scope import require_muse_arch_xe35, require_muse_b8_xe35
++
++require_muse_b8_xe35()
++
++import argparse
++import hashlib
++from pathlib import Path
++import json
++
++import torch
++from sgl_kernel import fused_qk_norm_rope
++
++
++def main_xe35():
++    parser = argparse.ArgumentParser()
++    parser.add_argument("--tokens", type=int, default=32768)
++    parser.add_argument("--q-heads", type=int, default=128)
++    parser.add_argument("--k-heads", type=int, default=16)
++    parser.add_argument("--tail-heads", type=int, default=144)
++    parser.add_argument("--head-dim", type=int, choices=(64, 128, 256), default=64)
++    parser.add_argument("--dtype", choices=("bf16", "fp16"), default="bf16")
++    parser.add_argument("--entry", choices=("generic", "xe35"), default="generic")
++    args = parser.parse_args()
++    if args.tokens not in (8, 32768) or (
++        args.q_heads,
++        args.k_heads,
++        args.tail_heads,
++        args.head_dim,
++    ) != (128, 16, 144, 64):
++        parser.error("requires B8 T8/T32768 Q128/K16/tail144/D64")
++    require_muse_arch_xe35()
++    if args.entry == "xe35":
++        from sgl_kernel import fused_qk_norm_rope_xe35
++
++        invoke = fused_qk_norm_rope_xe35
++    else:
++        invoke = fused_qk_norm_rope
++    if min(args.tokens, args.q_heads, args.k_heads) <= 0 or args.tail_heads < 0:
++        parser.error(
++            "tokens and Q/K heads must be positive; tail-heads must be nonnegative"
++        )
++    torch.manual_seed(42)
++    tokens = args.tokens
++    heads_q, heads_k, heads_v, dim = (
++        args.q_heads,
++        args.k_heads,
++        args.tail_heads,
++        args.head_dim,
++    )
++    dtype = torch.bfloat16 if args.dtype == "bf16" else torch.float16
++    eps, base = 1e-5, 500000.0
++    scale = 43.7840518911 / (dim**0.5)
++    qkv = torch.randn(
++        tokens,
++        (heads_q + heads_k + heads_v) * dim,
++        device="xpu:0",
++        dtype=dtype,
++    )
++    # Muse-Spark B8: T8 decode/T32768 prefill, Q128/K16/D64, gated tail144.
++    original = qkv.cpu()
++    q_weight = torch.full((dim,), scale, device="xpu:0", dtype=dtype)
++    k_weight = torch.ones(dim, device="xpu:0", dtype=dtype)
++    positions = torch.arange(tokens, device="xpu:0", dtype=torch.int32) % 4096
++    inv_freq = base ** (
++        -torch.arange(0, dim, 2, dtype=torch.float64, device="cpu") / dim
++    )
++    invoke(
++        qkv,
++        heads_q,
++        heads_k,
++        heads_v,
++        dim,
++        eps,
++        q_weight,
++        k_weight,
++        base,
++        False,
++        positions,
++        rotary_dim=dim,
++    )
++    torch.xpu.synchronize()
++    actual = qkv.cpu()
++    positions_cpu = positions.cpu()
++    tolerance = 5e-3 if dtype == torch.bfloat16 else 1e-3
++    max_abs, sum_abs, elements, violations = 0.0, 0.0, 0, 0
++    error_bins = {bound: 0 for bound in (1e-5, 1e-4, 1e-3, 5e-3, 1e-2, 5e-2)}
++    for start in range(0, tokens, 512):
++        rows = (
++            original[start : start + 512]
++            .reshape(-1, heads_q + heads_k + heads_v, dim)
++            .float()
++        )
++        q, k = rows[:, :heads_q], rows[:, heads_q : heads_q + heads_k]
++        q = (
++            q
++            * torch.rsqrt(q.square().mean(dim=-1, keepdim=True) + eps)
++            * q_weight.float().cpu()
++        )
++        k = (
++            k
++            * torch.rsqrt(k.square().mean(dim=-1, keepdim=True) + eps)
++            * k_weight.float().cpu()
++        )
++        theta = (
++            positions_cpu[start : start + 512].float()[:, None]
++            * inv_freq.float()[None, :]
++        )
++        cos, sin = theta.cos()[:, None, :], theta.sin()[:, None, :]
++
++        def rotate(values):
++            even, odd = values[..., ::2], values[..., 1::2]
++            return torch.stack(
++                (even * cos - odd * sin, odd * cos + even * sin), dim=-1
++            ).flatten(-2)
++
++        expected = torch.cat((rotate(q), rotate(k)), dim=1)
++        got = actual[start : start + 512, : (heads_q + heads_k) * dim].reshape_as(
++            expected
++        )
++        difference = (got.float() - expected.float()).abs()
++        max_abs = max(max_abs, difference.max().item())
++        sum_abs += difference.sum().item()
++        elements += difference.numel()
++        for bound in error_bins:
++            error_bins[bound] += (difference <= bound).sum().item()
++        violations += (
++            (
++                (~torch.isfinite(got))
++                | (~torch.isfinite(expected))
++                | (difference > tolerance + tolerance * expected.float().abs())
++            )
++            .sum()
++            .item()
++        )
++    tail_equal = torch.equal(
++        actual[:, (heads_q + heads_k) * dim :].view(torch.uint16),
++        original[:, (heads_q + heads_k) * dim :].view(torch.uint16),
++    )
++    mapped = sorted(
++        {
++            line.split()[-1]
++            for line in Path("/proc/self/maps").read_text().splitlines()
++            if "libsgl-ops-sycl-FusedQKNormRope" in line
++        }
++    )
++    libraries = {
++        path: hashlib.sha256(Path(path).read_bytes()).hexdigest() for path in mapped
++    }
++    output_hash = hashlib.sha256(
++        actual.view(torch.uint16).numpy().tobytes()
++    ).hexdigest()
++    input_hash = hashlib.sha256(
++        original.view(torch.uint16).numpy().tobytes()
++    ).hexdigest()
++    print(
++        json.dumps(
++            {
++                "entry": args.entry,
++                "input_sha256": input_hash,
++                "output_sha256": output_hash,
++                "loaded_libraries": libraries,
++                "tokens": tokens,
++                "dtype": args.dtype,
++                "heads": [heads_q, heads_k, heads_v],
++                "head_dim": dim,
++                "reference": "independent CPU FP32 with FP64 frequency rounded to FP32",
++                "atol": tolerance,
++                "rtol": tolerance,
++                "elements": elements,
++                "max_abs": max_abs,
++                "mean_abs": sum_abs / elements,
++                "error_cumulative_bins": error_bins,
++                "violations": violations,
++                "tail_equal": tail_equal,
++            }
++        ),
++        flush=True,
++    )
++    assert violations == 0 and tail_equal
++
++
++if __name__ == "__main__":
++    main_xe35()
+diff --git a/cmake/BuildFlags.cmake b/cmake/BuildFlags.cmake
+index 5dfb191b37ff61b04b4329536b487308b197cc44..086239cefe6af99520acbb1c4423744a46d9a4cc 100644
+--- a/cmake/BuildFlags.cmake
++++ b/cmake/BuildFlags.cmake
+@@ -26,7 +26,7 @@ function(CHECK_SYCL_FLAG FLAG VARIABLE_NAME)
+ endfunction()
+ 
+ # Support GCC on Linux.
+-if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
++if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" OR CMAKE_CXX_COMPILER_ID STREQUAL "IntelLLVM")
+   message(STATUS "sgl-kernel-xpu build type: ${CMAKE_BUILD_TYPE}")
+   set(SYCL_HOST_FLAGS)
+   set(SYCL_KERNEL_OPTIONS)
+@@ -185,6 +185,6 @@ if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+ 
+   set(SYCL_OFFLINE_COMPILER_FLAGS "${SYCL_OFFLINE_COMPILER_AOT_OPTIONS}${SYCL_OFFLINE_COMPILER_CG_OPTIONS}")
+ else()
+-  message("Not compiling with XPU. Currently only support GCC compiler on Linux as CXX compiler.")
++  message("Not compiling with XPU. Currently only support GNU or IntelLLVM compiler on Linux as CXX compiler.")
+   return()
+ endif()
+diff --git a/include/sgl_kernel/xe35/fused_qk_norm_rope.h b/include/sgl_kernel/xe35/fused_qk_norm_rope.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..cdaf5d1f10841b862025071a5b8929d4550f199e
+--- /dev/null
++++ b/include/sgl_kernel/xe35/fused_qk_norm_rope.h
+@@ -0,0 +1,25 @@
++#pragma once
++
++#include <torch/torch.h>
++
++namespace at::native::xpu {
++
++void fused_qk_norm_rope_xe35(
++    torch::Tensor& qkv,
++    int64_t num_heads_q,
++    int64_t num_heads_k,
++    int64_t num_heads_v,
++    int64_t head_dim,
++    double eps,
++    torch::Tensor& q_weight,
++    torch::Tensor& k_weight,
++    double base,
++    bool is_neox,
++    torch::Tensor& position_ids,
++    double factor,
++    double low,
++    double high,
++    double attention_factor,
++    int64_t rotary_dim);
++
++}
+diff --git a/include/sgl_kernel_ops.h b/include/sgl_kernel_ops.h
+index 0b71dcef0d0cd28a7b2bf892845c95d6c12a547f..67bc46f8b4cd92af9a337cf99bdd65d6519ff77b 100644
+--- a/include/sgl_kernel_ops.h
++++ b/include/sgl_kernel_ops.h
+@@ -26,6 +26,10 @@ limitations under the License.
+ #include <tuple>
+ #include <vector>
+ 
++#if SYCL_INTEL_TARGET == 35
++#include "sgl_kernel/xe35/fused_qk_norm_rope.h"
++#endif
++
+ #define _CONCAT(A, B) A##B
+ #define CONCAT(A, B) _CONCAT(A, B)
+ 
+diff --git a/python/sgl_kernel/__init__.py b/python/sgl_kernel/__init__.py
+index a9a03451df67b5d0d712636f0ef87e9a7a766c12..f66bb716600ce68e6382dab767ccc0005844c2bd 100644
+--- a/python/sgl_kernel/__init__.py
++++ b/python/sgl_kernel/__init__.py
+@@ -68,6 +68,7 @@ from sgl_kernel.elementwise import (
+     fused_k_norm_rope_flashmla,
+     fused_q_norm_rope,
+     fused_qk_norm_rope,
++    fused_qk_norm_rope_xe35,
+     fused_qk_rope,
+     fused_qk_rope_with_cos_sin_cache_inplace,
+     gelu_and_mul,
+diff --git a/python/sgl_kernel/elementwise.py b/python/sgl_kernel/elementwise.py
+index 2094e09b5394972a620b6950c098078804211137..db62edc796ae686400106130449d0b7b510ed3b8 100644
+--- a/python/sgl_kernel/elementwise.py
++++ b/python/sgl_kernel/elementwise.py
+@@ -462,6 +462,99 @@ def fused_qk_norm_rope(
+     )
+ 
+ 
++def fused_qk_norm_rope_xe35(
++    qkv: torch.Tensor,
++    num_heads_q: int,
++    num_heads_k: int,
++    num_heads_v: int,
++    head_dim: int,
++    eps: float,
++    q_weight: torch.Tensor,
++    k_weight: torch.Tensor,
++    base: float,
++    is_neox: bool,
++    position_ids: torch.Tensor,
++    factor: float = 1.0,
++    low: float = 1.0,
++    high: float = 1.0,
++    attention_factor: float = 1.0,
++    rotary_dim: int = None,
++) -> None:
++    r"""Xe35-only fused QK RMS normalization and RoPE application.
++
++    This operator applies RMS normalization and RoPE (Rotary Position Embedding)
++    to Q and K tensors in a single Xe35 SYCL kernel. The operation is performed
++    in-place on the input qkv tensor. This entry is not available on BMG or CUDA.
++    Production acceptance uses BF16; FP16 coverage does not change production precision.
++
++    Parameters
++    ----------
++    qkv : torch.Tensor
++        Combined QKV tensor, shape: ``(num_tokens, (num_heads_q + num_heads_k + num_heads_v) * head_dim)``.
++        The tensor is modified in-place.
++    num_heads_q : int
++        Number of query heads.
++    num_heads_k : int
++        Number of key heads.
++    num_heads_v : int
++        Number of value heads.
++    head_dim : int
++        Dimension per head.
++    eps : float
++        Epsilon for RMS normalization.
++    q_weight : torch.Tensor
++        RMSNorm weights for query, shape: ``(head_dim,)``.
++    k_weight : torch.Tensor
++        RMSNorm weights for key, shape: ``(head_dim,)``.
++    base : float
++        Base for RoPE computation.
++    is_neox : bool
++        Whether RoPE is applied in Neox style.
++
++        * If ``True``, the last dimension of the query/key tensor is not interleaved.
++        * If ``False``, the last dimension of the query/key tensor is interleaved.
++    position_ids : torch.Tensor
++        Position IDs for RoPE, shape: ``(num_tokens,)``.
++    factor : float, optional
++        Scaling factor for YARN (YaRN: Yet another RoPE extensioN method).
++        When it is not 1.0, the model is using YARN. Default: 1.0.
++    low : float, optional
++        YARN low frequency threshold. Default: 1.0.
++    high : float, optional
++        YARN high frequency threshold. Default: 1.0.
++    attention_factor : float, optional
++        Attention factor applied on cos and sin values. Default: 1.0.
++    rotary_dim : int, optional
++        Rotary dimension. If None, defaults to head_dim.
++
++    Note
++    ----
++    This is an in-place operation that modifies the qkv tensor directly.
++    Only the Q and K portions of the tensor are modified; V remains unchanged.
++    """
++    if rotary_dim is None:
++        rotary_dim = head_dim
++
++    torch.ops.sgl_kernel.fused_qk_norm_rope_xe35(
++        qkv,
++        num_heads_q,
++        num_heads_k,
++        num_heads_v,
++        head_dim,
++        eps,
++        q_weight,
++        k_weight,
++        base,
++        is_neox,
++        position_ids,
++        factor,
++        low,
++        high,
++        attention_factor,
++        rotary_dim,
++    )
++
++
+ def fused_qk_rope(
+     qkv: torch.Tensor,
+     num_heads_q: int,
+diff --git a/src/BuildOnLinux.cmake b/src/BuildOnLinux.cmake
+index 1568e7e1fd1433b7c598d3460cb6f61ab5d451cb..835fcf8e66ee306d345b8802dba63647906b2340 100644
+--- a/src/BuildOnLinux.cmake
++++ b/src/BuildOnLinux.cmake
+@@ -268,6 +268,9 @@ if(DPCPP_SYCL_TARGET MATCHES "cri")
+   foreach(sycl_src ${ATen_XPU_SYCL_XE35})
+     get_filename_component(name ${sycl_src} NAME_WLE REALPATH)
+     set(sycl_lib sgl-ops-sycl-${name})
++    if(name STREQUAL "FusedQKNormRope")
++      set(sycl_lib sgl-ops-sycl-${name}_xe35)
++    endif()
+     sycl_add_library(
+       ${sycl_lib}
+       ${XE35_OFFLINE_COMPILER_FLAGS}
+@@ -286,6 +289,10 @@ if(DPCPP_SYCL_TARGET MATCHES "cri")
+   endforeach()
+ endif()
+ 
++if(DPCPP_SYCL_TARGET MATCHES "cri")
++  target_link_libraries(sgl-ops-sycl-FusedQKNormRope PRIVATE sgl-ops-sycl-FusedQKNormRope_xe35)
++endif()
++
+ set(SYCL_LINK_LIBRARIES_KEYWORD)
+ 
+ foreach(lib ${SGL_OPS_LIBRARIES})
+diff --git a/src/sycl/Device.cpp b/src/sycl/Device.cpp
+index 44590db8a7c078bf6d8526548e75f80608b757af..2ab1b2262242d5741f5da3d55703004c257bb013 100644
+--- a/src/sycl/Device.cpp
++++ b/src/sycl/Device.cpp
+@@ -22,7 +22,8 @@ SGL_KERNEL_EXPORT std::tuple<int64_t, int64_t> query_device(int64_t device_index
+ // Need oneAPI 2026.2 or later to support `architecture::intel_gpu_cri`. Check the release
+ // (__INTEL_LLVM_COMPILER) rather than the build date (__SYCL_COMPILER_VERSION): 2026.1.x
+ // patch releases (e.g. 2026.1.3, 20260724) are built later but still lack this enum.
+-#if defined(__INTEL_LLVM_COMPILER) && __INTEL_LLVM_COMPILER >= 20260200
++#if (defined(__INTEL_LLVM_COMPILER) && __INTEL_LLVM_COMPILER >= 20260200) || \
++    (defined(__INTEL_LLVM_COMPILER_VERSION) && __INTEL_LLVM_COMPILER_VERSION >= 20260200)
+     case syclex::architecture::intel_gpu_cri:
+       return std::make_tuple(3, 5);
+ #endif
+diff --git a/src/sycl/FusedQKNormRope.cpp b/src/sycl/FusedQKNormRope.cpp
+index 1685a6d8a678a91f147f4239056c935581f62a8f..d7aa02d8978d9cc0bed65f0fa30c7c165bbbefa1 100644
+--- a/src/sycl/FusedQKNormRope.cpp
++++ b/src/sycl/FusedQKNormRope.cpp
+@@ -22,6 +22,7 @@
+ #include "Utils.h"
+ #include "cutlass/float8.h"
+ #include "sgl_kernel_export.h"
++#include "sgl_kernel_ops.h"
+ 
+ // TODO: Remove this when sycl float8 is supported
+ using cutlass::float_e4m3_t;
+@@ -522,6 +523,15 @@ SGL_KERNEL_EXPORT void fused_qk_norm_rope(
+     double high,
+     double attention_factor,
+     int64_t rotary_dim) {
++#if SYCL_INTEL_TARGET == 35
++  if (qkv.scalar_type() == at::ScalarType::Half || qkv.scalar_type() == at::ScalarType::BFloat16 ||
++      qkv.scalar_type() == at::ScalarType::Float8_e4m3fn) {
++    fused_qk_norm_rope_xe35(
++        qkv, num_heads_q, num_heads_k, num_heads_v, head_dim, eps, q_weight, k_weight, base, is_neox,
++        position_ids, factor, low, high, attention_factor, rotary_dim);
++    return;
++  }
++#endif
+   // Input validation
+   TORCH_CHECK(qkv.dim() == 2, "QKV tensor must be 2D: [num_tokens, (num_heads_q+num_heads_k+num_heads_v)*head_dim]");
+   TORCH_CHECK(position_ids.dim() == 1, "Position IDs must be 1D: [num_tokens]");
+diff --git a/src/sycl/HCHead.cpp b/src/sycl/HCHead.cpp
+index 78464246ed88cb8056af87e388bad9fc222d4053..1b2ace4419e74f6e6276cea4a8bcffc0b2078a6e 100644
+--- a/src/sycl/HCHead.cpp
++++ b/src/sycl/HCHead.cpp
+@@ -67,7 +67,10 @@ struct FusedHCHeadKernel : public __SYCL_KER_CONFIG_CONVENTION__ {
+     slm_ = sycl::local_accessor<float, 1>(slm_size, cgh);
+   }
+ 
+-  [[sycl::reqd_work_group_size(WG_SIZE)]] [[sycl::reqd_sub_group_size(SG_SIZE)]] void
++#ifdef __SYCL_DEVICE_ONLY__
++  [[sycl::reqd_work_group_size(WG_SIZE)]] [[sycl::reqd_sub_group_size(SG_SIZE)]]
++#endif
++  void
+   operator()(sycl::nd_item<1> item) const {
+     const int token_id = static_cast<int>(item.get_group(0));
+     const int tid = static_cast<int>(item.get_local_id(0));
+diff --git a/src/sycl/xe35/FusedQKNormRope.cpp b/src/sycl/xe35/FusedQKNormRope.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..2cbb18d14591de346d449bf528a1b269e8b1aa16
+--- /dev/null
++++ b/src/sycl/xe35/FusedQKNormRope.cpp
+@@ -0,0 +1,408 @@
++#include <ATen/ATen.h>
++#include <ATen/OpMathType.h>
++#include <ATen/Parallel.h>
++#include <c10/util/Float8_e4m3fn.h>
++#include <c10/xpu/XPUStream.h>
++#include <torch/all.h>
++
++#include <cmath>
++#include <cstdint>
++#include <iostream>
++#include <sycl/sycl.hpp>
++#include <vector>
++
++#include "FusedQKNormRopeKernel.h"
++#include "../MemoryAccess.h"
++#include "../Norm.h"
++#include "sgl_kernel_export.h"
++#include "../SYCLHelpers.h"
++#include "../Utils.h"
++#include "cutlass/float8.h"
++
++// TODO: Remove this when sycl float8 is supported
++using cutlass::float_e4m3_t;
++
++namespace at::native::xpu {
++
++template <typename T>
++inline T divUp_xe35(T m, T n) {
++  return (m + n - 1) / n;
++}
++
++// Sub-group reduction for sum
++template <typename T>
++inline T subGroupReduceSum_xe35(T val, const sycl::sub_group& sg) {
++  for (int offset = sg.get_max_local_range()[0] / 2; offset > 0; offset /= 2) {
++    val += sycl::shift_group_left(sg, val, offset);
++  }
++  return val;
++}
++
++// SYCL Kernel_xe35 for Fused QK Norm and RoPE
++template <int head_dim, bool interleave, typename scalar_t, bool UseTable>
++struct FusedQKNormRopeKernel_xe35 {
++  scalar_t* qkv;
++  int num_heads_q;
++  int num_heads_k;
++  int num_heads_v;
++  float eps;
++  const scalar_t* q_weight;
++  const scalar_t* k_weight;
++  float base;
++  const int* position_ids;
++  int num_tokens;
++  float factor;
++  float low;
++  float high;
++  float attention_factor;
++  int rotary_dim;
++  QKRopeFrequencyStorage_xe35<head_dim, UseTable> frequencies;
++
++  void operator()(sycl::nd_item<1> item) const {
++    // Always use float for accumulation, regardless of scalar_t
++    using accscalar_t = float;
++
++    const int sg_size = item.get_sub_group().get_max_local_range()[0];
++    const int warpsPerBlock = item.get_local_range(0) / sg_size;
++    const int warpId = item.get_local_id(0) / sg_size;
++    const int laneId = item.get_local_id(0) % sg_size;
++
++    const int globalWarpIdx = item.get_group(0) * warpsPerBlock + warpId;
++    const int total_qk_heads = num_heads_q + num_heads_k;
++
++    const int tokenIdx = globalWarpIdx / total_qk_heads;
++    const int localHeadIdx = globalWarpIdx % total_qk_heads;
++
++    if (tokenIdx >= num_tokens) return;
++
++    const bool isQ = localHeadIdx < num_heads_q;
++    const int headIdx = isQ ? localHeadIdx : localHeadIdx - num_heads_q;
++    const int num_heads = num_heads_q + num_heads_k + num_heads_v;
++
++    constexpr int numElemsPerThread = head_dim / 32;
++    accscalar_t elements[numElemsPerThread];
++
++    int offsetWarp;
++    if (isQ) {
++      offsetWarp = tokenIdx * num_heads * head_dim + headIdx * head_dim;
++    } else {
++      offsetWarp = tokenIdx * num_heads * head_dim + num_heads_q * head_dim + headIdx * head_dim;
++    }
++    int offsetThread = offsetWarp + laneId * numElemsPerThread;
++
++    // Load data and compute sum of squares for RMSNorm
++    accscalar_t sumOfSquares = 0.0f;
++    for (int i = 0; i < numElemsPerThread; i++) {
++      elements[i] = static_cast<accscalar_t>(qkv[offsetThread + i]);
++      sumOfSquares += elements[i] * elements[i];
++    }
++
++    // Reduce sum across sub-group (warp)
++    auto sg = item.get_sub_group();
++    sumOfSquares = sycl::reduce_over_group(sg, sumOfSquares, sycl::plus<accscalar_t>{});
++
++    // Compute RMS normalization factor
++    float rms_rcp = sycl::rsqrt(sumOfSquares / static_cast<float>(head_dim) + eps);
++
++    // Normalize elements
++    const scalar_t* weight_ptr = isQ ? q_weight : k_weight;
++    for (int i = 0; i < numElemsPerThread; i++) {
++      int dim = laneId * numElemsPerThread + i;
++      accscalar_t weight = static_cast<accscalar_t>(weight_ptr[dim]);
++      elements[i] *= rms_rcp * weight;
++    }
++
++    // Apply RoPE to normalized elements
++    accscalar_t elements2[numElemsPerThread];
++    accscalar_t cos_vals[numElemsPerThread];
++    accscalar_t sin_vals[numElemsPerThread];
++    float pos_id = static_cast<float>(position_ids[tokenIdx]);
++    const int rotary_lanes = rotary_dim / numElemsPerThread;
++    const bool applyRotary = (laneId < rotary_lanes);
++
++    if (applyRotary) {
++      if constexpr (interleave) {
++        // Interleave mode
++        for (int i = 0; i < numElemsPerThread; i++) {
++          elements2[i] = (i % 2 == 0) ? -elements[i + 1] : elements[i - 1];
++
++          int dim_idx = laneId * numElemsPerThread + i;
++          int half_dim = dim_idx / 2;
++          float freq = frequencies[half_dim];
++          float theta = pos_id * freq;
++          sin_vals[i] = sycl::sin(theta);
++          cos_vals[i] = sycl::cos(theta);
++        }
++      } else {
++        // Neox style - use XOR shuffle like CUDA
++        sycl::group_barrier(sg);
++        const int half_rotary_lanes = rotary_lanes / 2;
++
++        for (int i = 0; i < numElemsPerThread; i++) {
++          // XOR shuffle to exchange between first and second half
++          elements2[i] = sycl::permute_group_by_xor(sg, elements[i], half_rotary_lanes);
++          if (laneId < half_rotary_lanes) {
++            elements2[i] = -elements2[i];
++          }
++
++          int dim_idx = laneId * numElemsPerThread + i;
++          dim_idx = (dim_idx * 2) % rotary_dim;
++          int half_dim = dim_idx / 2;
++          float freq = frequencies[half_dim];
++          float theta = pos_id * freq;
++          sin_vals[i] = sycl::sin(theta);
++          cos_vals[i] = sycl::cos(theta);
++        }
++        sycl::group_barrier(sg);
++      }
++
++      // Apply rotation with attention_factor
++      for (int i = 0; i < numElemsPerThread; i++) {
++        elements[i] = (elements[i] * cos_vals[i] + elements2[i] * sin_vals[i]) * attention_factor;
++      }
++    }
++
++    // Store results
++    for (int i = 0; i < numElemsPerThread; i++) {
++      qkv[offsetThread + i] = static_cast<scalar_t>(elements[i]);
++    }
++  }
++};
++template <int head_dim, bool interleave, typename scalar_t>
++void launchFusedQKNormRopeImpl_xe35(
++    void* qkv,
++    int num_tokens,
++    int num_heads_q,
++    int num_heads_k,
++    int num_heads_v,
++    float eps,
++    const void* q_weight,
++    const void* k_weight,
++    float base,
++    const int* position_ids,
++    float factor,
++    float low,
++    float high,
++    float attention_factor,
++    int rotary_dim,
++    sycl::queue& q) {
++  constexpr int blockSize = 256;
++  const int warpsPerBlock = blockSize / 32;
++  const int totalQKHeads = num_heads_q + num_heads_k;
++  const int totalWarps = num_tokens * totalQKHeads;
++  const int gridSize = divUp_xe35(totalWarps, warpsPerBlock);
++
++  const float* table = qk_rope_cached_frequencies_xe35(q, base, rotary_dim, factor, low, high);
++  auto submit = [&]<bool UseTable>() {
++    FusedQKNormRopeKernel_xe35<head_dim, interleave, scalar_t, UseTable> kernel{
++        static_cast<scalar_t*>(qkv),
++        num_heads_q,
++        num_heads_k,
++        num_heads_v,
++        eps,
++        static_cast<const scalar_t*>(q_weight),
++        static_cast<const scalar_t*>(k_weight),
++        base,
++        position_ids,
++        num_tokens,
++        factor,
++        low,
++        high,
++        attention_factor,
++        rotary_dim,
++        qk_rope_frequency_storage_xe35<head_dim, UseTable>(table, base, rotary_dim, factor, low, high)};
++
++    sycl_kernel_submit(sycl::range<1>(gridSize * blockSize), sycl::range<1>(blockSize), q, kernel);
++  };
++  if (table)
++    submit.template operator()<true>();
++  else
++    submit.template operator()<false>();
++}
++
++SGL_KERNEL_EXPORT void fused_qk_norm_rope_xe35(
++    torch::Tensor& qkv,
++    int64_t num_heads_q,
++    int64_t num_heads_k,
++    int64_t num_heads_v,
++    int64_t head_dim,
++    double eps,
++    torch::Tensor& q_weight,
++    torch::Tensor& k_weight,
++    double base,
++    bool is_neox,
++    torch::Tensor& position_ids,
++    double factor,
++    double low,
++    double high,
++    double attention_factor,
++    int64_t rotary_dim) {
++  // Input validation
++  TORCH_CHECK(qkv.dim() == 2, "QKV tensor must be 2D: [num_tokens, (num_heads_q+num_heads_k+num_heads_v)*head_dim]");
++  TORCH_CHECK(position_ids.dim() == 1, "Position IDs must be 1D: [num_tokens]");
++  TORCH_CHECK(q_weight.dim() == 1, "Query weights must be 1D: [head_dim]");
++  TORCH_CHECK(k_weight.dim() == 1, "Key weights must be 1D: [head_dim]");
++  TORCH_CHECK(q_weight.size(0) == head_dim, "Query weights size must match head dimension");
++  TORCH_CHECK(k_weight.size(0) == head_dim, "Key weights size must match head dimension");
++  TORCH_CHECK(rotary_dim % (head_dim / 32) == 0, "rotary_dim must be divisible by numElemsPerThread");
++
++  if (is_neox) {
++    int64_t half_rotary_lanes = rotary_dim / (head_dim / 32) / 2;
++    TORCH_CHECK(
++        half_rotary_lanes >= 1 && (half_rotary_lanes & (half_rotary_lanes - 1)) == 0,
++        "half_rotary_lanes must be a power of 2 for neox style, got ",
++        half_rotary_lanes);
++  }
++
++  CHECK_DEVICE(qkv);
++  CHECK_CONTIGUOUS(qkv);
++  CHECK_DEVICE(position_ids);
++  CHECK_CONTIGUOUS(position_ids);
++  TORCH_CHECK(
++      position_ids.scalar_type() == at::ScalarType::Int,
++      "position_ids must have dtype int32 (at::kInt); got ",
++      position_ids.scalar_type());
++  CHECK_DEVICE(q_weight);
++  CHECK_CONTIGUOUS(q_weight);
++  CHECK_DEVICE(k_weight);
++  CHECK_CONTIGUOUS(k_weight);
++
++  int64_t num_tokens = qkv.size(0);
++  TORCH_CHECK(position_ids.size(0) == num_tokens, "Number of tokens in position_ids must match QKV");
++
++  int64_t total_heads = num_heads_q + num_heads_k + num_heads_v;
++  TORCH_CHECK(
++      qkv.size(1) == total_heads * head_dim, "QKV tensor size must match total number of heads and head dimension");
++
++  auto queue = dpcppGetCurrentQueue();
++  bool interleave = !is_neox;
++
++  // The Xe35 wide-access kernel is tuned for the two 16-bit types. Preserve
++  // the existing implementation for FP8 and for small shapes where its finer
++  // one-head-per-subgroup decomposition has better occupancy.
++  const int wide_lanes_per_head = static_cast<int>(head_dim) / (32 / static_cast<int>(qkv.element_size()));
++  const bool use_xe35_wide =
++      qkv.element_size() == 2 && !qk_norm_rope_kernel_xe35::prefer_baseline_xe35(
++                                     num_tokens, static_cast<int>(num_heads_q + num_heads_k), wide_lanes_per_head);
++
++// Maps at::ScalarType to the corresponding SYCL/cutlass C++ type (scalar_t)
++// and immediately invokes the callable passed as the variadic argument.
++// Float8_e4m3fn uses the cutlass type because native SYCL float8 is not yet
++// supported; Half and BFloat16 use their respective SYCL types.
++#define SYCL_DISPATCH_QK_FLOATING_TYPES_XE35(SCALAR_TYPE, KERNEL_NAME, ...)                 \
++  [&]() {                                                                           \
++    switch (SCALAR_TYPE) {                                                          \
++      case at::ScalarType::Half: {                                                  \
++        using scalar_t = sycl::half;                                                \
++        __VA_ARGS__();                                                              \
++        break;                                                                      \
++      }                                                                             \
++      case at::ScalarType::BFloat16: {                                              \
++        using scalar_t = sycl::ext::oneapi::bfloat16;                               \
++        __VA_ARGS__();                                                              \
++        break;                                                                      \
++      }                                                                             \
++      case at::ScalarType::Float8_e4m3fn: {                                         \
++        using scalar_t = float_e4m3_t;                                              \
++        __VA_ARGS__();                                                              \
++        break;                                                                      \
++      }                                                                             \
++      default:                                                                      \
++        TORCH_CHECK(false, "Unsupported dtype for " KERNEL_NAME ": ", SCALAR_TYPE); \
++    }                                                                               \
++  }()
++
++// The lambda is wrapped in an extra () so that commas in the template argument
++// list <HD, IL, scalar_t> are hidden from the preprocessor's argument splitter.
++#define LAUNCH_KERNEL(HD, IL)                                                    \
++  SYCL_DISPATCH_QK_FLOATING_TYPES_XE35(qkv.scalar_type(), "fused_qk_norm_rope", ([&]() { \
++                                 launchFusedQKNormRopeImpl_xe35<HD, IL, scalar_t>(    \
++                                     qkv.data_ptr(),                             \
++                                     static_cast<int>(num_tokens),               \
++                                     static_cast<int>(num_heads_q),              \
++                                     static_cast<int>(num_heads_k),              \
++                                     static_cast<int>(num_heads_v),              \
++                                     static_cast<float>(eps),                    \
++                                     q_weight.data_ptr(),                        \
++                                     k_weight.data_ptr(),                        \
++                                     static_cast<float>(base),                   \
++                                     position_ids.data_ptr<int>(),               \
++                                     static_cast<float>(factor),                 \
++                                     static_cast<float>(low),                    \
++                                     static_cast<float>(high),                   \
++                                     static_cast<float>(attention_factor),       \
++                                     static_cast<int>(rotary_dim),               \
++                                     queue);                                     \
++                               }))
++
++#define LAUNCH_XE35_KERNEL(HD, IL)                                                      \
++  SYCL_DISPATCH_QK_FLOATING_TYPES_XE35(qkv.scalar_type(), "fused_qk_norm_rope", ([&]() {        \
++                                 qk_norm_rope_kernel_xe35::launch_xe35<scalar_t, HD, IL>(     \
++                                     static_cast<scalar_t*>(qkv.data_ptr()),            \
++                                     static_cast<int>(num_tokens),                      \
++                                     static_cast<int>(num_heads_q),                     \
++                                     static_cast<int>(num_heads_k),                     \
++                                     static_cast<int>(num_heads_v),                     \
++                                     static_cast<float>(eps),                           \
++                                     static_cast<const scalar_t*>(q_weight.data_ptr()), \
++                                     static_cast<const scalar_t*>(k_weight.data_ptr()), \
++                                     static_cast<float>(base),                          \
++                                     position_ids.data_ptr<int>(),                      \
++                                     static_cast<float>(factor),                        \
++                                     static_cast<float>(low),                           \
++                                     static_cast<float>(high),                          \
++                                     static_cast<float>(attention_factor),              \
++                                     static_cast<int>(rotary_dim),                      \
++                                     queue);                                            \
++                               }))
++
++  switch (head_dim) {
++    case 64:
++      if (interleave) {
++        if (use_xe35_wide)
++          LAUNCH_XE35_KERNEL(64, true);
++        else
++          LAUNCH_KERNEL(64, true);
++      } else {
++        if (use_xe35_wide)
++          LAUNCH_XE35_KERNEL(64, false);
++        else
++          LAUNCH_KERNEL(64, false);
++      }
++      break;
++    case 128:
++      if (interleave) {
++        if (use_xe35_wide)
++          LAUNCH_XE35_KERNEL(128, true);
++        else
++          LAUNCH_KERNEL(128, true);
++      } else {
++        if (use_xe35_wide)
++          LAUNCH_XE35_KERNEL(128, false);
++        else
++          LAUNCH_KERNEL(128, false);
++      }
++      break;
++    case 256:
++      if (interleave) {
++        if (use_xe35_wide)
++          LAUNCH_XE35_KERNEL(256, true);
++        else
++          LAUNCH_KERNEL(256, true);
++      } else {
++        if (use_xe35_wide)
++          LAUNCH_XE35_KERNEL(256, false);
++        else
++          LAUNCH_KERNEL(256, false);
++      }
++      break;
++    default:
++      TORCH_CHECK(false, "Unsupported head dimension for fusedQKNormRope: ", head_dim);
++  }
++
++#undef LAUNCH_KERNEL
++#undef LAUNCH_XE35_KERNEL
++#undef SYCL_DISPATCH_QK_FLOATING_TYPES_XE35
++}
++
++}  // namespace at::native::xpu
+diff --git a/src/sycl/xe35/FusedQKNormRopeFrequency.h b/src/sycl/xe35/FusedQKNormRopeFrequency.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..1aa8591d7c73fbe7defa89f1d4d79b521fc3b4f0
+--- /dev/null
++++ b/src/sycl/xe35/FusedQKNormRopeFrequency.h
+@@ -0,0 +1,94 @@
++#pragma once
++
++#include <c10/util/Exception.h>
++
++#include <algorithm>
++#include <array>
++#include <cmath>
++#include <memory>
++#include <mutex>
++#include <sycl/sycl.hpp>
++#include <type_traits>
++#include <vector>
++
++namespace at::native::xpu {
++
++template <int HeadDim>
++inline std::array<float, HeadDim / 2>
++qk_rope_frequencies_xe35(float base, int rotary_dim, float factor, float low, float high) {
++  std::array<float, HeadDim / 2> frequencies{};
++  for (int half_dim = 0; half_dim < rotary_dim / 2; ++half_dim) {
++    float frequency = static_cast<float>(std::pow(static_cast<double>(base), -2.0 * half_dim / rotary_dim));
++    if (factor != 1.0f) {
++      const float high_adjusted = std::fabs(low - high) <= 1e-6f ? high + 0.001f : high;
++      const float ramp = std::clamp((2.0f * half_dim - low) / (high_adjusted - low), 0.0f, 1.0f);
++      frequency = (frequency / factor) * (1.0f - ramp) + frequency * ramp;
++    }
++    frequencies[half_dim] = frequency;
++  }
++  return frequencies;
++}
++
++struct QKRopeFrequencyTable_xe35 {
++  sycl::context context;
++  sycl::device device;
++  std::array<float, 4> parameters;
++  int rotary_dim;
++  float* data;
++
++  QKRopeFrequencyTable_xe35(const sycl::queue& queue, std::array<float, 4> parameters, int rotary_dim)
++      : context(queue.get_context()),
++        device(queue.get_device()),
++        parameters(parameters),
++        rotary_dim(rotary_dim),
++        data(sycl::malloc_shared<float>(rotary_dim / 2, device, context)) {
++    TORCH_CHECK(data != nullptr, "Failed to allocate QK RoPE frequency table");
++    const auto values =
++        qk_rope_frequencies_xe35<256>(parameters[0], rotary_dim, parameters[1], parameters[2], parameters[3]);
++    std::copy_n(values.data(), rotary_dim / 2, data);
++  }
++
++  ~QKRopeFrequencyTable_xe35() {
++    sycl::free(data, context);
++  }
++
++  bool matches(const sycl::queue& queue, const std::array<float, 4>& requested, int dim) const {
++    return rotary_dim == dim && parameters == requested && context == queue.get_context() &&
++           device == queue.get_device();
++  }
++};
++
++inline const float*
++qk_rope_cached_frequencies_xe35(const sycl::queue& queue, float base, int rotary_dim, float factor, float low, float high) {
++  if (!queue.get_device().has(sycl::aspect::usm_shared_allocations)) return nullptr;
++  const std::array<float, 4> parameters{base, factor, low, high};
++  static std::mutex mutex;
++  static std::vector<std::shared_ptr<QKRopeFrequencyTable_xe35>> tables;
++  thread_local std::shared_ptr<QKRopeFrequencyTable_xe35> last;
++  if (last && last->matches(queue, parameters, rotary_dim)) return last->data;
++  std::lock_guard<std::mutex> lock(mutex);
++  for (const auto& table : tables) {
++    if (table->matches(queue, parameters, rotary_dim)) {
++      last = table;
++      return table->data;
++    }
++  }
++  auto table = std::make_shared<QKRopeFrequencyTable_xe35>(queue, parameters, rotary_dim);
++  tables.push_back(table);
++  last = table;
++  return table->data;
++}
++
++template <int HeadDim, bool UseTable>
++using QKRopeFrequencyStorage_xe35 = std::conditional_t<UseTable, const float*, std::array<float, HeadDim / 2>>;
++
++template <int HeadDim, bool UseTable>
++inline QKRopeFrequencyStorage_xe35<HeadDim, UseTable>
++qk_rope_frequency_storage_xe35(const float* table, float base, int rotary_dim, float factor, float low, float high) {
++  if constexpr (UseTable)
++    return table;
++  else
++    return qk_rope_frequencies_xe35<HeadDim>(base, rotary_dim, factor, low, high);
++}
++
++}  // namespace at::native::xpu
+diff --git a/src/sycl/xe35/FusedQKNormRopeKernel.h b/src/sycl/xe35/FusedQKNormRopeKernel.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..264aa493b94e7386ce809d8192af6ebc7a6f1428
+--- /dev/null
++++ b/src/sycl/xe35/FusedQKNormRopeKernel.h
+@@ -0,0 +1,354 @@
++#pragma once
++
++#include <algorithm>
++#include <cstdint>
++#include <type_traits>
++
++#include "FusedQKNormRopeFrequency.h"
++#include "../MemoryAccess.h"
++#include "../SYCLHelpers.h"
++#include "../Utils.h"
++
++namespace at::native::xpu::qk_norm_rope_kernel_xe35 {
++
++constexpr int kSubgroupSize = 16;
++constexpr int kBytesPerLane = 32;
++constexpr int kTargetWorkgroup = 128;
++constexpr int kMaxWorkgroup = 256;
++constexpr int kMaxTokensPerWg = 4;
++constexpr int64_t kCacheTrafficBytes = 48ll << 20;
++constexpr int64_t kDramTrafficBytes = 100ll << 20;
++// The first repeatable BF16 128D sparse-row split gain starts at 300 MiB.
++constexpr int64_t kSparseRowSplitBytes = 300ll << 20;
++constexpr int64_t kSparseRowAlignmentBytes = 4ll << 10;
++constexpr int kCacheRoundCap = 9;
++constexpr int kDramRoundCap = 3;
++
++struct LaunchConfig_xe35 {
++  int wg_lanes;
++  int tokens_per_wg;
++  int clusters_per_token;
++  int heads_per_chunk;
++  int chunks_per_token;
++  int rounds;
++  int64_t groups;
++};
++
++inline LaunchConfig_xe35
++make_launch_xe35(int64_t num_tokens, int total_qk_heads, int lanes_per_head_xe35, int wg_lanes, int tokens_per_wg, int chunks) {
++  LaunchConfig_xe35 config{};
++  config.wg_lanes = wg_lanes;
++  config.tokens_per_wg = tokens_per_wg;
++  config.clusters_per_token = std::max(wg_lanes / lanes_per_head_xe35 / tokens_per_wg, 1);
++  config.chunks_per_token = chunks;
++  config.rounds = ((total_qk_heads + chunks - 1) / chunks + config.clusters_per_token - 1) / config.clusters_per_token;
++  config.heads_per_chunk = config.rounds * config.clusters_per_token;
++  config.chunks_per_token = (total_qk_heads + config.heads_per_chunk - 1) / config.heads_per_chunk;
++  config.groups = ((num_tokens + tokens_per_wg - 1) / tokens_per_wg) * config.chunks_per_token;
++  return config;
++}
++
++template <typename scalar_t, int HeadDim, bool Interleave>
++inline LaunchConfig_xe35 choose_launch_xe35(int64_t num_tokens, int total_qk_heads, int lanes_per_head_xe35, int row_heads) {
++  const int64_t slots_per_sg = std::max<int64_t>(kSubgroupSize / lanes_per_head_xe35, 1);
++  const int64_t wave = std::max<int64_t>(dpcppGpuEuCount() * dpcppGpuHWThreadsPerEU(), 1);
++  const int64_t work = num_tokens * total_qk_heads;
++  const int rounds = static_cast<int>(std::max<int64_t>(1, (work + slots_per_sg * wave - 1) / (slots_per_sg * wave)));
++  const int64_t traffic = 2 * work * lanes_per_head_xe35 * kBytesPerLane;
++  if constexpr (Interleave) {
++    // Keep the existing 64D split. Extend it only to measured BF16 128D rows.
++    const bool sparse_row = row_heads >= 2 * total_qk_heads;
++    const bool original_split = lanes_per_head_xe35 == 4 && traffic > kDramTrafficBytes;
++    const int64_t row_bytes = static_cast<int64_t>(row_heads) * HeadDim * sizeof(scalar_t);
++    const bool bf16_128d_split = std::is_same_v<scalar_t, sycl::ext::oneapi::bfloat16> && HeadDim == 128 &&
++                                 row_bytes % kSparseRowAlignmentBytes == 0 && traffic >= kSparseRowSplitBytes;
++    if (sparse_row && (original_split || bf16_128d_split)) {
++      return make_launch_xe35(num_tokens, total_qk_heads, lanes_per_head_xe35, 192, 1, 2);
++    }
++  }
++  const int round_cap = traffic > kDramTrafficBytes    ? kDramRoundCap
++                        : traffic > kCacheTrafficBytes ? kCacheRoundCap
++                                                       : rounds;
++
++  if (rounds > round_cap) {
++    const int cluster_cap = std::max(kMaxWorkgroup / lanes_per_head_xe35, 1);
++    const int clusters = std::min((total_qk_heads + round_cap - 1) / round_cap, cluster_cap);
++    return make_launch_xe35(num_tokens, total_qk_heads, lanes_per_head_xe35, clusters * lanes_per_head_xe35, 1, 1);
++  }
++
++  const int cluster_cap = std::max(kTargetWorkgroup / lanes_per_head_xe35, 1);
++  int clusters = 1;
++  int best_waste = -1;
++  for (int candidate = 1; candidate <= cluster_cap; ++candidate) {
++    const int chunks = (total_qk_heads + rounds * candidate - 1) / (rounds * candidate);
++    const int waste = chunks * rounds * candidate - total_qk_heads;
++    if (best_waste < 0 || waste <= best_waste) {
++      clusters = candidate;
++      best_waste = waste;
++    }
++  }
++
++  int tokens_per_wg = 1;
++  while (tokens_per_wg < kMaxTokensPerWg && clusters * lanes_per_head_xe35 * tokens_per_wg < kSubgroupSize) {
++    tokens_per_wg <<= 1;
++  }
++  const int chunks = (total_qk_heads + rounds * clusters - 1) / (rounds * clusters);
++  return make_launch_xe35(
++      num_tokens, total_qk_heads, lanes_per_head_xe35, clusters * lanes_per_head_xe35 * tokens_per_wg, tokens_per_wg, chunks);
++}
++
++inline int partner_lanes_for_xe35(int rotary_dim, int elements_per_lane) {
++  const int half = rotary_dim / 2;
++  if (half <= 0 || half % elements_per_lane != 0) return 0;
++  const int lanes = half / elements_per_lane;
++  return (lanes & (lanes - 1)) == 0 ? lanes : 0;
++}
++
++template <typename scalar_t>
++inline int lanes_per_head_xe35(int head_dim) {
++  const int wide = kBytesPerLane / sizeof(scalar_t);
++  return head_dim / std::min(head_dim, wide);
++}
++
++inline bool prefer_baseline_xe35(int64_t num_tokens, int total_qk_heads, int lanes_per_head_xe35) {
++  const int64_t slots_per_sg = std::max<int64_t>(kSubgroupSize / lanes_per_head_xe35, 1);
++  const int64_t subgroups = (num_tokens * total_qk_heads + slots_per_sg - 1) / slots_per_sg;
++  const int64_t wave = std::max<int64_t>(dpcppGpuEuCount() * dpcppGpuHWThreadsPerEU(), 1);
++  return subgroups * 4 < wave;
++}
++
++template <typename scalar_t, int HeadDim, bool Interleave, bool UseTable>
++struct Kernel_xe35 {
++  static constexpr int kElementsPerLane = kBytesPerLane / sizeof(scalar_t);
++  static constexpr int kLanesPerHead = HeadDim / kElementsPerLane;
++  using vec_t = aligned_vector_loop<scalar_t, kElementsPerLane>;
++
++  static_assert(HeadDim % kElementsPerLane == 0);
++  static_assert(kSubgroupSize % kLanesPerHead == 0);
++
++  scalar_t* qkv;
++  const scalar_t* q_weight;
++  const scalar_t* k_weight;
++  const int* position_ids;
++  float eps;
++  float base;
++  float factor;
++  float low;
++  float high;
++  float attention_factor;
++  int rotary_dim;
++  int num_tokens;
++  int num_heads_q;
++  int num_heads;
++  int total_qk_heads;
++  LaunchConfig_xe35 config;
++  int partner_lanes;
++  QKRopeFrequencyStorage_xe35<HeadDim, UseTable> frequencies;
++
++  template <int Delta>
++  void rotate_neox(
++      const sycl::sub_group& sg,
++      const float (&values)[kElementsPerLane],
++      const float (&cos_values)[kElementsPerLane],
++      const float (&sin_values)[kElementsPerLane],
++      int first_dim,
++      int half_rotary,
++      int rotary_count,
++      vec_t& output) const {
++#pragma unroll
++    for (int i = 0; i < kElementsPerLane; ++i) {
++      const float peer = sycl::permute_group_by_xor(sg, values[i], static_cast<uint32_t>(Delta));
++      const float rotated_peer = first_dim + i < half_rotary ? -peer : peer;
++      output[i] = static_cast<scalar_t>(
++          i < rotary_count ? (values[i] * cos_values[i] + rotated_peer * sin_values[i]) * attention_factor : values[i]);
++    }
++  }
++
++  [[sycl::reqd_sub_group_size(kSubgroupSize)]] void operator()(sycl::nd_item<1> item) const {
++    const auto sg = item.get_sub_group();
++    const int local_id = static_cast<int>(item.get_local_id(0));
++    const int group_id = static_cast<int>(item.get_group(0));
++    const int token_group = group_id / config.chunks_per_token;
++    const int chunk = group_id - token_group * config.chunks_per_token;
++    const int cluster = local_id / kLanesPerHead;
++    const int first_dim = (local_id - cluster * kLanesPerHead) * kElementsPerLane;
++    const int local_token = cluster / config.clusters_per_token;
++    const int slot = cluster - local_token * config.clusters_per_token;
++    const int half_rotary = rotary_dim / 2;
++    const int token_raw = token_group * config.tokens_per_wg + local_token;
++    const bool token_live = token_raw < num_tokens;
++    const int token = token_live ? token_raw : num_tokens - 1;
++
++    auto local =
++        sycl::ext::oneapi::group_local_memory_for_overwrite<float[kMaxTokensPerWg * 2 * HeadDim]>(item.get_group());
++    float* table = *local;
++    for (int index = local_id; index < config.tokens_per_wg * HeadDim; index += config.wg_lanes) {
++      const int local_table_token = index / HeadDim;
++      const int dim = index - local_table_token * HeadDim;
++      const int table_token = std::min(token_group * config.tokens_per_wg + local_table_token, num_tokens - 1);
++      const int half_dim = Interleave ? dim / 2 : (dim < half_rotary ? dim : dim - half_rotary);
++      const float theta =
++          dim < rotary_dim ? static_cast<float>(position_ids[table_token]) * frequencies[half_dim] : 0.0f;
++      table[local_table_token * 2 * HeadDim + dim] = sycl::sin(theta);
++      table[local_table_token * 2 * HeadDim + HeadDim + dim] = sycl::cos(theta);
++    }
++    sycl::group_barrier(item.get_group());
++
++    float sin_values[kElementsPerLane];
++    float cos_values[kElementsPerLane];
++    const float* token_table = table + local_token * 2 * HeadDim;
++#pragma unroll
++    for (int i = 0; i < kElementsPerLane; ++i) {
++      sin_values[i] = token_table[first_dim + i];
++      cos_values[i] = token_table[HeadDim + first_dim + i];
++    }
++
++    const int rotary_count = rotary_dim - first_dim;
++    const int64_t token_offset = static_cast<int64_t>(token) * num_heads * HeadDim;
++    const int base_head = chunk * config.heads_per_chunk;
++    const int heads_here = std::min(total_qk_heads - base_head, config.heads_per_chunk);
++    const int rounds = (heads_here + config.clusters_per_token - 1) / config.clusters_per_token;
++    auto head_for = [&](int round) {
++      return std::min(base_head + round * config.clusters_per_token + slot, base_head + heads_here - 1);
++    };
++    auto row_for = [&](int head) { return qkv + token_offset + static_cast<int64_t>(head) * HeadDim; };
++
++    float weights[kElementsPerLane];
++    bool weight_is_q = false;
++    bool weight_valid = false;
++    for (int round = 0; round < rounds; ++round) {
++      const int head = head_for(round);
++      const vec_t input = *reinterpret_cast<const vec_t*>(row_for(head) + first_dim);
++      const bool store = token_live && base_head + round * config.clusters_per_token + slot < base_head + heads_here;
++
++      float square_sum = 0.0f;
++#pragma unroll
++      for (int i = 0; i < kElementsPerLane; ++i) {
++        const float value = static_cast<float>(input[i]);
++        square_sum += value * value;
++      }
++#pragma unroll
++      for (int step = 1; step < kLanesPerHead; step <<= 1) {
++        square_sum += sycl::permute_group_by_xor(sg, square_sum, static_cast<uint32_t>(step));
++      }
++
++      const float reciprocal_rms = sycl::rsqrt(square_sum / static_cast<float>(HeadDim) + eps);
++      const bool is_q = head < num_heads_q;
++      if (!weight_valid || is_q != weight_is_q) {
++        const vec_t weight = *reinterpret_cast<const vec_t*>((is_q ? q_weight : k_weight) + first_dim);
++#pragma unroll
++        for (int i = 0; i < kElementsPerLane; ++i)
++          weights[i] = static_cast<float>(weight[i]);
++        weight_is_q = is_q;
++        weight_valid = true;
++      }
++
++      float values[kElementsPerLane];
++#pragma unroll
++      for (int i = 0; i < kElementsPerLane; ++i) {
++        values[i] = static_cast<float>(input[i]) * reciprocal_rms * weights[i];
++      }
++
++      vec_t output;
++      if constexpr (Interleave) {
++#pragma unroll
++        for (int i = 0; i < kElementsPerLane; i += 2) {
++          const float first = values[i];
++          const float second = values[i + 1];
++          output[i] = static_cast<scalar_t>(
++              i < rotary_count ? (first * cos_values[i] - second * sin_values[i]) * attention_factor : first);
++          output[i + 1] = static_cast<scalar_t>(
++              i + 1 < rotary_count ? (second * cos_values[i + 1] + first * sin_values[i + 1]) * attention_factor
++                                   : second);
++        }
++      } else {
++        switch (partner_lanes) {
++          case 1:
++            rotate_neox<1>(sg, values, cos_values, sin_values, first_dim, half_rotary, rotary_count, output);
++            break;
++          case 2:
++            rotate_neox<2>(sg, values, cos_values, sin_values, first_dim, half_rotary, rotary_count, output);
++            break;
++          case 4:
++            rotate_neox<4>(sg, values, cos_values, sin_values, first_dim, half_rotary, rotary_count, output);
++            break;
++          case 8:
++            rotate_neox<8>(sg, values, cos_values, sin_values, first_dim, half_rotary, rotary_count, output);
++            break;
++          default: {
++            const scalar_t* row = row_for(head);
++            const scalar_t* weight = is_q ? q_weight : k_weight;
++#pragma unroll
++            for (int i = 0; i < kElementsPerLane; ++i) {
++              if (i >= rotary_count) {
++                output[i] = static_cast<scalar_t>(values[i]);
++                continue;
++              }
++              const int dim = first_dim + i;
++              const bool lower = dim < half_rotary;
++              const int peer_dim = lower ? dim + half_rotary : dim - half_rotary;
++              const float peer =
++                  static_cast<float>(row[peer_dim]) * reciprocal_rms * static_cast<float>(weight[peer_dim]);
++              output[i] = static_cast<scalar_t>(
++                  (values[i] * cos_values[i] + (lower ? -peer : peer) * sin_values[i]) * attention_factor);
++            }
++            break;
++          }
++        }
++      }
++      if (store) *reinterpret_cast<vec_t*>(row_for(head) + first_dim) = output;
++    }
++  }
++};
++
++template <typename scalar_t, int HeadDim, bool Interleave>
++void launch_xe35(
++    scalar_t* qkv,
++    int num_tokens,
++    int num_heads_q,
++    int num_heads_k,
++    int num_heads_v,
++    float eps,
++    const scalar_t* q_weight,
++    const scalar_t* k_weight,
++    float base,
++    const int* position_ids,
++    float factor,
++    float low,
++    float high,
++    float attention_factor,
++    int rotary_dim,
++    sycl::queue& queue) {
++  constexpr int lanes = Kernel_xe35<scalar_t, HeadDim, Interleave, true>::kLanesPerHead;
++  const LaunchConfig_xe35 config = choose_launch_xe35<scalar_t, HeadDim, Interleave>(
++      num_tokens, num_heads_q + num_heads_k, lanes, num_heads_q + num_heads_k + num_heads_v);
++  const float* table = qk_rope_cached_frequencies_xe35(queue, base, rotary_dim, factor, low, high);
++  auto submit = [&]<bool UseTable>() {
++    Kernel_xe35<scalar_t, HeadDim, Interleave, UseTable> kernel{
++        qkv,
++        q_weight,
++        k_weight,
++        position_ids,
++        eps,
++        base,
++        factor,
++        low,
++        high,
++        attention_factor,
++        rotary_dim,
++        num_tokens,
++        num_heads_q,
++        num_heads_q + num_heads_k + num_heads_v,
++        num_heads_q + num_heads_k,
++        config,
++        partner_lanes_for_xe35(rotary_dim, Kernel_xe35<scalar_t, HeadDim, Interleave, UseTable>::kElementsPerLane),
++        qk_rope_frequency_storage_xe35<HeadDim, UseTable>(table, base, rotary_dim, factor, low, high)};
++    sycl_kernel_submit(sycl::range<1>(config.groups * config.wg_lanes), sycl::range<1>(config.wg_lanes), queue, kernel);
++  };
++  if (table)
++    submit.template operator()<true>();
++  else
++    submit.template operator()<false>();
++}
++
++}  // namespace at::native::xpu::qk_norm_rope_kernel_xe35
+diff --git a/src/torch_extension_sycl.cc b/src/torch_extension_sycl.cc
+index 8603e536b016ae275cc7e77d48e1a312532d48c2..a4fd978eabf1ad6493cd40eaa74efd484cc82880 100644
+--- a/src/torch_extension_sycl.cc
++++ b/src/torch_extension_sycl.cc
+@@ -537,6 +537,13 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
+       "float eps, Tensor! q_weight, Tensor! k_weight, float base, bool is_neox, Tensor! position_ids, "
+       "float factor, float low, float high, float attention_factor, int rotary_dim) -> ()");
+   m.impl("fused_qk_norm_rope", torch::kXPU, &at::native::xpu::fused_qk_norm_rope);
++#if SYCL_INTEL_TARGET == 35
++  m.def(
++      "fused_qk_norm_rope_xe35(Tensor! qkv, int num_heads_q, int num_heads_k, int num_heads_v, int head_dim, "
++      "float eps, Tensor! q_weight, Tensor! k_weight, float base, bool is_neox, Tensor! position_ids, "
++      "float factor, float low, float high, float attention_factor, int rotary_dim) -> ()");
++  m.impl("fused_qk_norm_rope_xe35", torch::kXPU, &at::native::xpu::fused_qk_norm_rope_xe35);
++#endif
+   m.def(
+       "fused_inplace_qknorm_rope(Tensor! q, Tensor! k, Tensor q_weight, Tensor k_weight, "
+       "Tensor cos_sin_cache, Tensor positions, bool is_neox, float eps, int head_dim=0, int rope_dim=0) -> ()");
+diff --git a/tests/test_fused_qk_norm_rope.py b/tests/test_fused_qk_norm_rope.py
+index 2d40d3032e7db8bdea2796dd710952b2d8b6e9b0..1b8079f75927cc186f78b5f4d29f402dee7e1630 100644
+--- a/tests/test_fused_qk_norm_rope.py
++++ b/tests/test_fused_qk_norm_rope.py
+@@ -1148,5 +1148,125 @@ def test_fused_k_norm_rope_flashmla_zero_batch():
+     )
+ 
+ 
++@pytest.mark.arch("xe35")
++@pytest.mark.parametrize("tokens", [8, 32768])
++def test_production_reference_xe35(tokens):
++    import subprocess
++    import time
++    from pathlib import Path
++
++    benchmark = Path(__file__).resolve().parents[1] / "benchmark"
++    result = subprocess.run(
++        [
++            sys.executable,
++            str(benchmark / "validate_qk_norm_rope_b8.py"),
++            "--tokens",
++            str(tokens),
++            "--entry",
++            "xe35",
++        ],
++        capture_output=True,
++        text=True,
++    )
++    print(result.stdout)
++    assert result.returncode == 0, result.stdout + result.stderr
++    torch.xpu.synchronize()
++    time.sleep(2)
++
++
++@pytest.mark.arch("xe35")
++@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
++@pytest.mark.parametrize("execution", ["cold_graph", "streams"])
++def test_frequency_lifetime_and_generic_dispatch_xe35(dtype, execution):
++    import time
++
++    torch.manual_seed(127)
++    tokens, dim = 8, 64
++    original = torch.randn(tokens, 288 * dim, device="xpu:0", dtype=dtype)
++    weights_q = torch.full(
++        (dim,), 43.7840518911 / dim**0.5, device="xpu:0", dtype=dtype
++    )
++    weights_k = torch.ones(dim, device="xpu:0", dtype=dtype)
++    positions = torch.tensor(
++        [0, 1, 255, 1023, 2047, 4094, 4095, 4095], device="xpu:0", dtype=torch.int32
++    )
++    base = (
++        130003.0
++        + (16 if dtype == torch.float16 else 0)
++        + (10000 if execution == "streams" else 0)
++    )
++    buffers = [original.clone(), original.clone()]
++
++    def invoke_xe35(buffer, generic=False):
++        entry = (
++            sgl_kernel.fused_qk_norm_rope
++            if generic
++            else sgl_kernel.fused_qk_norm_rope_xe35
++        )
++        entry(
++            buffer,
++            128,
++            16,
++            144,
++            dim,
++            1e-5,
++            weights_q,
++            weights_k,
++            base,
++            False,
++            positions,
++            rotary_dim=dim,
++        )
++
++    if execution == "cold_graph":
++        graph = torch.xpu.XPUGraph()
++        with torch.xpu.graph(graph):
++            invoke_xe35(buffers[0])
++        graph.replay()
++        invoke_xe35(buffers[1], generic=True)
++    else:
++        streams = [torch.xpu.Stream(), torch.xpu.Stream()]
++        for stream, buffer in zip(streams, buffers):
++            stream.wait_stream(torch.xpu.current_stream())
++            with torch.xpu.stream(stream):
++                invoke_xe35(buffer, generic=buffer is buffers[1])
++    torch.xpu.synchronize()
++    frequencies = (
++        base ** (-torch.arange(0, dim, 2, dtype=torch.float64) / dim)
++    ).float()
++    theta = positions.cpu().float()[:, None] * frequencies[None, :]
++    cosine, sine = theta.cos()[:, None, :], theta.sin()[:, None, :]
++    rows = original.cpu().reshape(tokens, 288, dim).float()
++    active = rows[:, :144]
++    weights = torch.cat(
++        (
++            weights_q.cpu().float().expand(128, dim),
++            weights_k.cpu().float().expand(16, dim),
++        )
++    )
++    normalized = (
++        active * torch.rsqrt(active.square().mean(-1, keepdim=True) + 1e-5) * weights
++    )
++    even, odd = normalized[..., ::2], normalized[..., 1::2]
++    expected = torch.stack(
++        (even * cosine - odd * sine, odd * cosine + even * sine), -1
++    ).flatten(-2)
++    tolerance = 5e-3 if dtype == torch.bfloat16 else 1e-3
++    for buffer in buffers:
++        actual = buffer.cpu().reshape(tokens, 288, dim)
++        torch.testing.assert_close(
++            actual[:, :144].float(), expected, atol=tolerance, rtol=tolerance
++        )
++        assert torch.equal(
++            actual[:, 144:].view(torch.uint16),
++            original.cpu().reshape(tokens, 288, dim)[:, 144:].view(torch.uint16),
++        )
++    assert torch.equal(
++        buffers[0].cpu().view(torch.uint16), buffers[1].cpu().view(torch.uint16)
++    )
++    torch.xpu.synchronize()
++    time.sleep(2)
++
++
+ if __name__ == "__main__":
+     sys.exit(pytest.main([__file__]))

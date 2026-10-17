@@ -1,0 +1,29 @@
+commit 5fb14b2f257e16564f3c4eb5ba9db8b9579ff555
+Author: Yuankun Shi <yuankun.shi@intel.com>
+Date:   Fri Oct 16 04:06:21 2026 +0800
+
+    fix(xpu): enforce independent routing and quantization accuracy gates
+
+diff --git a/src/sycl/TripleOps.cpp b/src/sycl/TripleOps.cpp
+index 3549f6b..4fde3a9 100644
+--- a/src/sycl/TripleOps.cpp
++++ b/src/sycl/TripleOps.cpp
+@@ -78,12 +78,12 @@ struct op_and_mul_functor {
+   int64_t dim;
+ };
+ 
+-#define VEC_LAUNCH(KERNEL, N)                                                \
+-  case N: {                                                                  \
+-    op_and_mul_functor<T_to, KERNEL<T_to, accscalar_t>, N> kfn = {           \
+-        .input_ptr = _input, .output_ptr = _out, .num_ = numel, .dim = dim}; \
+-    sycl_kernel_submit(num_group* wg_size, wg_size, q, kfn);                 \
+-    break;                                                                   \
++#define VEC_LAUNCH(KERNEL, N)                                                  \
++  case N: {                                                                    \
++    op_and_mul_functor<T_to, KERNEL<T_to, at::opmath_type<T_from>>, N> kfn = { \
++        .input_ptr = _input, .output_ptr = _out, .num_ = numel, .dim = dim};   \
++    sycl_kernel_submit(num_group* wg_size, wg_size, q, kfn);                   \
++    break;                                                                     \
+   }
+ 
+ template <typename T = float>

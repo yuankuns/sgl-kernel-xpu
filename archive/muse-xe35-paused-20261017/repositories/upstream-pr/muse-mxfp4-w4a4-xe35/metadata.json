@@ -1,0 +1,39 @@
+{
+  "directory": "/home/syk/worktrees/sgl-kernel-xpu-up/pr/muse-mxfp4-w4a4-xe35",
+  "head": "833c95208dccd2af5628c121222f91186a5b2de7",
+  "branch": "pr/muse-mxfp4-w4a4-xe35",
+  "patch_sha256": "456a80819f04eb2543d019805061aad4867587894d20ba60101343a8d5a8295a",
+  "tracked_paths": [
+    "cmake/BuildFlags.cmake",
+    "include/sgl_kernel_ops.h",
+    "python/sgl_kernel/__init__.py",
+    "python/sgl_kernel/moe.py",
+    "src/BuildOnLinux.cmake",
+    "src/CMakeLists.txt",
+    "src/sycl/Device.cpp",
+    "src/sycl/HCHead.cpp",
+    "src/torch_extension_sycl.cc",
+    "tests/conftest.py"
+  ],
+  "untracked_code": [
+    "benchmark/accuracy_reference.py",
+    "benchmark/bench_mxfp4_decode.py",
+    "include/sgl_kernel/xe35/mxfp4_w4a4.h",
+    "src/sycl/xe35/moe/collective/moe_array_epilogue.hpp",
+    "src/sycl/xe35/moe/collective/moe_array_mma.hpp",
+    "src/sycl/xe35/moe/collective/moe_array_mma_fp8block.hpp",
+    "src/sycl/xe35/moe/collective/moe_array_mma_mxfp.hpp",
+    "src/sycl/xe35/moe/collective/moe_bf16_reorder.hpp",
+    "src/sycl/xe35/moe/collective/moe_callbacks.hpp",
+    "src/sycl/xe35/moe/collective/moe_dtype_policy.hpp",
+    "src/sycl/xe35/moe/collective/moe_gemm_array_cooperative.hpp",
+    "src/sycl/xe35/moe/collective/moe_tile_scheduler.hpp",
+    "src/sycl/xe35/moe/collective/moe_tile_scheduler_params.h",
+    "src/sycl/xe35/moe/collective/xe_blockfp8_mma.hpp",
+    "src/sycl/xe35/moe/device/grouped_gemm_runner.hpp",
+    "src/sycl/xe35/moe_grouped_mm_mxfp4_w4a4.cpp",
+    "src/sycl/xe35/mxfp4_moe_scale_layout.cpp",
+    "tests/test_mxfp4_moe_w4a4.py"
+  ],
+  "apply_check": "PASS"
+}

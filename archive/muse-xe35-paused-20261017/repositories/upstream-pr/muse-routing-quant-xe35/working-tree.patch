@@ -1,0 +1,3714 @@
+diff --git a/benchmark/bench_routing_quant_audit.py b/benchmark/bench_routing_quant_audit.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..3411cda11a6e26eda034241efe25a2d972423d8f
+--- /dev/null
++++ b/benchmark/bench_routing_quant_audit.py
+@@ -0,0 +1,572 @@
++"""B8 routing and MXFP4 device-time probes through one CLI."""
++
++import argparse
++import json
++import statistics
++import time
++
++GRAPH_REPLAY = 1
++
++
++def parse_args_xe35(argv=None):
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument("--mode", choices=("audit", "padded-gather"), default="audit")
++    parser.add_argument("--op", choices=("all", "quant", "route"), default="all")
++    parser.add_argument(
++        "--serving-batch", "--batch", dest="serving_batch", type=int, default=8
++    )
++    parser.add_argument("--isl", type=int, default=4096)
++    parser.add_argument("--osl", type=int, default=16)
++    parser.add_argument("--tp", type=int, default=1)
++    parser.add_argument("--ep", type=int, default=1)
++    parser.add_argument("--branch", action="store_true")
++    parser.add_argument("--triton-route", action="store_true")
++    parser.add_argument("--quant-only", action="store_true")
++    parser.add_argument("--lane-only", action="store_true")
++    parser.add_argument("--fused-only", action="store_true")
++    parser.add_argument("--warmup", type=int)
++    parser.add_argument("--rep", type=int, default=21)
++    parser.add_argument("--repeat", type=int, default=10)
++    parser.add_argument("--graph-replay", type=int, default=1)
++    parser.add_argument(
++        "--shapes",
++        nargs="+",
++        type=int,
++        default=(64, 128, 252, 256, 260, 368, 372, 376, 512, 1024),
++    )
++    parser.add_argument("--tokens", nargs="+", type=int)
++    parser.add_argument("--hidden", type=int, default=4096)
++    parser.add_argument("--topk", type=int, default=8)
++    parser.add_argument("--experts", type=int, default=256)
++    parser.add_argument("--alignment", type=int, default=4)
++    args = parser.parse_args(argv)
++    if args.serving_batch != 8:
++        parser.error("Muse-Spark serving benchmarks require --serving-batch 8")
++    if (args.isl, args.osl, args.tp, args.ep) != (4096, 16, 1, 1):
++        parser.error("serving scope requires ISL4096/OSL16/TP1/EP1")
++    if args.warmup is None:
++        args.warmup = 3 if args.mode == "padded-gather" else 5
++    if args.warmup < 0 or args.rep < 1 or args.repeat < 1 or args.graph_replay < 1:
++        parser.error("warmup must be nonnegative; repeat counts must be positive")
++    if args.hidden < 1 or args.hidden % 32 or any(rows < 1 for rows in args.shapes):
++        parser.error(
++            "hidden must be positive and divisible by32; shapes must be positive"
++        )
++    if args.tokens is None:
++        args.tokens = (8, 8 * args.isl)
++    if any(tokens < 1 for tokens in args.tokens):
++        parser.error("--tokens values must be positive")
++    if (
++        args.topk < 1
++        or args.experts < 1
++        or args.alignment < 1
++        or args.topk > args.experts
++    ):
++        parser.error("topk/alignment must be positive, with topk <= experts")
++    if args.mode == "padded-gather" and args.op == "route":
++        parser.error("padded-gather mode does not benchmark routing")
++    if args.mode == "audit" and (args.topk, args.experts, args.alignment) != (
++        8,
++        256,
++        4,
++    ):
++        parser.error("audit mode requires topk8/experts256/alignment4")
++    if args.op == "route" and (args.quant_only or args.lane_only or args.fused_only):
++        parser.error("quantization-only flags are incompatible with --op route")
++    args.quant_only = args.quant_only or args.op == "quant"
++    return args
++
++
++def check_route_xe35(weights, ids, logits, bias, multiplier):
++    scores = torch.sigmoid((logits * multiplier).float())
++    rank_scores = scores + bias
++    assert bool(((ids >= 0) & (ids < logits.size(1))).all())
++    assert bool((torch.diff(torch.sort(ids, dim=-1).values, dim=-1) != 0).all())
++    torch.testing.assert_close(
++        rank_scores.gather(1, ids.long()),
++        torch.topk(rank_scores, ids.size(1), dim=-1, sorted=True).values,
++        rtol=0,
++        atol=0,
++    )
++    selected = scores.gather(1, ids.long())
++    torch.testing.assert_close(
++        weights,
++        selected / (selected.sum(dim=-1, keepdim=True) + 1e-15),
++        rtol=3e-4,
++        atol=3e-4,
++    )
++
++
++def bench_xe35(name, fn, warmup, rep):
++    global GRAPH_REPLAY
++    for _ in range(warmup):
++        fn()
++    torch.xpu.synchronize()
++    if GRAPH_REPLAY > 1:
++        graph = torch.xpu.XPUGraph()
++        with torch.xpu.graph(graph):
++            fn()
++        torch.xpu.synchronize()
++    samples = []
++    for _ in range(rep):
++        start = torch.xpu.Event(enable_timing=True)
++        end = torch.xpu.Event(enable_timing=True)
++        start.record()
++        if GRAPH_REPLAY > 1:
++            for _ in range(GRAPH_REPLAY):
++                graph.replay()
++        else:
++            fn()
++        end.record()
++        end.synchronize()
++        samples.append(start.elapsed_time(end) * 1000 / GRAPH_REPLAY)
++    ordered = sorted(samples)
++    print(
++        json.dumps(
++            {
++                "name": name,
++                "graph_replay": GRAPH_REPLAY,
++                "samples_us": samples,
++                "p20_us": ordered[round(0.2 * (len(ordered) - 1))],
++                "p50_us": statistics.median(ordered),
++                "p80_us": ordered[round(0.8 * (len(ordered) - 1))],
++            }
++        ),
++        flush=True,
++    )
++
++
++def measure_padded_xe35(fn, warmup, repeat):
++    for _ in range(warmup):
++        fn()
++    torch.xpu.synchronize()
++
++    samples = []
++    for _ in range(repeat):
++        start = torch.xpu.Event(enable_timing=True)
++        end = torch.xpu.Event(enable_timing=True)
++        start.record()
++        fn()
++        end.record()
++        end.synchronize()
++        samples.append(start.elapsed_time(end))
++    return statistics.median(samples)
++
++
++def baseline_xe35(hidden_states, row_map, rows_per_expert):
++    gathered = hidden_states.index_select(0, row_map)
++    output_q, scales_rm = sgl_per_token_group_quant_fp4_xe35(gathered, group_size=32)
++    scales_mn = torch.empty_like(scales_rm)
++    mxfp4_moe_scale_to_mn_major_xe35(scales_mn, scales_rm, rows_per_expert)
++    return output_q, scales_mn
++
++
++def gather_quant_relayout_xe35(hidden_states, row_map, rows_per_expert):
++    output_q, scales_rm = sgl_padded_gather_per_token_group_quant_fp4_xe35(
++        hidden_states, row_map, group_size=32
++    )
++    scales_mn = torch.empty_like(scales_rm)
++    mxfp4_moe_scale_to_mn_major_xe35(scales_mn, scales_rm, rows_per_expert)
++    return output_q, scales_mn
++
++
++def gather_quant_only_xe35(hidden_states, row_map):
++    return sgl_padded_gather_per_token_group_quant_fp4_xe35(
++        hidden_states, row_map, group_size=32
++    )
++
++
++def relayout_only_xe35(scales_rm, rows_per_expert):
++    scales_mn = torch.empty_like(scales_rm)
++    mxfp4_moe_scale_to_mn_major_xe35(scales_mn, scales_rm, rows_per_expert)
++    return scales_mn
++
++
++def swiglu_quant_relayout_xe35(gate_up, rows_per_expert):
++    output_q, scales_rm = sgl_per_token_group_quant_fp4_xe35(
++        gate_up, group_size=32, fuse_silu_and_mul=True
++    )
++    scales_mn = torch.empty_like(scales_rm)
++    mxfp4_moe_scale_to_mn_major_xe35(scales_mn, scales_rm, rows_per_expert)
++    return output_q, scales_mn
++
++
++def logical_bytes_xe35(rows, hidden, path):
++    # Count each logical stream once. The baseline_xe35 first reads and writes a
++    # gathered BF16 surface, then reads it for quantization. Both paths write
++    # packed FP4 values and one UE8M0 byte per group of 32 values. The legacy
++    # paths additionally read and rewrite the row-major scale surface.
++    bf16_bytes = 2
++    fp4_bytes = 0.5
++    scale_bytes = 1 / 32
++    if path == "baseline_xe35":
++        streams_per_element = 3 * bf16_bytes + fp4_bytes + 3 * scale_bytes
++    elif path == "gather_relayout":
++        streams_per_element = bf16_bytes + fp4_bytes + 3 * scale_bytes
++    elif path == "swiglu_relayout":
++        streams_per_element = 2 * bf16_bytes + fp4_bytes + 3 * scale_bytes
++    else:
++        raise ValueError(f"unknown path: {path}")
++    return rows * hidden * streams_per_element
++
++
++def routing_metadata_xe35(routed_rows, experts, alignment, rows, device):
++    active_experts = min(experts, routed_rows)
++    base, remainder = divmod(routed_rows, active_experts)
++    counts = torch.zeros(experts, dtype=torch.int32)
++    counts[:active_experts] = base
++    counts[:remainder] += 1
++    padded_counts = (
++        torch.div(counts + alignment - 1, alignment, rounding_mode="floor") * alignment
++    )
++    used_rows = int(padded_counts.sum())
++    assert used_rows <= rows
++    return padded_counts.to(device), used_rows
++
++
++def run_padded_gather_xe35(args):
++    if not torch.xpu.is_available():
++        raise RuntimeError("an XPU is required")
++    device = torch.xpu.get_device_properties(0)
++    print(
++        f"device={device.name} device_id=0x{device.device_id:04x} "
++        f"B={args.serving_batch} ISL={args.isl} OSL={args.osl} TP={args.tp} EP={args.ep}"
++    )
++
++    for token_count in args.tokens:
++        torch.xpu.synchronize()
++        time.sleep(2)
++        routed_rows = token_count * args.topk
++        rows = routed_rows + (args.alignment - 1) * min(args.experts, routed_rows)
++        hidden_states = torch.randn(
++            (token_count, args.hidden), dtype=torch.bfloat16, device="xpu"
++        )
++        gate_up = torch.randn(
++            (rows, 2 * args.hidden), dtype=torch.bfloat16, device="xpu"
++        )
++        padded_counts, used_rows = routing_metadata_xe35(
++            routed_rows,
++            args.experts,
++            args.alignment,
++            rows,
++            hidden_states.device,
++        )
++        row_map_i32 = torch.arange(rows, dtype=torch.int32, device="xpu") % token_count
++        expected_q, expected_s = baseline_xe35(hidden_states, row_map_i32, padded_counts)
++        gather_q, gather_s = gather_quant_relayout_xe35(
++            hidden_states, row_map_i32, padded_counts
++        )
++        used_scale_bytes = used_rows * (args.hidden // 32)
++        if not torch.equal(expected_q, gather_q) or not torch.equal(
++            expected_s.view(-1)[:used_scale_bytes],
++            gather_s.view(-1)[:used_scale_bytes],
++        ):
++            raise AssertionError(
++                f"optimized output differs for tokens={token_count}, rows={rows}"
++            )
++        del expected_q, expected_s, gather_q, gather_s
++        torch.xpu.synchronize()
++
++        baseline_ms = measure_padded_xe35(
++            lambda: baseline_xe35(hidden_states, row_map_i32, padded_counts),
++            args.warmup,
++            args.repeat,
++        )
++        gather_relayout_ms = measure_padded_xe35(
++            lambda: gather_quant_relayout_xe35(hidden_states, row_map_i32, padded_counts),
++            args.warmup,
++            args.repeat,
++        )
++        _, scales_rm = gather_quant_only_xe35(hidden_states, row_map_i32)
++        gather_quant_ms = measure_padded_xe35(
++            lambda: gather_quant_only_xe35(hidden_states, row_map_i32),
++            args.warmup,
++            args.repeat,
++        )
++        relayout_ms = measure_padded_xe35(
++            lambda: relayout_only_xe35(scales_rm, padded_counts),
++            args.warmup,
++            args.repeat,
++        )
++        swiglu_relayout_ms = measure_padded_xe35(
++            lambda: swiglu_quant_relayout_xe35(gate_up, padded_counts),
++            args.warmup,
++            args.repeat,
++        )
++        baseline_gbps = logical_bytes_xe35(rows, args.hidden, "baseline_xe35") / baseline_ms / 1e6
++        gather_relayout_gbps = (
++            logical_bytes_xe35(rows, args.hidden, "gather_relayout")
++            / gather_relayout_ms
++            / 1e6
++        )
++        swiglu_relayout_gbps = (
++            logical_bytes_xe35(rows, args.hidden, "swiglu_relayout")
++            / swiglu_relayout_ms
++            / 1e6
++        )
++
++        print(
++            f"tokens={token_count} routed_rows={routed_rows} "
++            f"used_rows={used_rows} padded_upper_rows={rows}: "
++            f"index_select+quant+relayout={baseline_ms:.4f} ms/"
++            f"{baseline_gbps:.1f} logical GB/s, "
++            f"gather+quant+relayout={gather_relayout_ms:.4f} ms/"
++            f"{gather_relayout_gbps:.1f} logical GB/s, "
++            f"gather+quant={gather_quant_ms:.4f} ms, "
++            f"scale_relayout={relayout_ms:.4f} ms, "
++            f"speedup={baseline_ms / gather_relayout_ms:.3f}x"
++        )
++        print(
++            f"  swiglu+quant+relayout={swiglu_relayout_ms:.4f} ms/"
++            f"{swiglu_relayout_gbps:.1f} logical GB/s"
++        )
++
++        del gate_up, hidden_states, row_map_i32, scales_rm
++        del padded_counts
++        torch.xpu.synchronize()
++
++
++def run_audit_xe35(args):
++    global GRAPH_REPLAY
++    GRAPH_REPLAY = args.graph_replay
++    if args.branch:
++        from sgl_kernel import (
++            muse_spark_moe_routing_xe35,
++            mxfp4_moe_scale_to_mn_major_xe35,
++            sgl_padded_gather_per_token_group_quant_fp4_xe35,
++        )
++
++    torch.manual_seed(7)
++    props = torch.xpu.get_device_properties(0)
++    print(
++        json.dumps(
++            {
++                "device": props.name,
++                "device_id": props.device_id,
++                "branch": args.branch,
++                "hidden": args.hidden,
++            }
++        ),
++        flush=True,
++    )
++    for rows in args.shapes:
++        torch.xpu.synchronize()
++        time.sleep(2)
++        if args.graph_replay > 1:
++            torch.manual_seed(7000 + rows)
++        source_rows = 32768 if rows >= 32768 * 8 else 8
++        if args.op != "route":
++            x = torch.randn(
++                (source_rows, args.hidden), device="xpu", dtype=torch.bfloat16
++            )
++            index = torch.arange(rows, device="xpu", dtype=torch.int32) % source_rows
++            gathered = x.index_select(0, index)
++            q_ref, s_ref = sgl_per_token_group_quant_fp4_xe35(gathered)
++            if args.branch:
++                q, s = sgl_padded_gather_per_token_group_quant_fp4_xe35(x, index)
++                assert torch.equal(q, q_ref) and torch.equal(s, s_ref)
++            if not args.lane_only:
++                bench_xe35(
++                    f"index_quant_rows{rows}",
++                    lambda: sgl_per_token_group_quant_fp4_xe35(x.index_select(0, index)),
++                    args.warmup,
++                    args.rep,
++                )
++            if not args.fused_only:
++                bench_xe35(
++                    f"plain_quant_rows{rows}",
++                    lambda: sgl_per_token_group_quant_fp4_xe35(gathered),
++                    args.warmup,
++                    args.rep,
++                )
++            if args.branch:
++                if not args.fused_only:
++                    bench_xe35(
++                        f"gather_quant_rows{rows}",
++                        lambda: sgl_padded_gather_per_token_group_quant_fp4_xe35(x, index),
++                        args.warmup,
++                        args.rep,
++                    )
++                routed_rows = source_rows * 8
++                active_experts = min(256, routed_rows)
++                counts = torch.zeros(256, dtype=torch.int32)
++                base, rem = divmod(routed_rows, active_experts)
++                counts[:active_experts] = base
++                counts[:rem] += 1
++                counts = (counts + 3) // 4 * 4
++                used_rows = int(counts.sum())
++                if used_rows <= rows and not args.lane_only:
++                    counts_xpu = counts.to("xpu")
++
++                    def index_quant_relayout():
++                        q, s = sgl_per_token_group_quant_fp4_xe35(x.index_select(0, index))
++                        s_mn = torch.empty_like(s)
++                        mxfp4_moe_scale_to_mn_major_xe35(s_mn, s, counts_xpu)
++                        return q, s_mn
++
++                    def gather_quant_relayout_xe35():
++                        q, s = sgl_padded_gather_per_token_group_quant_fp4_xe35(x, index)
++                        s_mn = torch.empty_like(s)
++                        mxfp4_moe_scale_to_mn_major_xe35(s_mn, s, counts_xpu)
++                        return q, s_mn
++
++                    iq, is_mn = index_quant_relayout()
++                    gq, gs_mn = gather_quant_relayout_xe35()
++                    assert torch.equal(iq, gq) and torch.equal(
++                        is_mn.flatten()[: used_rows * (args.hidden // 32)],
++                        gs_mn.flatten()[: used_rows * (args.hidden // 32)],
++                    )
++                    bench_xe35(
++                        f"index_quant_relayout_rows{rows}",
++                        index_quant_relayout,
++                        args.warmup,
++                        args.rep,
++                    )
++                    bench_xe35(
++                        f"gather_quant_relayout_rows{rows}",
++                        gather_quant_relayout_xe35,
++                        args.warmup,
++                        args.rep,
++                    )
++                gate_up = torch.randn(
++                    (rows, 2 * args.hidden), device="xpu", dtype=torch.bfloat16
++                )
++                activated = silu_and_mul(gate_up)
++                fused_q, fused_s = sgl_per_token_group_quant_fp4_xe35(
++                    gate_up, fuse_silu_and_mul=True
++                )
++                separate_q, separate_s = sgl_per_token_group_quant_fp4_xe35(activated)
++                assert torch.equal(fused_q, separate_q) and torch.equal(
++                    fused_s, separate_s
++                )
++                if not args.lane_only:
++                    bench_xe35(
++                        f"separate_silu_quant_rows{rows}",
++                        lambda: sgl_per_token_group_quant_fp4_xe35(silu_and_mul(gate_up)),
++                        args.warmup,
++                        args.rep,
++                    )
++                bench_xe35(
++                    f"fused_silu_quant_rows{rows}",
++                    lambda: sgl_per_token_group_quant_fp4_xe35(
++                        gate_up, fuse_silu_and_mul=True
++                    ),
++                    args.warmup,
++                    args.rep,
++                )
++        if not args.quant_only and rows in (256, 512, 32768 * 8 + 768):
++            route_tokens = source_rows if rows != 512 else 16
++            if args.graph_replay > 1:
++                torch.manual_seed(17000 + route_tokens)
++            logits = torch.randn((route_tokens, 256), device="xpu", dtype=torch.float32)
++            bias = torch.randn((256,), device="xpu", dtype=torch.float32)
++            multiplier = 0.3535533905932738
++
++            def native():
++                scores = torch.sigmoid((logits * multiplier).float())
++                ids = torch.topk(scores + bias, 8, dim=-1, sorted=True)[1]
++                weights = scores.gather(1, ids)
++                return weights / (weights.sum(dim=-1, keepdim=True) + 1e-15), ids
++
++            main_weights = torch.empty(
++                (route_tokens, 8), device="xpu", dtype=torch.float32
++            )
++            main_ids = torch.empty((route_tokens, 8), device="xpu", dtype=torch.int32)
++
++            def main_topk():
++                scaled_logits = logits * multiplier
++                topk_sigmoid_xe35(main_weights, main_ids, scaled_logits, True, bias)
++                return main_weights, main_ids
++
++            main_w, main_i = main_topk()
++            check_route_xe35(main_w, main_i, logits, bias, multiplier)
++            if args.branch:
++                weights = torch.empty(
++                    (route_tokens, 8), device="xpu", dtype=torch.float32
++                )
++                ids = torch.empty((route_tokens, 8), device="xpu", dtype=torch.int32)
++
++                def fused():
++                    muse_spark_moe_routing_xe35(
++                        weights, ids, logits, bias, multiplier, 1.0, 1e-15
++                    )
++
++                fused()
++                check_route_xe35(weights, ids, logits, bias, multiplier)
++            bench_xe35(f"native_route_tokens{route_tokens}", native, args.warmup, args.rep)
++            bench_xe35(
++                f"main_topk_route_tokens{route_tokens}",
++                main_topk,
++                args.warmup,
++                args.rep,
++            )
++            if args.triton_route:
++                try:
++                    from sglang_meta_common.ops.fused_muse_spark_routing import (
++                        fused_muse_spark_routing,
++                    )
++
++                    triton_weights = torch.empty_like(main_weights)
++                    triton_ids = torch.empty_like(main_ids)
++
++                    def triton_route():
++                        return fused_muse_spark_routing(
++                            logits,
++                            bias,
++                            8,
++                            1.0,
++                            router_output_multiplier=multiplier,
++                            router_score_normalization="sigmoid",
++                            router_score_division_eps=1e-15,
++                            topk_weights=triton_weights,
++                            topk_ids=triton_ids,
++                        )
++
++                    triton_w, triton_i = triton_route()
++                    check_route_xe35(triton_w, triton_i, logits, bias, multiplier)
++                    bench_xe35(
++                        f"framework_auto_route_tokens{route_tokens}",
++                        triton_route,
++                        args.warmup,
++                        args.rep,
++                    )
++                except AssertionError:
++                    raise
++                except Exception as exc:
++                    print(
++                        json.dumps(
++                            {
++                                "name": f"framework_auto_route_tokens{route_tokens}",
++                                "error": repr(exc),
++                            }
++                        ),
++                        flush=True,
++                    )
++            if args.branch:
++                bench_xe35(f"fused_route_tokens{route_tokens}", fused, args.warmup, args.rep)
++        torch.xpu.synchronize()
++
++
++def main_xe35():
++    args = parse_args_xe35()
++    global torch, sgl_per_token_group_quant_fp4_xe35, silu_and_mul, topk_sigmoid_xe35
++    global mxfp4_moe_scale_to_mn_major_xe35, sgl_padded_gather_per_token_group_quant_fp4_xe35
++    import torch
++    from sgl_kernel import is_xe3_arch, sgl_per_token_group_quant_fp4_xe35, silu_and_mul, topk_sigmoid_xe35
++
++    if not torch.xpu.is_available() or not is_xe3_arch():
++        raise RuntimeError("Routing/quant benchmark requires an Intel Xe3.5 XPU")
++
++    if args.mode == "padded-gather":
++        from sgl_kernel import (
++            mxfp4_moe_scale_to_mn_major_xe35,
++            sgl_padded_gather_per_token_group_quant_fp4_xe35,
++        )
++
++        run_padded_gather_xe35(args)
++    else:
++        run_audit_xe35(args)
++
++
++if __name__ == "__main__":
++    main_xe35()
+diff --git a/cmake/BuildFlags.cmake b/cmake/BuildFlags.cmake
+index 5dfb191b37ff61b04b4329536b487308b197cc44..086239cefe6af99520acbb1c4423744a46d9a4cc 100644
+--- a/cmake/BuildFlags.cmake
++++ b/cmake/BuildFlags.cmake
+@@ -26,7 +26,7 @@ function(CHECK_SYCL_FLAG FLAG VARIABLE_NAME)
+ endfunction()
+ 
+ # Support GCC on Linux.
+-if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
++if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" OR CMAKE_CXX_COMPILER_ID STREQUAL "IntelLLVM")
+   message(STATUS "sgl-kernel-xpu build type: ${CMAKE_BUILD_TYPE}")
+   set(SYCL_HOST_FLAGS)
+   set(SYCL_KERNEL_OPTIONS)
+@@ -185,6 +185,6 @@ if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+ 
+   set(SYCL_OFFLINE_COMPILER_FLAGS "${SYCL_OFFLINE_COMPILER_AOT_OPTIONS}${SYCL_OFFLINE_COMPILER_CG_OPTIONS}")
+ else()
+-  message("Not compiling with XPU. Currently only support GCC compiler on Linux as CXX compiler.")
++  message("Not compiling with XPU. Currently only support GNU or IntelLLVM compiler on Linux as CXX compiler.")
+   return()
+ endif()
+diff --git a/include/sgl_kernel/xe35/routing_quant.h b/include/sgl_kernel/xe35/routing_quant.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..5649ea5135d7555bc7e2760309f6980897169de4
+--- /dev/null
++++ b/include/sgl_kernel/xe35/routing_quant.h
+@@ -0,0 +1,43 @@
++#pragma once
++
++#include <torch/all.h>
++
++#pragma GCC visibility push(default)
++
++namespace at::native::xpu {
++void muse_spark_moe_routing_xe35(
++    at::Tensor& topk_weights,
++    at::Tensor& topk_ids,
++    at::Tensor& gating_output,
++    const c10::optional<at::Tensor>& correction_bias,
++    double router_output_multiplier,
++    double route_scale,
++    double division_eps,
++    const c10::optional<at::Tensor>& local_expert_mapping,
++    const c10::optional<at::Tensor>& num_valid_tokens);
++void sgl_per_token_group_quant_fp4_xe35(
++    at::Tensor input,
++    at::Tensor output_q,
++    at::Tensor output_s,
++    int64_t group_size,
++    double eps,
++    bool fuse_silu_and_mul,
++    const std::optional<at::Tensor>& scale_map);
++void sgl_padded_gather_per_token_group_quant_fp4_xe35(
++    at::Tensor input,
++    at::Tensor row_map,
++    at::Tensor output_q,
++    at::Tensor output_s,
++    int64_t group_size,
++    double eps,
++    const std::optional<at::Tensor>& scale_map);
++void topk_sigmoid_xe35(
++    at::Tensor& topk_weights,
++    at::Tensor& topk_indices,
++    at::Tensor& gating_output,
++    bool renormalize,
++    const c10::optional<at::Tensor>& correction_bias);
++}
++void mxfp4_moe_scale_to_mn_major_xe35(torch::Tensor& out, const torch::Tensor& in, const torch::Tensor& rows_per_expert);
++
++#pragma GCC visibility pop
+diff --git a/include/sgl_kernel_ops.h b/include/sgl_kernel_ops.h
+index 0b71dcef0d0cd28a7b2bf892845c95d6c12a547f..e0ffa2f9b5c299c393b5c5948e3befb2e5c995f3 100644
+--- a/include/sgl_kernel_ops.h
++++ b/include/sgl_kernel_ops.h
+@@ -1575,3 +1575,7 @@ std::tuple<at::Tensor, at::Tensor> minimax_decode_topk_page_table(
+     int64_t page_size);
+ 
+ #pragma GCC visibility pop
++
++#if SYCL_INTEL_TARGET == 35
++#include "sgl_kernel/xe35/routing_quant.h"
++#endif
+diff --git a/python/sgl_kernel/__init__.py b/python/sgl_kernel/__init__.py
+index a9a03451df67b5d0d712636f0ef87e9a7a766c12..592a999cb0cb8e1db64d4caa0ce442eac9ccfe00 100644
+--- a/python/sgl_kernel/__init__.py
++++ b/python/sgl_kernel/__init__.py
+@@ -245,3 +245,11 @@ from sgl_kernel.version import __version__
+ build_tree_kernel = (
+     None  # TODO(ying): remove this after updating the sglang python code.
+ )
++
++from sgl_kernel.routing_quant import (
++    muse_spark_moe_routing_xe35,
++    mxfp4_moe_scale_to_mn_major_xe35,
++    sgl_per_token_group_quant_fp4_xe35,
++    sgl_padded_gather_per_token_group_quant_fp4_xe35,
++    topk_sigmoid_xe35,
++)
+diff --git a/python/sgl_kernel/routing_quant.py b/python/sgl_kernel/routing_quant.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..4755b09b862ecdcd325d52acd58a4c364e144745
+--- /dev/null
++++ b/python/sgl_kernel/routing_quant.py
+@@ -0,0 +1,191 @@
++from typing import Optional, Tuple
++
++import torch
++
++def sgl_per_token_group_quant_fp4_xe35(
++    x: torch.Tensor,
++    group_size: int = 32,
++    eps: float = 1e-10,
++    fuse_silu_and_mul: bool = False,
++    scale_map: Optional[torch.Tensor] = None,
++) -> Tuple[torch.Tensor, torch.Tensor]:
++    """
++    Quantize input tensor to MXFP4 (E2M1) format with per-token group scaling.
++
++    MXFP4 follows the OpenCompute MX (Microscaling) format specification:
++    - Data type: E2M1 (4-bit float with 2-bit exponent, 1-bit mantissa)
++    - Block size: 32 elements per scale factor (default)
++    - Scale format: UE8M0 (unsigned 8-bit exponent-only, no mantissa)
++
++    Args:
++        x: Input tensor with shape (..., K) where K is divisible by group_size.
++           Must be contiguous and dtype float16, bfloat16, or float32.
++        group_size: Number of elements per quantization group. Must be 32 for MXFP4.
++        eps: Small epsilon to avoid division by zero. Default is 1e-10.
++        fuse_silu_and_mul: Quantize ``silu(x[..., :K // 2]) * x[..., K // 2:]``
++            instead of ``x``, i.e. fold SwiGLU into this kernel. ``x`` must then
++            be 2D with an even ``K``, and the outputs describe ``K // 2``
++            values per row. Same halving convention as ``silu_and_mul``.
++        scale_map: Optional contiguous int32 ``[M, 2]`` table giving, per
++            row ``r``, the ``(start, rows)`` of the row block it belongs to.
++            Its scale for group ``g`` is then stored at flat byte
++            ``start * G + g * rows + (r - start)`` of ``output_s`` instead of
++            ``r * G + g`` (with ``abs(rows)`` as the block size). This emits the
++            per-expert MN-major surface of ``mxfp4_moe_scale_to_mn_major_xe35``
++            directly. ``rows < 0`` marks a padding row whose GEMM output is
++            discarded: it stores scale 0 (2^-127) and leaves its ``output_q``
++            bytes unwritten. ``rows == 0`` marks slack: nothing is written.
++
++    Returns:
++        Tuple[torch.Tensor, torch.Tensor]: with ``KOUT = K // 2`` when
++        ``fuse_silu_and_mul`` and ``KOUT = K`` otherwise,
++            - output_q: Packed FP4 tensor with shape (..., KOUT // 2) and dtype uint8.
++                        Two E2M1 values are packed into each byte.
++            - output_s: Scale tensor with shape (..., KOUT // group_size) and dtype uint8.
++                        Scales are stored in UE8M0 format (exponent + 127 bias).
++    """
++    assert (
++        x.shape[-1] % group_size == 0
++    ), f"the last dimension of `x` ({x.shape[-1]}) must be divisible by `group_size` ({group_size})"
++    assert x.is_contiguous(), "`x` is not contiguous"
++    assert group_size == 32, f"group_size must be 32 for MXFP4, got {group_size}"
++
++    # Ensure input is 2D for the kernel
++    original_shape = x.shape
++    if x.dim() == 1:
++        x = x.unsqueeze(0)
++    elif x.dim() > 2:
++        x = x.view(-1, x.shape[-1])
++
++    m, k = x.shape
++    if fuse_silu_and_mul:
++        assert (
++            k % (2 * group_size) == 0
++        ), f"with `fuse_silu_and_mul` the last dimension of `x` ({k}) must be divisible by 2 x {group_size}"
++        k //= 2
++    num_groups_per_row = k // group_size
++
++    # Output is packed FP4 (2 values per byte)
++    output_q = torch.empty((m, k // 2), device=x.device, dtype=torch.uint8)
++
++    # Scales in row-major layout: (m, num_groups_per_row)
++    # Each row has the scales for that token's groups
++    output_s = torch.empty((m, num_groups_per_row), device=x.device, dtype=torch.uint8)
++
++    if x.shape[0] > 0:
++        torch.ops.sgl_kernel.sgl_per_token_group_quant_fp4_xe35.default(
++            x, output_q, output_s, group_size, eps, fuse_silu_and_mul, scale_map
++        )
++
++    # Reshape output to match input shape, in the activated width
++    out_k = original_shape[-1] // 2 if fuse_silu_and_mul else original_shape[-1]
++    output_shape_q = original_shape[:-1] + (out_k // 2,)
++    output_shape_s = original_shape[:-1] + (out_k // group_size,)
++
++    return output_q.view(output_shape_q), output_s.view(output_shape_s)
++
++
++def sgl_padded_gather_per_token_group_quant_fp4_xe35(
++    x: torch.Tensor,
++    row_map: torch.Tensor,
++    group_size: int = 32,
++    eps: float = 1e-10,
++    scale_map: Optional[torch.Tensor] = None,
++) -> Tuple[torch.Tensor, torch.Tensor]:
++    """Gather source rows and quantize them directly to MXFP4.
++
++    ``row_map[d]`` selects the source row written to padded destination row
++    ``d``. This is equivalent to
++    ``sgl_per_token_group_quant_fp4_xe35(x.index_select(0, row_map))`` without
++    materializing the FP16/BF16 gathered tensor.
++
++    Args:
++        x: Contiguous 2D FP16 or BF16 tensor with shape ``[M, K]``. ``K`` must
++            be divisible by 32.
++        row_map: Contiguous 1D int32 or int64 XPU tensor. Every entry must be in
++            ``[0, M)``; repeated entries are allowed and provide padding rows.
++        group_size: MXFP4 group size. Only 32 is supported.
++        eps: Positive lower bound for each group's absolute maximum.
++        scale_map: Optional ``(start, rows)`` scale redirection table, as in
++            ``sgl_per_token_group_quant_fp4_xe35``, with one row per ``row_map``
++            entry.
++
++    Returns:
++        Packed E2M1 bytes with shape ``[row_map.numel(), K // 2]`` and row-major
++        UE8M0 scales with shape ``[row_map.numel(), K // 32]``.
++    """
++    assert x.dim() == 2, f"`x` must be 2D, got {x.dim()} dimensions"
++    assert x.dtype in (
++        torch.float16,
++        torch.bfloat16,
++    ), f"`x` must be float16 or bfloat16, got {x.dtype}"
++    assert x.is_contiguous(), "`x` is not contiguous"
++    assert row_map.dim() == 1, f"`row_map` must be 1D, got {row_map.dim()} dimensions"
++    assert row_map.dtype in (
++        torch.int32,
++        torch.int64,
++    ), f"`row_map` must be int32 or int64, got {row_map.dtype}"
++    assert row_map.is_contiguous(), "`row_map` is not contiguous"
++    assert group_size == 32, f"group_size must be 32 for MXFP4, got {group_size}"
++    assert (
++        x.shape[1] % group_size == 0
++    ), f"the last dimension of `x` ({x.shape[1]}) must be divisible by `group_size` ({group_size})"
++
++    rows, k = row_map.numel(), x.shape[1]
++    output_q = torch.empty((rows, k // 2), device=x.device, dtype=torch.uint8)
++    output_s = torch.empty((rows, k // group_size), device=x.device, dtype=torch.uint8)
++    if rows > 0:
++        torch.ops.sgl_kernel.sgl_padded_gather_per_token_group_quant_fp4_xe35.default(
++            x, row_map, output_q, output_s, group_size, eps, scale_map
++        )
++    return output_q, output_s
++
++
++def muse_spark_moe_routing_xe35(
++    topk_weights: torch.Tensor,
++    topk_ids: torch.Tensor,
++    gating_output: torch.Tensor,
++    correction_bias: Optional[torch.Tensor] = None,
++    router_output_multiplier: float = 1.0,
++    route_scale: float = 1.0,
++    division_eps: float = 0.0,
++    local_expert_mapping: Optional[torch.Tensor] = None,
++    num_valid_tokens: Optional[torch.Tensor] = None,
++) -> None:
++    """Muse Spark's fused MoE routing, writing into ``topk_weights``/``topk_ids``.
++
++    ``num_valid_tokens`` is a device int32 scalar so the padded row count never
++    reaches the host: rows at or after it get expert id ``-1`` and weight 0.
++    """
++    torch.ops.sgl_kernel.muse_spark_moe_routing_xe35.default(
++        topk_weights,
++        topk_ids,
++        gating_output,
++        correction_bias,
++        router_output_multiplier,
++        route_scale,
++        division_eps,
++        local_expert_mapping,
++        num_valid_tokens,
++    )
++
++
++def mxfp4_moe_scale_to_mn_major_xe35(out, input, rows_per_expert):
++    """Relayout per-token MXFP4 scales for moe_grouped_mm_nt_xe35_mxfp4_w4a4.
++
++    `input` is the [M, k // 32] row-major surface `sgl_per_token_group_quant_fp4_xe35`
++    emits, with rows already grouped by expert; `out` is the per-expert MN-major,
++    M-padded-to-4 surface the grouped GEMM reads, and needs
++    `sum(round_up(rows_i, 4))` rows (zero it first if any row count is not a
++    multiple of 4). `rows_per_expert` must be contiguous int32 on device.
++    Row counts must be nonnegative, sum to at most the input row count, and
++    fit in the padded output. The caller validates these device-resident counts;
++    this op checks shapes without copying counts to the host or draining the stream.
++    """
++    torch.ops.sgl_kernel.mxfp4_moe_scale_to_mn_major_xe35.default(
++        out, input, rows_per_expert
++    )
++
++
++def topk_sigmoid_xe35(topk_weights, topk_ids, gating_output, renormalize, correction_bias=None):
++    torch.ops.sgl_kernel.topk_sigmoid_xe35.default(topk_weights, topk_ids, gating_output, renormalize, correction_bias)
+diff --git a/src/BuildOnLinux.cmake b/src/BuildOnLinux.cmake
+index 1568e7e1fd1433b7c598d3460cb6f61ab5d451cb..246d5ff92a767af73cae1d453b0433fe5e490347 100644
+--- a/src/BuildOnLinux.cmake
++++ b/src/BuildOnLinux.cmake
+@@ -268,6 +268,9 @@ if(DPCPP_SYCL_TARGET MATCHES "cri")
+   foreach(sycl_src ${ATen_XPU_SYCL_XE35})
+     get_filename_component(name ${sycl_src} NAME_WLE REALPATH)
+     set(sycl_lib sgl-ops-sycl-${name})
++    if(name STREQUAL "per_token_group_quant_fp4")
++      set(sycl_lib sgl-ops-sycl-${name}_xe35)
++    endif()
+     sycl_add_library(
+       ${sycl_lib}
+       ${XE35_OFFLINE_COMPILER_FLAGS}
+diff --git a/src/sycl/Device.cpp b/src/sycl/Device.cpp
+index 44590db8a7c078bf6d8526548e75f80608b757af..2ab1b2262242d5741f5da3d55703004c257bb013 100644
+--- a/src/sycl/Device.cpp
++++ b/src/sycl/Device.cpp
+@@ -22,7 +22,8 @@ SGL_KERNEL_EXPORT std::tuple<int64_t, int64_t> query_device(int64_t device_index
+ // Need oneAPI 2026.2 or later to support `architecture::intel_gpu_cri`. Check the release
+ // (__INTEL_LLVM_COMPILER) rather than the build date (__SYCL_COMPILER_VERSION): 2026.1.x
+ // patch releases (e.g. 2026.1.3, 20260724) are built later but still lack this enum.
+-#if defined(__INTEL_LLVM_COMPILER) && __INTEL_LLVM_COMPILER >= 20260200
++#if (defined(__INTEL_LLVM_COMPILER) && __INTEL_LLVM_COMPILER >= 20260200) || \
++    (defined(__INTEL_LLVM_COMPILER_VERSION) && __INTEL_LLVM_COMPILER_VERSION >= 20260200)
+     case syclex::architecture::intel_gpu_cri:
+       return std::make_tuple(3, 5);
+ #endif
+diff --git a/src/sycl/HCHead.cpp b/src/sycl/HCHead.cpp
+index 78464246ed88cb8056af87e388bad9fc222d4053..1b2ace4419e74f6e6276cea4a8bcffc0b2078a6e 100644
+--- a/src/sycl/HCHead.cpp
++++ b/src/sycl/HCHead.cpp
+@@ -67,7 +67,10 @@ struct FusedHCHeadKernel : public __SYCL_KER_CONFIG_CONVENTION__ {
+     slm_ = sycl::local_accessor<float, 1>(slm_size, cgh);
+   }
+ 
+-  [[sycl::reqd_work_group_size(WG_SIZE)]] [[sycl::reqd_sub_group_size(SG_SIZE)]] void
++#ifdef __SYCL_DEVICE_ONLY__
++  [[sycl::reqd_work_group_size(WG_SIZE)]] [[sycl::reqd_sub_group_size(SG_SIZE)]]
++#endif
++  void
+   operator()(sycl::nd_item<1> item) const {
+     const int token_id = static_cast<int>(item.get_group(0));
+     const int tid = static_cast<int>(item.get_local_id(0));
+diff --git a/src/sycl/xe35/muse_routing_quant.cpp b/src/sycl/xe35/muse_routing_quant.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..215299474c09f50f626eea37c8fd967668578748
+--- /dev/null
++++ b/src/sycl/xe35/muse_routing_quant.cpp
+@@ -0,0 +1,437 @@
++#include "sgl_kernel/xe35/routing_quant.h"
++
++#include <ATen/ATen.h>
++#include <c10/xpu/XPUStream.h>
++#include <torch/all.h>
++
++#include <cstdint>
++#include <limits>
++#include <sycl/ext/oneapi/sub_group_mask.hpp>
++#include <sycl/sycl.hpp>
++
++#include "sycl/SYCLHelpers.h"
++#include "sycl/Utils.h"
++
++#include "sgl_kernel_ops.h"
++
++namespace at::native::xpu {
++namespace TopKSigmoidImpl_xe35 {
++template <typename T>
++struct LogitBits_xe35 {
++  using Raw = uint16_t;
++  static float to_float(Raw bits) {
++    return static_cast<float>(sycl::bit_cast<T>(bits));
++  }
++};
++
++template <>
++struct LogitBits_xe35<float> {
++  using Raw = float;
++  static float to_float(Raw value) {
++    return value;
++  }
++};
++
++// Runtime routing parameters shared by every supported expert count and top-k.
++struct RoutingArguments_xe35 {
++  float* weights;
++  int* ids;
++  float const* correction_bias;     // null for no bias
++  int const* local_expert_mapping;  // null when a rank owns every expert
++  int const* num_valid_tokens;      // device scalar; null when every row is real
++  int tokens;
++  int experts;
++  int topk;
++  float router_multiplier;
++  float route_scale;
++  float division_eps;
++  bool renormalize;
++};
++
++// Global -> local expert id, for the ranks that own a slice of the experts.
++inline int map_expert_xe35(RoutingArguments_xe35 const& args, int expert) {
++  return args.local_expert_mapping == nullptr ? expert : args.local_expert_mapping[expert];
++}
++
++// A row past the real token count is padding: emit the sentinel id -1, which
++// matches no expert, so the MoE backend skips it.
++inline bool row_is_padding_xe35(RoutingArguments_xe35 const& args, int row) {
++  return args.num_valid_tokens != nullptr && row >= *args.num_valid_tokens;
++}
++
++// A full 32-lane tile can load its logits and bias as vectors. This selection
++// algorithm applies to every supported full tile width when top-k is eight;
++// the tail-safe kernel below handles all other expert counts and top-k values.
++template <typename T, int kValuesPerLane>
++struct FullTileTopk8_xe35 {
++  static constexpr int kSubgroup = 32;
++  static constexpr int kTopK = 8;
++  static constexpr int kSubgroupsPerGroup = 8;
++  static constexpr int kExperts = kSubgroup * kValuesPerLane;
++  using Raw = typename LogitBits_xe35<T>::Raw;
++  using LogitVec = sycl::vec<Raw, kValuesPerLane>;
++  using BiasVec = sycl::vec<float, kValuesPerLane>;
++  static_assert(sizeof(T) == sizeof(Raw));
++
++  T const* input;
++  RoutingArguments_xe35 args;
++
++  [[sycl::reqd_sub_group_size(kSubgroup)]]
++  void operator()(sycl::nd_item<1> item) const {
++    constexpr float kInfinity = std::numeric_limits<float>::infinity();
++    sycl::sub_group subgroup = item.get_sub_group();
++    int lane = static_cast<int>(subgroup.get_local_linear_id());
++    int row =
++        static_cast<int>(item.get_group(0)) * kSubgroupsPerGroup + static_cast<int>(subgroup.get_group_linear_id());
++    if (row >= args.tokens) return;
++    int out = row * kTopK + lane;
++    if (row_is_padding_xe35(args, row)) {
++      if (lane < kTopK) {
++        args.ids[out] = -1;
++        args.weights[out] = 0.0f;
++      }
++      return;
++    }
++
++    auto const* row_ptr = reinterpret_cast<Raw const*>(input) + static_cast<size_t>(row) * kExperts;
++    LogitVec raw = *reinterpret_cast<LogitVec const*>(row_ptr + lane * kValuesPerLane);
++    float bias[kValuesPerLane];
++    if (args.correction_bias != nullptr) {
++      BiasVec bias_vec = *reinterpret_cast<BiasVec const*>(args.correction_bias + lane * kValuesPerLane);
++#pragma unroll
++      for (int i = 0; i < kValuesPerLane; ++i) {
++        bias[i] = bias_vec[i];
++      }
++    } else {
++#pragma unroll
++      for (int i = 0; i < kValuesPerLane; ++i) {
++        bias[i] = 0.0f;
++      }
++    }
++
++    float values[kValuesPerLane];
++#pragma unroll
++    for (int i = 0; i < kValuesPerLane; ++i) {
++      float logit = LogitBits_xe35<T>::to_float(raw[i]);
++      float scaled = static_cast<float>(static_cast<T>(logit * args.router_multiplier));
++      values[i] = 1.0f / (1.0f + sycl::exp(-scaled)) + bias[i];
++    }
++
++    int selected_id = -1;
++#pragma unroll
++    for (int k = 0; k < kTopK; ++k) {
++      float lane_value = -kInfinity;
++      int lane_slot = 0;
++#pragma unroll
++      for (int i = 0; i < kValuesPerLane; ++i) {
++        bool greater = values[i] > lane_value;
++        lane_value = greater ? values[i] : lane_value;
++        lane_slot = greater ? i : lane_slot;
++      }
++      float group_value = sycl::reduce_over_group(subgroup, lane_value, sycl::maximum<float>());
++      std::uint32_t holders = 0;
++      sycl::ext::oneapi::group_ballot(subgroup, lane_value == group_value).extract_bits(holders);
++      int winner_lane = __builtin_ctz(holders);
++      int winner_slot = sycl::select_from_group(subgroup, lane_slot, winner_lane);
++      if (lane == k) selected_id = winner_lane * kValuesPerLane + winner_slot;
++      if (lane == winner_lane) {
++#pragma unroll
++        for (int i = 0; i < kValuesPerLane; ++i) {
++          if (i == winner_slot) values[i] = -kInfinity;
++        }
++      }
++    }
++
++    float weight = 0.0f;
++    if (lane < kTopK) {
++      float logit = LogitBits_xe35<T>::to_float(row_ptr[selected_id]);
++      float scaled = static_cast<float>(static_cast<T>(logit * args.router_multiplier));
++      weight = 1.0f / (1.0f + sycl::exp(-scaled));
++    }
++    float sum = sycl::reduce_over_group(subgroup, weight, sycl::plus<float>());
++    if (lane < kTopK) {
++      args.ids[out] = map_expert_xe35(args, selected_id);
++      args.weights[out] = args.renormalize ? weight * (args.route_scale / (sum + args.division_eps)) : weight;
++    }
++  }
++};
++
++// Each lane owns a fixed-capacity slice of the experts. Four vector widths
++// cover every expert count up to 256; partially filled slices use masked
++// scalar loads. The tile width is a subgroup memory-layout choice, independent
++// of routing top-k or a model's expert count.
++template <typename T, int kValuesPerLane, bool kFullTile>
++struct MuseSparkRouting_xe35 {
++  static constexpr int kSubgroup = 32;
++  static constexpr int kSubgroupsPerGroup = 8;
++  static constexpr int kMaxTopK = 8;
++  using Raw = typename LogitBits_xe35<T>::Raw;
++  using LogitVec = sycl::vec<Raw, kValuesPerLane>;
++  using BiasVec = sycl::vec<float, kValuesPerLane>;
++  static_assert(sizeof(T) == sizeof(Raw));
++
++  T const* input;
++  RoutingArguments_xe35 args;
++
++  [[sycl::reqd_sub_group_size(kSubgroup)]]
++  void operator()(sycl::nd_item<1> item) const {
++    constexpr float kInfinity = std::numeric_limits<float>::infinity();
++    sycl::sub_group subgroup = item.get_sub_group();
++    int row =
++        static_cast<int>(item.get_group(0)) * kSubgroupsPerGroup + static_cast<int>(subgroup.get_group_linear_id());
++    int lane = static_cast<int>(subgroup.get_local_linear_id());
++    if (row >= args.tokens) {
++      return;
++    }
++    if (row_is_padding_xe35(args, row)) {
++      if (lane < args.topk) {
++        args.ids[row * args.topk + lane] = -1;
++        args.weights[row * args.topk + lane] = 0.0f;
++      }
++      return;
++    }
++
++    const size_t row_start = static_cast<size_t>(row) * (kFullTile ? kValuesPerLane * kSubgroup : args.experts);
++    LogitVec logits{};
++    BiasVec biases{};
++    if constexpr (kFullTile) {
++      auto const* bits = reinterpret_cast<Raw const*>(input) + row_start + lane * kValuesPerLane;
++      logits = *reinterpret_cast<LogitVec const*>(bits);
++      if (args.correction_bias != nullptr) {
++        biases = *reinterpret_cast<BiasVec const*>(args.correction_bias + lane * kValuesPerLane);
++      }
++    }
++    float rank_values[kValuesPerLane];
++
++#pragma unroll
++    for (int i = 0; i < kValuesPerLane; ++i) {
++      int expert = lane * kValuesPerLane + i;
++      if (kFullTile || expert < args.experts) {
++        float logit = kFullTile ? LogitBits_xe35<T>::to_float(logits[i]) : static_cast<float>(input[row_start + expert]);
++        float scaled = static_cast<float>(static_cast<T>(logit * args.router_multiplier));
++        float score = 1.0f / (1.0f + sycl::exp(-scaled));
++        rank_values[i] =
++            args.correction_bias == nullptr ? score : score + (kFullTile ? biases[i] : args.correction_bias[expert]);
++      } else {
++        rank_values[i] = -kInfinity;
++      }
++    }
++
++    // Result lane k owns selected expert k. Keep selection shared across the
++    // subgroup, then compute the unbiased weights in parallel.
++    int selected_id = -1;
++
++#pragma unroll
++    for (int k = 0; k < kMaxTopK; ++k) {
++      if (k >= args.topk) {
++        break;
++      }
++      float lane_value = -kInfinity;
++      int lane_slot = -1;
++#pragma unroll
++      for (int i = 0; i < kValuesPerLane; ++i) {
++        const int expert = lane * kValuesPerLane + i;
++        if ((kFullTile || expert < args.experts) && (lane_slot < 0 || rank_values[i] > lane_value)) {
++          lane_value = rank_values[i];
++          lane_slot = i;
++        }
++      }
++
++      // Select the maximum with one subgroup reduction and a ballot. The
++      // local search visits increasing expert IDs and keeps the first equal
++      // score. The lowest holder lane therefore has the lowest expert ID
++      // across lanes. This also works for partially filled lanes.
++      const float group_value = sycl::reduce_over_group(subgroup, lane_value, sycl::maximum<float>());
++      std::uint32_t holders = 0;
++      sycl::ext::oneapi::group_ballot(subgroup, lane_slot >= 0 && lane_value == group_value).extract_bits(holders);
++      const int winner_lane = __builtin_ctz(holders);
++      const int winner_slot = sycl::select_from_group(subgroup, lane_slot, winner_lane);
++      const int winner_id = winner_lane * kValuesPerLane + winner_slot;
++      if (lane == winner_lane && lane_slot >= 0) {
++#pragma unroll
++        for (int i = 0; i < kValuesPerLane; ++i) {
++          if (i == lane_slot) rank_values[i] = -kInfinity;
++        }
++      }
++
++      if (lane == k) selected_id = winner_id;
++    }
++
++    float weight = 0.0f;
++    if (lane < args.topk) {
++      float logit = static_cast<float>(input[static_cast<size_t>(row) * args.experts + selected_id]);
++      float scaled = static_cast<float>(static_cast<T>(logit * args.router_multiplier));
++      weight = 1.0f / (1.0f + sycl::exp(-scaled));
++    }
++    const float sum = sycl::reduce_over_group(subgroup, weight, sycl::plus<float>());
++    if (lane < args.topk) {
++      const float factor = args.renormalize ? args.route_scale / (sum + args.division_eps) : 1.0f;
++      args.ids[row * args.topk + lane] = map_expert_xe35(args, selected_id);
++      args.weights[row * args.topk + lane] = weight * factor;
++    }
++  }
++};
++
++template <typename T, int kValuesPerLane, bool kFullTile>
++void launch_muse_spark_routing_tile_xe35(sycl::queue& queue, T const* input, RoutingArguments_xe35 const& args) {
++  using Kernel = MuseSparkRouting_xe35<T, kValuesPerLane, kFullTile>;
++  sycl::range<1> local(Kernel::kSubgroupsPerGroup * Kernel::kSubgroup);
++  sycl::range<1> global(static_cast<size_t>(div_up(args.tokens, Kernel::kSubgroupsPerGroup)) * local[0]);
++  sycl_kernel_submit(global, local, queue, Kernel{input, args});
++}
++
++template <typename T, int kValuesPerLane>
++void launch_full_tile_topk8_xe35(sycl::queue& queue, T const* input, RoutingArguments_xe35 const& args) {
++  using Kernel = FullTileTopk8_xe35<T, kValuesPerLane>;
++  sycl::range<1> local(Kernel::kSubgroupsPerGroup * Kernel::kSubgroup);
++  sycl::range<1> global(static_cast<size_t>(div_up(args.tokens, Kernel::kSubgroupsPerGroup)) * local[0]);
++  sycl_kernel_submit(global, local, queue, Kernel{input, args});
++}
++
++template <typename T, int kValuesPerLane>
++void launch_muse_spark_routing_bucket_xe35(sycl::queue& queue, T const* input, RoutingArguments_xe35 const& args) {
++  if (args.experts == kValuesPerLane * 32) {
++    if (args.topk == 8) {
++      launch_full_tile_topk8_xe35<T, kValuesPerLane>(queue, input, args);
++    } else {
++      launch_muse_spark_routing_tile_xe35<T, kValuesPerLane, true>(queue, input, args);
++    }
++  } else {
++    launch_muse_spark_routing_tile_xe35<T, kValuesPerLane, false>(queue, input, args);
++  }
++}
++
++template <typename T>
++void launch_muse_spark_routing_xe35(sycl::queue& queue, T const* input, RoutingArguments_xe35 const& args) {
++  const int values_per_lane = div_up(args.experts, 32);
++  if (values_per_lane <= 1) {
++    launch_muse_spark_routing_bucket_xe35<T, 1>(queue, input, args);
++  } else if (values_per_lane <= 2) {
++    launch_muse_spark_routing_bucket_xe35<T, 2>(queue, input, args);
++  } else if (values_per_lane <= 4) {
++    launch_muse_spark_routing_bucket_xe35<T, 4>(queue, input, args);
++  } else {
++    launch_muse_spark_routing_bucket_xe35<T, 8>(queue, input, args);
++  }
++}
++
++}
++
++void topk_sigmoid_xe35(
++    at::Tensor& topk_weights,
++    at::Tensor& topk_indices,
++    at::Tensor& gating_output,
++    bool renormalize,
++    const c10::optional<at::Tensor>& correction_bias) {
++  auto shape = gating_output.sizes().vec();
++  TORCH_CHECK(shape.size() == 2, "gating_output must be 2D");
++  int64_t n_tokens = shape[0];
++  int64_t n_experts = shape[1];
++  TORCH_CHECK(n_experts <= 256, "n_experts only support up to 256, got ", n_experts);
++  TORCH_CHECK(topk_weights.scalar_type() == at::kFloat, "topk_weights should be Float");
++  TORCH_CHECK(topk_indices.scalar_type() == at::kInt, "topk_indices should be Int");
++
++  int64_t n_topk = topk_weights.size(1);
++  // The max topk value is 8, which is constrained by 'malloc_per_item'.
++  auto max_topk = n_experts < 8 ? n_experts : 8;
++  TORCH_CHECK(0 < n_topk && n_topk <= max_topk, "topk must be less than or equal to num_experts and 8");
++
++  const float* bias_ptr = nullptr;
++  if (correction_bias.has_value()) {
++    const auto& bias = correction_bias.value();
++    TORCH_CHECK(bias.dim() == 1 && bias.size(0) == n_experts, "correction_bias must be 1D [num_experts]");
++    TORCH_CHECK(bias.scalar_type() == at::kFloat, "correction_bias must be float32");
++    bias_ptr = bias.data_ptr<float>();
++  }
++
++  const int values_per_lane = div_up<int64_t>(n_experts, 32);
++  const bool full_tile = n_experts == values_per_lane * 32;
++  const bool vector_width = values_per_lane == 1 || values_per_lane == 2 || values_per_lane == 4 || values_per_lane == 8;
++  if ((gating_output.scalar_type() == at::kHalf || gating_output.scalar_type() == at::kBFloat16) && n_topk == 8 && full_tile && vector_width) {
++    auto queue = at::xpu::getCurrentXPUStream().queue();
++    DISPATCH_FLOAT_TYPES(gating_output.scalar_type(), "topk_sigmoid_xe35", [&] {
++      TopKSigmoidImpl_xe35::RoutingArguments_xe35 args{
++          topk_weights.data_ptr<float>(), topk_indices.data_ptr<int>(), bias_ptr,
++          nullptr, nullptr, static_cast<int>(n_tokens), static_cast<int>(n_experts),
++          static_cast<int>(n_topk), 1.0f, 1.0f, 0.0f, renormalize};
++      TopKSigmoidImpl_xe35::launch_muse_spark_routing_xe35(queue, gating_output.data_ptr<scalar_t>(), args);
++    });
++    return;
++  }
++  topk_sigmoid(topk_weights, topk_indices, gating_output, renormalize, correction_bias);
++}
++
++void muse_spark_moe_routing_xe35(
++    at::Tensor& topk_weights,
++    at::Tensor& topk_ids,
++    at::Tensor& gating_output,
++    const c10::optional<at::Tensor>& correction_bias,
++    double router_output_multiplier,
++    double route_scale,
++    double division_eps,
++    const c10::optional<at::Tensor>& local_expert_mapping,
++    const c10::optional<at::Tensor>& num_valid_tokens) {
++  TORCH_CHECK(gating_output.dim() == 2, "gating_output must be 2D");
++  TORCH_CHECK(gating_output.is_contiguous(), "gating_output must be contiguous");
++  int64_t n_tokens = gating_output.size(0);
++  int64_t n_experts = gating_output.size(1);
++  TORCH_CHECK(n_experts <= 256, "n_experts only support up to 256, got ", n_experts);
++  TORCH_CHECK(topk_weights.scalar_type() == at::kFloat, "topk_weights should be Float");
++  TORCH_CHECK(topk_ids.scalar_type() == at::kInt, "topk_ids should be Int");
++  TORCH_CHECK(topk_weights.dim() == 2 && topk_weights.size(0) == n_tokens, "topk_weights must be [n_tokens, topk]");
++  TORCH_CHECK(topk_ids.sizes() == topk_weights.sizes(), "topk_ids and topk_weights must have the same shape");
++  TORCH_CHECK(topk_weights.is_contiguous() && topk_ids.is_contiguous(), "outputs must be contiguous");
++
++  int64_t n_topk = topk_weights.size(1);
++  auto max_topk = n_experts < 8 ? n_experts : 8;
++  TORCH_CHECK(0 < n_topk && n_topk <= max_topk, "topk must be less than or equal to num_experts and 8");
++
++  const float* bias_ptr = nullptr;
++  if (correction_bias.has_value()) {
++    const auto& bias = correction_bias.value();
++    TORCH_CHECK(bias.dim() == 1 && bias.size(0) == n_experts, "correction_bias must be 1D [num_experts]");
++    TORCH_CHECK(bias.scalar_type() == at::kFloat, "correction_bias must be float32");
++    TORCH_CHECK(bias.is_contiguous(), "correction_bias must be contiguous");
++    bias_ptr = bias.data_ptr<float>();
++  }
++
++  const int* mapping_ptr = nullptr;
++  if (local_expert_mapping.has_value()) {
++    const auto& mapping = local_expert_mapping.value();
++    TORCH_CHECK(mapping.dim() == 1 && mapping.size(0) == n_experts, "local_expert_mapping must be 1D [num_experts]");
++    TORCH_CHECK(mapping.scalar_type() == at::kInt, "local_expert_mapping must be int32");
++    TORCH_CHECK(mapping.is_contiguous(), "local_expert_mapping must be contiguous");
++    mapping_ptr = mapping.data_ptr<int>();
++  }
++
++  const int* valid_ptr = nullptr;
++  if (num_valid_tokens.has_value()) {
++    const auto& valid = num_valid_tokens.value();
++    TORCH_CHECK(valid.numel() == 1, "num_valid_tokens must be a single element tensor");
++    TORCH_CHECK(valid.scalar_type() == at::kInt, "num_valid_tokens must be int32");
++    valid_ptr = valid.data_ptr<int>();
++  }
++
++  if (n_tokens == 0) {
++    return;
++  }
++
++  auto queue = at::xpu::getCurrentXPUStream().queue();
++  DISPATCH_FLOAT_TYPES(gating_output.scalar_type(), "muse_spark_moe_routing_kernel", [&] {
++    TopKSigmoidImpl_xe35::RoutingArguments_xe35 args{
++        topk_weights.data_ptr<float>(),
++        topk_ids.data_ptr<int>(),
++        bias_ptr,
++        mapping_ptr,
++        valid_ptr,
++        static_cast<int>(n_tokens),
++        static_cast<int>(n_experts),
++        static_cast<int>(n_topk),
++        static_cast<float>(router_output_multiplier),
++        static_cast<float>(route_scale),
++        static_cast<float>(division_eps),
++        /*renormalize=*/true};
++    TopKSigmoidImpl_xe35::launch_muse_spark_routing_xe35<scalar_t>(queue, gating_output.data_ptr<scalar_t>(), args);
++  });
++}
++}
+diff --git a/src/sycl/xe35/mxfp4_moe_scale_layout.cpp b/src/sycl/xe35/mxfp4_moe_scale_layout.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..d2dc53be18b3ba0e6f48fb23ec35a21a244a475a
+--- /dev/null
++++ b/src/sycl/xe35/mxfp4_moe_scale_layout.cpp
+@@ -0,0 +1,334 @@
++/***************************************************************************************************
++ * Copyright 2025 SGLang Team. All Rights Reserved.
++ * SPDX-License-Identifier: Apache-2.0
++ **************************************************************************************************/
++/*! \file
++    \brief Relayout of per-token MXFP4 activation scales into the surface the Xe3.5
++           MXFP grouped-GEMM mainloop indexes (see moe_grouped_mm_nt_xe35_mxfp4_w4a4).
++
++    `sgl_per_token_group_quant_fp4_xe35` emits scales as a plain row-major [M, G] byte
++    surface (one row per token, G = ceil(K/32) groups). The MXFP mainloop instead
++    reads, per expert, an [G, round_up(M_e, 4)] tile: M is the *fastest-moving*
++    extent ("MN-major"), and its width must be a multiple of 4 because the Xe 2D
++    block load of the scales is DWord-granular. This kernel writes that surface:
++
++      out[dst_start_e * G + g * padded_e + i] = in[(src_start_e + i) * G + g]
++
++    with src_start_e the prefix sum of rows_per_expert, padded_e = round_up(rows_e, 4)
++    and dst_start_e the prefix sum of the padded counts. Row counts stay on the
++    device, so each work group scans them into SLM once rather than syncing them
++    to the host, then binary-searches that scan for the expert owning each tile it
++    claims.
++
++    The transpose is staged through SLM one 64-row tile at a time so both the loads
++    and the stores move contiguous bytes; a direct byte scatter costs ~64x its own
++    size in memory traffic. Each work item moves a 32-bit quad on both sides -- four
++    scale groups of one row in, four rows of one scale group out -- which needs
++    `groups % 4 == 0`; the byte-granular path below covers the rest.
++*/
++
++#include "sgl_kernel/xe35/routing_quant.h"
++
++#include <ATen/ATen.h>
++#include <c10/xpu/XPUStream.h>
++#include <torch/all.h>
++
++#include <algorithm>
++#include <sycl/sycl.hpp>
++
++#include "sycl/SYCLHelpers.h"
++#include "sycl/Utils.h"
++
++namespace {
++
++constexpr int kScaleAlignRows = 4;
++constexpr int kTileRows = 64;
++constexpr int kWorkGroupSize = 256;
++// Bounds the SLM tile at kTileRows * kMaxGroups bytes (16 KB), i.e. K <= 8192.
++constexpr int kMaxGroups = 256;
++
++void check_out_rows_xe35(int64_t out_rows, int64_t in_rows) {
++  TORCH_CHECK(
++      out_rows >= in_rows,
++      "mxfp4_moe_scale_to_mn_major_xe35: out must have at least as many rows as the ",
++      in_rows,
++      "-row surface it is built from (padding only grows it), got ",
++      out_rows);
++}
++
++template <bool VEC4>
++struct Mxfp4ScaleToMnMajorKernel_xe35 : public __SYCL_KER_CONFIG_CONVENTION__ {
++  Mxfp4ScaleToMnMajorKernel_xe35(
++      uint8_t* out_,
++      const uint8_t* in_,
++      const int32_t* rows_per_expert_,
++      int32_t num_experts_,
++      int32_t groups_,
++      int64_t in_rows_,
++      int64_t out_rows_,
++      int32_t num_work_groups_)
++      : out(out_),
++        in(in_),
++        rows_per_expert(rows_per_expert_),
++        num_experts(num_experts_),
++        groups(groups_),
++        in_rows(in_rows_),
++        out_rows(out_rows_),
++        num_work_groups(num_work_groups_) {}
++
++  void sycl_ker_config_convention(sycl::handler& cgh) {
++    // uint32 elements so the staged tile is 4-byte aligned for the VEC4 path;
++    // the byte path just views the same storage as bytes.
++    smem = sycl::local_accessor<uint32_t>((kTileRows * groups + 3) / 4, cgh);
++    // Per-expert tile/row/dst-row prefixes, scanned once per work group, plus
++    // the three work-group-wide partial sums the scan itself runs on.
++    prefix = sycl::local_accessor<int32_t>(3 * (num_experts + 1), cgh);
++    scan = sycl::local_accessor<int32_t>(3 * kWorkGroupSize, cgh);
++  }
++
++  void operator()(sycl::nd_item<1> item) const {
++    const int32_t wg = static_cast<int32_t>(item.get_group(0));
++    const int32_t lid = static_cast<int32_t>(item.get_local_id(0));
++    const int32_t lsz = static_cast<int32_t>(item.get_local_range(0));
++    uint8_t* tile = reinterpret_cast<uint8_t*>(&smem[0]);
++    int32_t* tile_start = &prefix[0];
++    int32_t* src_of = &prefix[num_experts + 1];
++    int32_t* dst_of = &prefix[2 * (num_experts + 1)];
++
++    // Scan the (device-resident) row counts into SLM once, so the tile loop below
++    // is O(tiles claimed by this work group) instead of a walk over the whole tile
++    // list with a modulo per candidate.
++    //
++    // The scan runs across the whole work group, not on one work item. A serial
++    // scan is num_experts *dependent* global loads -- ~50 us for 256 experts,
++    // which at decode shapes costs more than moving the scales does. Two-level:
++    // each work item folds its own contiguous slice of experts, the per-item
++    // sums are scanned in SLM, then each item replays its slice from its
++    // exclusive base.
++    {
++      int32_t* scan_t = &scan[0];
++      int32_t* scan_s = &scan[kWorkGroupSize];
++      int32_t* scan_d = &scan[2 * kWorkGroupSize];
++      const int32_t per_item = (num_experts + lsz - 1) / lsz;
++      const int32_t lo_e = sycl::min(lid * per_item, num_experts);
++      const int32_t hi_e = sycl::min(lo_e + per_item, num_experts);
++
++      int32_t lt = 0, ls = 0, ld = 0;
++      for (int32_t e = lo_e; e < hi_e; ++e) {
++        const int32_t rows = rows_per_expert[e];
++        lt += (rows + kTileRows - 1) / kTileRows;
++        ls += rows;
++        ld += (rows + kScaleAlignRows - 1) / kScaleAlignRows * kScaleAlignRows;
++      }
++      scan_t[lid] = lt;
++      scan_s[lid] = ls;
++      scan_d[lid] = ld;
++      item.barrier(sycl::access::fence_space::local_space);
++
++      // Hillis-Steele inclusive scan over the lsz per-item sums.
++      for (int32_t off = 1; off < lsz; off <<= 1) {
++        int32_t at = 0, as = 0, ad = 0;
++        if (lid >= off) {
++          at = scan_t[lid - off];
++          as = scan_s[lid - off];
++          ad = scan_d[lid - off];
++        }
++        item.barrier(sycl::access::fence_space::local_space);
++        if (lid >= off) {
++          scan_t[lid] += at;
++          scan_s[lid] += as;
++          scan_d[lid] += ad;
++        }
++        item.barrier(sycl::access::fence_space::local_space);
++      }
++
++      int32_t bt = lid > 0 ? scan_t[lid - 1] : 0;
++      int32_t bs = lid > 0 ? scan_s[lid - 1] : 0;
++      int32_t bd = lid > 0 ? scan_d[lid - 1] : 0;
++      for (int32_t e = lo_e; e < hi_e; ++e) {
++        const int32_t rows = rows_per_expert[e];
++        tile_start[e] = bt;
++        src_of[e] = bs;
++        dst_of[e] = bd;
++        bt += (rows + kTileRows - 1) / kTileRows;
++        bs += rows;
++        bd += (rows + kScaleAlignRows - 1) / kScaleAlignRows * kScaleAlignRows;
++      }
++      // Exactly one work item owns the last expert, so exactly one writes the
++      // totals into the one-past-the-end slots.
++      if (lo_e < num_experts && hi_e == num_experts) {
++        tile_start[num_experts] = bt;
++        src_of[num_experts] = bs;
++        dst_of[num_experts] = bd;
++      }
++    }
++    item.barrier(sycl::access::fence_space::local_space);
++
++    const int32_t total_tiles = tile_start[num_experts];
++    for (int32_t t = wg; t < total_tiles; t += num_work_groups) {
++      // Which expert owns tile t: tile_start is non-decreasing, so an upper-bound
++      // search over num_experts entries replaces the old linear re-walk.
++      int32_t lo = 0;
++      int32_t hi = num_experts - 1;
++      while (lo < hi) {
++        const int32_t mid = (lo + hi + 1) >> 1;
++        if (tile_start[mid] <= t) {
++          lo = mid;
++        } else {
++          hi = mid - 1;
++        }
++      }
++      const int32_t e = lo;
++      const int32_t rows = rows_per_expert[e];
++      const int32_t padded = (rows + kScaleAlignRows - 1) / kScaleAlignRows * kScaleAlignRows;
++      const int64_t src_start = src_of[e];
++      const int64_t dst_start = dst_of[e];
++      const int32_t row0 = (t - tile_start[e]) * kTileRows;
++      {
++        const int32_t tile_rows = sycl::min(kTileRows, rows - row0);
++
++        if constexpr (VEC4) {
++          // Round the tile out to the 4-row scale alignment so the store side
++          // can emit whole quads. `row0` is a multiple of kTileRows and the last
++          // tile of an expert ends at round_up(rows, 4) == padded, so the extra
++          // rows stay inside this expert's own padded block -- rows the GEMM
++          // pairs with pad rows of A and whose output is dropped on combine.
++          const int32_t tile_rows4 = (tile_rows + kScaleAlignRows - 1) / kScaleAlignRows * kScaleAlignRows;
++          const int32_t quads_per_row = groups / 4;
++
++          // Load: consecutive work items read consecutive quads of a source row.
++          for (int32_t idx = lid; idx < tile_rows4 * quads_per_row; idx += lsz) {
++            const int32_t r = idx / quads_per_row;
++            const int32_t q = idx - r * quads_per_row;
++            const int64_t row = src_start + row0 + r;
++            uint32_t v = 0;
++            if (r < tile_rows && row < in_rows) {
++              v = *reinterpret_cast<const uint32_t*>(in + row * groups + q * 4);
++            }
++            *reinterpret_cast<uint32_t*>(tile + r * groups + q * 4) = v;
++          }
++          item.barrier(sycl::access::fence_space::local_space);
++
++          // Store: consecutive work items write consecutive row quads of one
++          // scale group, so the 32-bit stores stay contiguous within a group.
++          const int32_t row_quads = tile_rows4 / 4;
++          for (int32_t idx = lid; idx < groups * row_quads; idx += lsz) {
++            const int32_t g = idx / row_quads;
++            const int32_t rq = idx - g * row_quads;
++            const uint8_t* src = tile + rq * 4 * groups + g;
++            const uint32_t packed = static_cast<uint32_t>(src[0]) | (static_cast<uint32_t>(src[groups]) << 8) |
++                                    (static_cast<uint32_t>(src[2 * groups]) << 16) |
++                                    (static_cast<uint32_t>(src[3 * groups]) << 24);
++            const int64_t off = dst_start * groups + static_cast<int64_t>(g) * padded + row0 + rq * 4;
++            if (off + 4 <= out_rows * groups) {
++              *reinterpret_cast<uint32_t*>(out + off) = packed;
++            }
++          }
++        } else {
++          const int32_t count = tile_rows * groups;
++
++          // Load: consecutive work items read consecutive bytes of a source row.
++          for (int32_t idx = lid; idx < count; idx += lsz) {
++            const int64_t row = src_start + row0 + idx / groups;
++            tile[idx] = row < in_rows ? in[row * groups + idx % groups] : uint8_t(0);
++          }
++          item.barrier(sycl::access::fence_space::local_space);
++
++          // Store: consecutive work items write consecutive rows of one scale group.
++          for (int32_t idx = lid; idx < count; idx += lsz) {
++            const int32_t g = idx / tile_rows;
++            const int32_t i = idx % tile_rows;
++            const int64_t off = dst_start * groups + static_cast<int64_t>(g) * padded + row0 + i;
++            if (off < out_rows * groups) {
++              out[off] = tile[i * groups + g];
++            }
++          }
++        }
++        item.barrier(sycl::access::fence_space::local_space);
++      }
++    }
++  }
++
++  uint8_t* out;
++  const uint8_t* in;
++  const int32_t* rows_per_expert;
++  int32_t num_experts;
++  int32_t groups;
++  int64_t in_rows;
++  int64_t out_rows;
++  int32_t num_work_groups;
++  sycl::local_accessor<uint32_t> smem;
++  sycl::local_accessor<int32_t> prefix;
++  sycl::local_accessor<int32_t> scan;
++};
++
++}  // namespace
++
++void mxfp4_moe_scale_to_mn_major_xe35(torch::Tensor& out, const torch::Tensor& in, const torch::Tensor& rows_per_expert) {
++  TORCH_CHECK(
++      in.device().is_xpu() && out.device().is_xpu() && rows_per_expert.device().is_xpu(),
++      "mxfp4_moe_scale_to_mn_major_xe35: all tensors must be on an XPU device");
++  TORCH_CHECK(in.dim() == 2 && out.dim() == 2, "mxfp4_moe_scale_to_mn_major_xe35: in/out must be 2D");
++  TORCH_CHECK(in.is_contiguous() && out.is_contiguous(), "mxfp4_moe_scale_to_mn_major_xe35: in/out must be contiguous");
++  TORCH_CHECK(in.size(1) == out.size(1), "mxfp4_moe_scale_to_mn_major_xe35: in/out must have the same group count");
++  TORCH_CHECK(
++      in.size(1) > 0 && in.size(1) <= kMaxGroups,
++      "mxfp4_moe_scale_to_mn_major_xe35: group count must be in [1, ",
++      kMaxGroups,
++      "], got ",
++      in.size(1));
++  TORCH_CHECK(
++      rows_per_expert.dim() == 1 && rows_per_expert.scalar_type() == at::kInt,
++      "mxfp4_moe_scale_to_mn_major_xe35: rows_per_expert must be a 1D int32 tensor");
++  TORCH_CHECK(rows_per_expert.is_contiguous(), "mxfp4_moe_scale_to_mn_major_xe35: rows_per_expert must be contiguous");
++  check_out_rows_xe35(out.size(0), in.size(0));
++  // e8m0 scales are carried either as uint8 or as the typed view.
++  auto is_e8m0 = [](const torch::Tensor& t) {
++    return t.scalar_type() == at::kByte || t.scalar_type() == at::kFloat8_e8m0fnu;
++  };
++  TORCH_CHECK(
++      is_e8m0(in) && is_e8m0(out),
++      "mxfp4_moe_scale_to_mn_major_xe35: scales must be uint8 or float8_e8m0fnu, got ",
++      in.scalar_type(),
++      " and ",
++      out.scalar_type());
++
++  const int32_t num_experts = static_cast<int32_t>(rows_per_expert.numel());
++  const int32_t groups = static_cast<int32_t>(in.size(1));
++  if (num_experts == 0 || in.size(0) == 0) {
++    return;
++  }
++
++  // One work group per tile would need the (device-side) row counts on the host;
++  // instead a fixed grid strides over the tile list, sized to cover the buffer's
++  // worth of tiles without launching more work groups than there is work for.
++  // Every work group pays one num_experts-long scan, so do not oversubscribe.
++  const int64_t max_tiles = (in.size(0) + kTileRows - 1) / kTileRows + num_experts;
++  const int32_t num_work_groups = static_cast<int32_t>(std::min<int64_t>(max_tiles, 1024));
++
++  auto queue = at::xpu::getCurrentXPUStream(in.device().index()).queue();
++
++#define LAUNCH_SCALE_RELAYOUT(VEC4)                                                                           \
++  do {                                                                                                        \
++    Mxfp4ScaleToMnMajorKernel_xe35<VEC4> kernel(                                                                   \
++        reinterpret_cast<uint8_t*>(out.data_ptr()),                                                           \
++        reinterpret_cast<const uint8_t*>(in.data_ptr()),                                                      \
++        rows_per_expert.data_ptr<int32_t>(),                                                                  \
++        num_experts,                                                                                          \
++        groups,                                                                                               \
++        in.size(0),                                                                                           \
++        out.size(0),                                                                                          \
++        num_work_groups);                                                                                     \
++    sycl_kernel_submit(static_cast<size_t>(num_work_groups) * kWorkGroupSize, kWorkGroupSize, queue, kernel); \
++  } while (0)
++
++  // A row of scales must be a whole number of 32-bit quads for the vectorized
++  // path; K a multiple of 128 (groups a multiple of 4) covers every shape this
++  // MoE runs. Everything else falls back to the byte-granular walk.
++  if (groups % 4 == 0) {
++    LAUNCH_SCALE_RELAYOUT(true);
++  } else {
++    LAUNCH_SCALE_RELAYOUT(false);
++  }
++#undef LAUNCH_SCALE_RELAYOUT
++}
+diff --git a/src/sycl/xe35/per_token_group_quant_fp4.cpp b/src/sycl/xe35/per_token_group_quant_fp4.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..35ca507952cda83b3416364f51f5efd126430cc1
+--- /dev/null
++++ b/src/sycl/xe35/per_token_group_quant_fp4.cpp
+@@ -0,0 +1,588 @@
++// SPDX-License-Identifier: Apache-2.0
++/*
++ * SYCL kernel for per-token group quantization to MXFP4 (E2M1) format.
++ *
++ * MXFP4 follows the OpenCompute MX (Microscaling) format specification:
++ * - Data type: E2M1 (4-bit float with 2-bit exponent, 1-bit mantissa)
++ * - Block size: 32 elements per scale factor
++ * - Scale format: UE8M0 (unsigned 8-bit exponent-only, no mantissa)
++ *
++ * E2M1 representable values (magnitude): 0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0
++ * With sign bit, we have 16 total values.
++ *
++ * Bit layout of E2M1:
++ *   Bit 3: Sign (0 = positive, 1 = negative)
++ *   Bits 0-2: Magnitude index (0-7)
++ *
++ * Two FP4 values are packed into a single uint8_t:
++ *   - Lower nibble (bits 0-3): First value
++ *   - Upper nibble (bits 4-7): Second value
++ *
++ * Rounding: Per OCP MX spec (section 5.3.3), FP4 conversion uses
++ * roundTiesToEven — at midpoints between representable values, the
++ * value with even mantissa (mantissa bit = 0) is chosen.
++ */
++
++#include "sgl_kernel/xe35/routing_quant.h"
++
++#include <ATen/ATen.h>
++#include <ATen/OpMathType.h>
++#include <c10/xpu/XPUStream.h>
++#include <torch/all.h>
++
++#include <cmath>
++#include <limits>
++#include <sycl/sycl.hpp>
++
++#include "sycl/SYCLHelpers.h"
++#include "sycl/Utils.h"
++
++namespace at::native::xpu {
++
++constexpr float FLOAT4_E2M1_MAX_xe35 = 6.0f;
++
++// Reduce `val` across the WIDTH consecutive lanes that own one quantization
++// group. A group is a power-of-two-sized, WIDTH-aligned span of the sub-group
++// (the work-group size is a whole number of groups), so the xor butterfly never
++// crosses a group boundary and WIDTH must not exceed the sub-group size.
++template <int WIDTH, typename T>
++inline T QuantGroupReduceMaxFP4_xe35(T val, sycl::sub_group sg) {
++  static_assert(WIDTH >= 1 && (WIDTH & (WIDTH - 1)) == 0, "WIDTH must be a power of two");
++#pragma unroll
++  for (int mask = WIDTH / 2; mask > 0; mask >>= 1) {
++    val = sycl::fmax(val, sycl::permute_group_by_xor(sg, val, mask));
++  }
++  return val;
++}
++
++// E2M1 format (4-bit float): 1 sign bit, 2 exponent bits, 1 mantissa bit
++// Encoding: exp=00 (subnormal), exp=01/10/11 (normal with bias=1)
++// Result: bits[3]=sign, bits[2:1]=exponent, bits[0]=mantissa
++//
++// Representable values and their codes:
++//   0.0 -> 0b000   (subnormal, m=0, even)
++//   0.5 -> 0b001   (subnormal, m=1, odd)
++//   1.0 -> 0b010   (e=01, m=0, even)
++//   1.5 -> 0b011   (e=01, m=1, odd)
++//   2.0 -> 0b100   (e=10, m=0, even)
++//   3.0 -> 0b101   (e=10, m=1, odd)
++//   4.0 -> 0b110   (e=11, m=0, even)
++//   6.0 -> 0b111   (e=11, m=1, odd)
++//
++// RoundTiesToEven: At exact midpoints between two representable values,
++// we round to the one whose mantissa bit is 0 (even).
++//
++// Midpoints and their rounding targets:
++//   0.25  -> midpoint of (0.0, 0.5)  -> round to 0.0  (m=0, even)
++//   0.75  -> midpoint of (0.5, 1.0)  -> round to 1.0  (m=0, even)
++//   1.25  -> midpoint of (1.0, 1.5)  -> round to 1.0  (m=0, even)
++//   1.75  -> midpoint of (1.5, 2.0)  -> round to 2.0  (m=0, even)
++//   2.5   -> midpoint of (2.0, 3.0)  -> round to 2.0  (m=0, even)
++//   3.5   -> midpoint of (3.0, 4.0)  -> round to 4.0  (m=0, even)
++//   5.0   -> midpoint of (4.0, 6.0)  -> round to 4.0  (m=0, even)
++inline uint8_t quantize_to_e2m1_xe35(float val) {
++  uint8_t sign = (val < 0.0f) ? 1 : 0;
++  float abs_val = sycl::fabs(val);
++
++  // Branchless form of the interval ladder: the magnitude code is the number of
++  // interval bounds `abs_val` has passed. The bounds are the midpoints between
++  // consecutive representable magnitudes, and the comparison at each one is
++  // strict or non-strict exactly so that a tie lands on the even-mantissa side
++  // (roundTiesToEven, OCP MX 5.3.3):
++  //
++  //   code  1  2     3     4    5     6    7
++  //   at   >.25 >=.75 >1.25 >=1.75 >2.5 >=3.5 >5.0
++  //
++  // e.g. 0.25 -> 0 (even), 0.75 -> 2 i.e. 1.0 (even), 2.5 -> 4 i.e. 2.0 (even).
++  // This replaces an 8-way branch chain evaluated once per element; the packed
++  // loop below calls it VEC_SIZE times per work item.
++  const uint8_t code = static_cast<uint8_t>(
++      static_cast<int>(abs_val > 0.25f) + static_cast<int>(abs_val >= 0.75f) + static_cast<int>(abs_val > 1.25f) +
++      static_cast<int>(abs_val >= 1.75f) + static_cast<int>(abs_val > 2.5f) + static_cast<int>(abs_val >= 3.5f) +
++      static_cast<int>(abs_val > 5.0f));
++
++  return (sign << 3) | code;
++}
++
++// Use SYCL native vector type for efficient loading
++template <typename T, uint32_t N>
++using vec_t = sycl::vec<T, N>;
++
++template <typename T>
++inline T silu_mul_xe35(T a, T b) {
++  float gate = static_cast<float>(a);
++  float up = static_cast<float>(b);
++  return static_cast<T>(gate / (1.0f + expf(-gate)) * up);
++}
++
++// `LANES_PER_GROUP` work items cooperate on one quantization group, each moving
++// `GROUP_SIZE / LANES_PER_GROUP` elements as whole 16-byte vectors. At the
++// default of 1 a lane owns a whole group, which is what this shape wants: the
++// shared-exponent math (`log2`, `exp2`, the reciprocal) and the absmax reduction
++// are per-group, so spreading a group over N lanes runs that arithmetic N times
++// and adds N-1 sub-group permutes on top. One lane per group also turns the
++// packed output into a single 16-byte store. Small surfaces are the exception;
++// see `fp4_quant_lanes_per_group_xe35`.
++//
++// `FUSE_SILU_AND_MUL` folds SwiGLU into the quantizer: the input row is twice as
++// wide as the output row, the gate half first and the up half `row_groups *
++// GROUP_SIZE` elements later, which is the layout `silu_and_mul` and
++// `sgl_per_token_group_quant_8bit_v2` already use. The group's absmax is taken
++// over the *activated* values, so the scale is the one the fused row needs.
++template <
++    typename T,
++    int GROUP_SIZE = 32,
++    bool FUSE_SILU_AND_MUL = false,
++    int LANES_PER_GROUP = 1,
++    bool PADDED_GATHER = false,
++    typename IndexTy = int64_t>
++struct PerTokenGroupQuantFP4Kernel_xe35 : public __SYCL_KER_CONFIG_CONVENTION__ {
++  static constexpr uint32_t VEC_SIZE = 16 / sizeof(T);
++  static constexpr int32_t THREADS_PER_GROUP = LANES_PER_GROUP;
++  static constexpr uint32_t ELEMS_PER_LANE = GROUP_SIZE / LANES_PER_GROUP;
++  static constexpr uint32_t VECS_PER_LANE = ELEMS_PER_LANE / VEC_SIZE;
++  static constexpr uint32_t PACKED_BYTES = ELEMS_PER_LANE / 2;
++  static_assert(GROUP_SIZE % LANES_PER_GROUP == 0, "a group must split evenly across its lanes");
++  static_assert(ELEMS_PER_LANE % VEC_SIZE == 0, "a lane's share must be a whole number of 16-byte loads");
++  static_assert(
++      THREADS_PER_GROUP >= 1 && (THREADS_PER_GROUP & (THREADS_PER_GROUP - 1)) == 0,
++      "THREADS_PER_GROUP must be a power of two for the sub-group butterfly");
++  static_assert(THREADS_PER_GROUP <= 32, "a group must fit inside one sub-group");
++  static_assert(!(FUSE_SILU_AND_MUL && PADDED_GATHER), "the fused input transforms are mutually exclusive");
++
++  PerTokenGroupQuantFP4Kernel_xe35(
++      const T* input,
++      const IndexTy* row_map,
++      uint8_t* output_q,
++      uint8_t* output_s,
++      const int32_t* scale_map,
++      int num_groups,
++      int groups_per_block,
++      int row_groups,
++      float eps)
++      : input(input),
++        row_map(row_map),
++        output_q(output_q),
++        output_s(output_s),
++        scale_map(scale_map),
++        num_groups(num_groups),
++        groups_per_block(groups_per_block),
++        row_groups(row_groups),
++        eps(eps) {}
++
++  void sycl_ker_config_convention(sycl::handler& cgh) {}
++
++  [[sycl::reqd_sub_group_size(32)]] void operator()(sycl::nd_item<1> item) const {
++    const int64_t local_group_id = item.get_local_id(0) / THREADS_PER_GROUP;
++    const int lane_id = item.get_local_id(0) % THREADS_PER_GROUP;
++
++    const int64_t block_group_id = item.get_group(0) * groups_per_block;
++    const int64_t global_group_id = block_group_id + local_group_id;
++
++    if (global_group_id >= num_groups) return;
++
++    // `global_group_id` always enumerates *output* groups. Without the fused
++    // activation the input is the same surface, so the offsets coincide.
++    const int64_t out_group_offset = global_group_id * GROUP_SIZE;
++    int64_t in_group_offset = out_group_offset;
++    if constexpr (FUSE_SILU_AND_MUL) {
++      const int64_t row = global_group_id / row_groups;
++      const int64_t g = global_group_id - row * row_groups;
++      in_group_offset = (row * 2 * row_groups + g) * GROUP_SIZE;
++    } else if constexpr (PADDED_GATHER) {
++      const int64_t row = global_group_id / row_groups;
++      const int64_t g = global_group_id - row * row_groups;
++      const int64_t source_row = static_cast<int64_t>(row_map[row]);
++      in_group_offset = (source_row * row_groups + g) * GROUP_SIZE;
++    }
++
++    const T* gate_ptr = input + in_group_offset + lane_id * ELEMS_PER_LANE;
++    // Output is packed FP4 (2 values per byte), so the offset is halved.
++    uint8_t* out_ptr = output_q + (out_group_offset / 2) + lane_id * PACKED_BYTES;
++    // Scales are row-major by default: one byte per output group, contiguous per
++    // row. A `scale_map` names, per row, the (first row, row count) of the
++    // expert block holding it, and the scales go to the per-expert MN-major
++    // surface the Xe3.5 MXFP grouped GEMM reads (mxfp4_moe_scale_layout.cpp):
++    //   out[start * G + g * rows + (row - start)]
++    // A negative row count marks alignment padding inside a block: its GEMM
++    // output is discarded, so only a finite scale (2^-127) is stored and the
++    // input and packed values are left untouched. A row count of 0 marks
++    // buffer slack nothing reads, so the row is skipped entirely.
++    uint8_t* scale_output = output_s + global_group_id;
++    if (scale_map != nullptr) {
++      const int64_t row = global_group_id / row_groups;
++      const int64_t g = global_group_id - row * row_groups;
++      const int64_t start = scale_map[2 * row];
++      const int64_t rows = scale_map[2 * row + 1];
++      if (rows == 0) return;
++      scale_output = output_s + start * row_groups + g * sycl::abs(rows) + (row - start);
++      if (rows < 0) {
++        if (lane_id == 0) *scale_output = 0;
++        return;
++      }
++    }
++
++    using vec_type = vec_t<T, VEC_SIZE>;
++    const int64_t up_stride = FUSE_SILU_AND_MUL ? static_cast<int64_t>(row_groups) * GROUP_SIZE : 0;
++
++    float vals[ELEMS_PER_LANE];
++    float local_absmax = eps;
++#pragma unroll
++    for (uint32_t v = 0; v < VECS_PER_LANE; ++v) {
++      const T* vec_ptr = gate_ptr + v * VEC_SIZE;
++      vec_type gate_vec;
++      gate_vec.load(0, sycl::multi_ptr<const T, sycl::access::address_space::global_space>(vec_ptr));
++      vec_type up_vec;
++      if constexpr (FUSE_SILU_AND_MUL) {
++        up_vec.load(0, sycl::multi_ptr<const T, sycl::access::address_space::global_space>(vec_ptr + up_stride));
++      }
++#pragma unroll
++      for (uint32_t j = 0; j < VEC_SIZE; ++j) {
++        float val = static_cast<float>(gate_vec[j]);
++        if constexpr (FUSE_SILU_AND_MUL) {
++          val = static_cast<float>(silu_mul_xe35<T>(gate_vec[j], up_vec[j]));
++        }
++        vals[v * VEC_SIZE + j] = val;
++        local_absmax = sycl::fmax(local_absmax, sycl::fabs(val));
++      }
++    }
++
++    // Reduce across the threads in the quantization group to find the maximum
++    local_absmax = QuantGroupReduceMaxFP4_xe35<THREADS_PER_GROUP>(local_absmax, item.get_sub_group());
++
++    // Shared exponent per OCP MX spec / Microsoft micro-scaling:
++    //   shared_exp = floor(log2(absmax)) - E2M1_EMAX
++    // where E2M1_EMAX = 2.  eps already lower-limits local_absmax so
++    // log2 is well-defined.
++    float log2_scale = sycl::floor(sycl::log2(local_absmax)) - 2.0f;
++    int clamped_exponent = sycl::clamp(static_cast<int>(log2_scale), -127, 127);
++    float scale_value = sycl::ldexp(1.0f, clamped_exponent);
++
++    if (lane_id == 0) {
++      // Store scale as UE8M0: exponent + 127 bias
++      uint8_t scale_ue8m0 = static_cast<uint8_t>(clamped_exponent + 127);
++      *scale_output = scale_ue8m0;
++    }
++
++    const float inv_scale = 1.0f / scale_value;
++
++    // Quantize and pack: two E2M1 nibbles per byte, one vector store per lane.
++    vec_t<uint8_t, PACKED_BYTES> packed;
++#pragma unroll
++    for (uint32_t j = 0; j < ELEMS_PER_LANE; j += 2) {
++      uint8_t q0 = quantize_to_e2m1_xe35(vals[j] * inv_scale);
++      uint8_t q1 = quantize_to_e2m1_xe35(vals[j + 1] * inv_scale);
++      // Pack: first value in lower nibble, second in upper nibble
++      // No masking needed — quantize_to_e2m1_xe35 returns values in [0, 15]
++      packed[j / 2] = q0 | (q1 << 4);
++    }
++    packed.store(
++        0, sycl::address_space_cast<sycl::access::address_space::global_space, sycl::access::decorated::yes>(out_ptr));
++  }
++
++ private:
++  const T* input;
++  const IndexTy* row_map;
++  uint8_t* output_q;
++  uint8_t* output_s;
++  const int32_t* scale_map;
++  int num_groups;
++  int groups_per_block;
++  int row_groups;
++  float eps;
++};
++
++// GPU graph timing shows four lanes are useful for small fused BF16 surfaces
++// across output widths 2048, 4096 and 8192. The first crossover is near
++// 48 Ki groups, independent of how those groups are divided into rows.
++// Plain quantization and padded gather have no stable four-lane advantage.
++// One lane is the default for input dtypes without a measured crossover.
++static int fp4_quant_lanes_per_group_xe35(int64_t num_groups, bool bf16_input, bool fused_swiglu) {
++  constexpr int64_t kFourLaneFusedGroupLimit = 48 * 1024;
++  return bf16_input && fused_swiglu && num_groups <= kFourLaneFusedGroupLimit ? 4 : 1;
++}
++
++// `scale_map` is an optional [rows, 2] int32 (block start, block rows) table
++// redirecting each output row's scales; see the kernel. Offsets are not bounds-checked on the host
++// (they are device data), so the caller sizes `output_s` for the surface it names.
++static const int32_t* checked_scale_map_xe35(const std::optional<at::Tensor>& scale_map, int64_t rows, const char* op) {
++  if (!scale_map.has_value()) return nullptr;
++  const at::Tensor& m = *scale_map;
++  TORCH_CHECK(m.device().is_xpu() && m.is_contiguous(), op, ": scale_map must be a contiguous XPU tensor");
++  TORCH_CHECK(m.scalar_type() == at::kInt, op, ": scale_map must be int32, got ", m.scalar_type());
++  TORCH_CHECK(
++      m.dim() == 2 && m.size(0) == rows && m.size(1) == 2,
++      op,
++      ": scale_map must have shape [",
++      rows,
++      ", 2], got ",
++      m.sizes());
++  return m.data_ptr<int32_t>();
++}
++
++void sgl_per_token_group_quant_fp4_xe35(
++    torch::Tensor input,
++    torch::Tensor output_q,
++    torch::Tensor output_s,
++    int64_t group_size,
++    double eps,
++    bool fuse_silu_and_mul,
++    const std::optional<at::Tensor>& scale_map) {
++  CHECK_CONTIGUOUS(input);
++  CHECK_CONTIGUOUS(output_q);
++
++  TORCH_CHECK(group_size == 32, "sgl_per_token_group_quant_fp4_xe35: group_size must be 32 for MXFP4, got ", group_size);
++
++  TORCH_CHECK(
++      input.scalar_type() == at::ScalarType::Half || input.scalar_type() == at::ScalarType::BFloat16 ||
++          input.scalar_type() == at::ScalarType::Float,
++      "sgl_per_token_group_quant_fp4_xe35: input dtype must be Float16, BFloat16, or Float32, got ",
++      input.scalar_type());
++
++  TORCH_CHECK(
++      output_q.scalar_type() == at::ScalarType::Byte,
++      "output_q must be uint8 (packed FP4), got ",
++      output_q.scalar_type());
++  TORCH_CHECK(
++      output_s.scalar_type() == at::ScalarType::Byte,
++      "output_s must be uint8 (UE8M0 scales), got ",
++      output_s.scalar_type());
++
++  TORCH_CHECK(input.dim() >= 1, "input must have at least 1 dimension");
++  TORCH_CHECK(
++      input.size(-1) % group_size == 0,
++      "sgl_per_token_group_quant_fp4_xe35: last dimension of input (",
++      input.size(-1),
++      ") must be divisible by group_size (",
++      group_size,
++      ")");
++
++  // With the fused activation the input row carries the gate and up halves, so
++  // it holds twice the elements the output groups cover.
++  const int64_t in_per_out = fuse_silu_and_mul ? 2 : 1;
++  TORCH_CHECK(
++      input.numel() % (group_size * in_per_out) == 0,
++      "sgl_per_token_group_quant_fp4_xe35: input numel (",
++      input.numel(),
++      ") must be divisible by group_size x ",
++      in_per_out);
++  const int num_groups = static_cast<int>(input.numel() / (group_size * in_per_out));
++
++  // Output should be half the size (2 FP4 values per byte)
++  CHECK_EQ(output_q.numel(), input.numel() / (2 * in_per_out));
++  CHECK_EQ(output_s.numel(), num_groups);
++
++  // Groups per output row, which is what the fused path needs to find the up
++  // half of a row; `output_q` holds two nibbles per byte.
++  const int row_groups = static_cast<int>(output_q.size(-1) * 2 / group_size);
++  if (fuse_silu_and_mul) {
++    TORCH_CHECK(input.dim() == 2 && output_q.dim() == 2, "fuse_silu_and_mul needs 2D input/output_q");
++    TORCH_CHECK(
++        input.size(-1) == output_q.size(-1) * 4,
++        "sgl_per_token_group_quant_fp4_xe35: with fuse_silu_and_mul the input row (",
++        input.size(-1),
++        ") must be 2x the output row (",
++        output_q.size(-1) * 2,
++        " values)");
++  }
++
++  const int32_t* scale_map_ptr = checked_scale_map_xe35(scale_map, num_groups / row_groups, "sgl_per_token_group_quant_fp4_xe35");
++
++  // Ensure eps is positive to prevent NaN from log2(0)
++  float eps_f = static_cast<float>(eps);
++  if (eps_f <= 0.0f) {
++    eps_f = 1e-10f;
++  }
++
++  auto queue = dpcppGetCurrentQueue();
++  const int lanes =
++      fp4_quant_lanes_per_group_xe35(num_groups, input.scalar_type() == at::ScalarType::BFloat16, fuse_silu_and_mul);
++
++// A block holds a whole number of quantization groups, so the sub-group
++// butterfly in `QuantGroupReduceMaxFP4_xe35` stays inside one group (a no-op at the
++// default one lane per group). The ladder aims at `kTargetThreads` work items
++// and steps down to whatever divides `num_groups`.
++#define LAUNCH_FP4_KERNEL_WITH_GROUP_SIZE(T, GS, FUSE, LANES)                                                       \
++  do {                                                                                                              \
++    using Kernel = PerTokenGroupQuantFP4Kernel_xe35<T, GS, FUSE, LANES>;                                                 \
++    constexpr int kTargetThreads = 256;                                                                             \
++    int groups_per_block = kTargetThreads / Kernel::THREADS_PER_GROUP;                                              \
++    while (groups_per_block > 1 && num_groups % groups_per_block != 0) {                                            \
++      groups_per_block >>= 1;                                                                                       \
++    }                                                                                                               \
++    const int num_blocks = num_groups / groups_per_block;                                                           \
++    const int num_threads = groups_per_block * Kernel::THREADS_PER_GROUP;                                           \
++    auto kernel = Kernel(                                                                                           \
++        static_cast<const T*>(input.data_ptr()),                                                                    \
++        nullptr,                                                                                                    \
++        static_cast<uint8_t*>(output_q.data_ptr()),                                                                 \
++        static_cast<uint8_t*>(output_s.data_ptr()),                                                                 \
++        scale_map_ptr,                                                                                              \
++        num_groups,                                                                                                 \
++        groups_per_block,                                                                                           \
++        row_groups,                                                                                                 \
++        eps_f);                                                                                                     \
++    sycl_kernel_submit(                                                                                             \
++        sycl::range<1>(static_cast<size_t>(num_blocks) * num_threads), sycl::range<1>(num_threads), queue, kernel); \
++  } while (0)
++
++#define LAUNCH_FP4_KERNEL_LANES(T, FUSE)                 \
++  do {                                                   \
++    if (lanes == 4) {                                    \
++      LAUNCH_FP4_KERNEL_WITH_GROUP_SIZE(T, 32, FUSE, 4); \
++    } else {                                             \
++      LAUNCH_FP4_KERNEL_WITH_GROUP_SIZE(T, 32, FUSE, 1); \
++    }                                                    \
++  } while (0)
++
++#define LAUNCH_FP4_KERNEL(T)             \
++  do {                                   \
++    if (fuse_silu_and_mul) {             \
++      LAUNCH_FP4_KERNEL_LANES(T, true);  \
++    } else {                             \
++      LAUNCH_FP4_KERNEL_LANES(T, false); \
++    }                                    \
++  } while (0)
++
++  // Dispatch based on input type
++  if (input.scalar_type() == at::ScalarType::Half) {
++    LAUNCH_FP4_KERNEL(sycl::half);
++  } else if (input.scalar_type() == at::ScalarType::BFloat16) {
++    LAUNCH_FP4_KERNEL(sycl::ext::oneapi::bfloat16);
++  } else if (input.scalar_type() == at::ScalarType::Float) {
++    LAUNCH_FP4_KERNEL(float);
++  }
++
++#undef LAUNCH_FP4_KERNEL
++#undef LAUNCH_FP4_KERNEL_LANES
++#undef LAUNCH_FP4_KERNEL_WITH_GROUP_SIZE
++}
++
++void sgl_padded_gather_per_token_group_quant_fp4_xe35(
++    torch::Tensor input,
++    torch::Tensor row_map,
++    torch::Tensor output_q,
++    torch::Tensor output_s,
++    int64_t group_size,
++    double eps,
++    const std::optional<at::Tensor>& scale_map) {
++  CHECK_INPUT(input);
++  CHECK_INPUT(row_map);
++  CHECK_INPUT(output_q);
++  CHECK_INPUT(output_s);
++
++  TORCH_CHECK(
++      group_size == 32,
++      "sgl_padded_gather_per_token_group_quant_fp4_xe35: group_size must be 32 for MXFP4, got ",
++      group_size);
++  TORCH_CHECK(
++      input.scalar_type() == at::ScalarType::Half || input.scalar_type() == at::ScalarType::BFloat16,
++      "sgl_padded_gather_per_token_group_quant_fp4_xe35: input dtype must be Float16 or BFloat16, got ",
++      input.scalar_type());
++  TORCH_CHECK(
++      row_map.scalar_type() == at::ScalarType::Int || row_map.scalar_type() == at::ScalarType::Long,
++      "sgl_padded_gather_per_token_group_quant_fp4_xe35: row_map dtype must be Int32 or Int64, got ",
++      row_map.scalar_type());
++  TORCH_CHECK(
++      output_q.scalar_type() == at::ScalarType::Byte,
++      "sgl_padded_gather_per_token_group_quant_fp4_xe35: output_q must be uint8, got ",
++      output_q.scalar_type());
++  TORCH_CHECK(
++      output_s.scalar_type() == at::ScalarType::Byte,
++      "sgl_padded_gather_per_token_group_quant_fp4_xe35: output_s must be uint8, got ",
++      output_s.scalar_type());
++  TORCH_CHECK(input.dim() == 2, "sgl_padded_gather_per_token_group_quant_fp4_xe35: input must be 2D");
++  TORCH_CHECK(row_map.dim() == 1, "sgl_padded_gather_per_token_group_quant_fp4_xe35: row_map must be 1D");
++  TORCH_CHECK(
++      output_q.dim() == 2 && output_s.dim() == 2, "sgl_padded_gather_per_token_group_quant_fp4_xe35: outputs must be 2D");
++  TORCH_CHECK(
++      input.size(1) > 0 && input.size(1) % group_size == 0,
++      "sgl_padded_gather_per_token_group_quant_fp4_xe35: input width (",
++      input.size(1),
++      ") must be positive and divisible by ",
++      group_size);
++
++  const int64_t output_rows = row_map.numel();
++  const int64_t row_width = input.size(1);
++  const int64_t row_groups_i64 = row_width / group_size;
++  TORCH_CHECK(
++      output_q.size(0) == output_rows && output_q.size(1) == row_width / 2,
++      "sgl_padded_gather_per_token_group_quant_fp4_xe35: output_q must have shape [",
++      output_rows,
++      ", ",
++      row_width / 2,
++      "], got ",
++      output_q.sizes());
++  TORCH_CHECK(
++      output_s.size(0) == output_rows && output_s.size(1) == row_groups_i64,
++      "sgl_padded_gather_per_token_group_quant_fp4_xe35: output_s must have shape [",
++      output_rows,
++      ", ",
++      row_groups_i64,
++      "], got ",
++      output_s.sizes());
++  TORCH_CHECK(
++      input.get_device() == row_map.get_device() && input.get_device() == output_q.get_device() &&
++          input.get_device() == output_s.get_device(),
++      "sgl_padded_gather_per_token_group_quant_fp4_xe35: all tensors must be on the same XPU");
++
++  if (output_rows == 0) return;
++
++  TORCH_CHECK(
++      input.size(0) > 0,
++      "sgl_padded_gather_per_token_group_quant_fp4_xe35: input must have at least one row when row_map is nonempty");
++  TORCH_CHECK(
++      output_rows <= std::numeric_limits<int>::max() / row_groups_i64,
++      "sgl_padded_gather_per_token_group_quant_fp4_xe35: output surface is too large");
++  const int num_groups = static_cast<int>(output_rows * row_groups_i64);
++  const int row_groups = static_cast<int>(row_groups_i64);
++  const int32_t* scale_map_ptr =
++      checked_scale_map_xe35(scale_map, output_rows, "sgl_padded_gather_per_token_group_quant_fp4_xe35");
++  float eps_f = static_cast<float>(eps);
++  if (eps_f <= 0.0f) eps_f = 1e-10f;
++
++  auto queue = dpcppGetCurrentQueue();
++#define LAUNCH_PADDED_GATHER_FP4(T, INDEX_T)                                                                        \
++  do {                                                                                                              \
++    using Kernel = PerTokenGroupQuantFP4Kernel_xe35<T, 32, false, 1, true, INDEX_T>;                                     \
++    constexpr int kTargetThreads = 256;                                                                             \
++    int groups_per_block = kTargetThreads / Kernel::THREADS_PER_GROUP;                                              \
++    while (groups_per_block > 1 && num_groups % groups_per_block != 0) {                                            \
++      groups_per_block >>= 1;                                                                                       \
++    }                                                                                                               \
++    const int num_blocks = num_groups / groups_per_block;                                                           \
++    const int num_threads = groups_per_block * Kernel::THREADS_PER_GROUP;                                           \
++    auto kernel = Kernel(                                                                                           \
++        static_cast<const T*>(input.data_ptr()),                                                                    \
++        static_cast<const INDEX_T*>(row_map.data_ptr()),                                                            \
++        static_cast<uint8_t*>(output_q.data_ptr()),                                                                 \
++        static_cast<uint8_t*>(output_s.data_ptr()),                                                                 \
++        scale_map_ptr,                                                                                              \
++        num_groups,                                                                                                 \
++        groups_per_block,                                                                                           \
++        row_groups,                                                                                                 \
++        eps_f);                                                                                                     \
++    sycl_kernel_submit(                                                                                             \
++        sycl::range<1>(static_cast<size_t>(num_blocks) * num_threads), sycl::range<1>(num_threads), queue, kernel); \
++  } while (0)
++
++#define DISPATCH_PADDED_GATHER_INDEX(T)                 \
++  do {                                                  \
++    if (row_map.scalar_type() == at::ScalarType::Int) { \
++      LAUNCH_PADDED_GATHER_FP4(T, int32_t);             \
++    } else {                                            \
++      LAUNCH_PADDED_GATHER_FP4(T, int64_t);             \
++    }                                                   \
++  } while (0)
++
++  if (input.scalar_type() == at::ScalarType::Half) {
++    DISPATCH_PADDED_GATHER_INDEX(sycl::half);
++  } else {
++    DISPATCH_PADDED_GATHER_INDEX(sycl::ext::oneapi::bfloat16);
++  }
++
++#undef DISPATCH_PADDED_GATHER_INDEX
++#undef LAUNCH_PADDED_GATHER_FP4
++}
++
++}  // namespace at::native::xpu
+diff --git a/src/torch_extension_sycl.cc b/src/torch_extension_sycl.cc
+index 8603e536b016ae275cc7e77d48e1a312532d48c2..a0fe12440977b61d4c30fb1c0f5805650504d095 100644
+--- a/src/torch_extension_sycl.cc
++++ b/src/torch_extension_sycl.cc
+@@ -794,3 +794,30 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
+ }
+ 
+ REGISTER_EXTENSION(common_ops)
++
++#if SYCL_INTEL_TARGET == 35
++TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
++  m.def(
++      "muse_spark_moe_routing_xe35(Tensor! topk_weights, Tensor! topk_ids, Tensor gating_output, Tensor? correction_bias, "
++      "float router_output_multiplier, float route_scale, float division_eps, Tensor? local_expert_mapping, Tensor? "
++      "num_valid_tokens) -> ()");
++  m.impl("muse_spark_moe_routing_xe35", torch::kXPU, &at::native::xpu::muse_spark_moe_routing_xe35);
++  m.def("mxfp4_moe_scale_to_mn_major_xe35(Tensor! out, Tensor input, Tensor rows_per_expert) -> ()");
++  m.impl("mxfp4_moe_scale_to_mn_major_xe35", torch::kXPU, &mxfp4_moe_scale_to_mn_major_xe35);
++  m.def(
++      "sgl_per_token_group_quant_fp4_xe35(Tensor input, Tensor output_q, Tensor output_s, int group_size,"
++      " float eps, bool fuse_silu_and_mul, Tensor? scale_map=None) -> ()");
++  m.impl("sgl_per_token_group_quant_fp4_xe35", torch::kXPU, &at::native::xpu::sgl_per_token_group_quant_fp4_xe35);
++  m.def(
++      "sgl_padded_gather_per_token_group_quant_fp4_xe35(Tensor input, Tensor row_map, Tensor output_q,"
++      " Tensor output_s, int group_size, float eps, Tensor? scale_map=None) -> ()");
++  m.impl(
++      "sgl_padded_gather_per_token_group_quant_fp4_xe35",
++      torch::kXPU,
++      &at::native::xpu::sgl_padded_gather_per_token_group_quant_fp4_xe35);
++  m.def(
++      "topk_sigmoid_xe35(Tensor! topk_weights, Tensor! topk_indices, Tensor gating_output, bool renormalize, Tensor? "
++      "correction_bias) -> ()");
++  m.impl("topk_sigmoid_xe35", torch::kXPU, &at::native::xpu::topk_sigmoid_xe35);
++}
++#endif
+diff --git a/tests/test_moe_routing.py b/tests/test_moe_routing.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..1840f00faa330a409c6ef57327b2f9f0248e7380
+--- /dev/null
++++ b/tests/test_moe_routing.py
+@@ -0,0 +1,328 @@
++"""Accuracy tests for fused MoE routing.
++
++The reference follows native routing dtype transitions: multiply logits by the metap
++multiplier, sigmoid, add the fp32 bias for selection only, take the top-k, then
++emit the unbiased scores as `score * route_scale / (sum + eps)`. Padded rows
++carry expert id -1, and the emitted ids pass through the expert-parallel table.
++
++The router runs in fp32 in the production config (`moe_router_in_fp32`). The
++reference keeps the native path's multiplication dtype and float32 sigmoid.
++"""
++
++from typing import Optional
++
++import pytest
++import sgl_kernel
++import torch
++import utils
++
++device = utils.get_device()
++pytestmark = pytest.mark.skipif(
++    not torch.xpu.is_available() or not sgl_kernel.is_xe3_arch(),
++    reason="routing Xe35 kernels require Intel Xe3.5",
++)
++
++
++def routing_torch_native_xe35(
++    gating_output: torch.Tensor,
++    bias: Optional[torch.Tensor],
++    topk: int,
++    route_scale: float,
++    router_output_multiplier: float,
++    division_eps: float,
++):
++    """Mirror the native routing dtype transitions."""
++    logits = gating_output * router_output_multiplier
++    scores = torch.sigmoid(logits.float())
++    rank_keys = scores if bias is None else scores + bias.unsqueeze(0)
++    ids = torch.topk(rank_keys, k=topk, dim=-1, sorted=True)[1]
++    weights = scores.gather(1, ids)
++    weights = weights * (
++        route_scale / (weights.sum(dim=-1, keepdim=True) + division_eps)
++    )
++    return weights, ids, scores, rank_keys
++
++
++def check_routing_xe35(
++    gating_output,
++    bias,
++    topk,
++    route_scale,
++    router_output_multiplier,
++    division_eps,
++    local_expert_mapping=None,
++    num_valid=None,
++):
++    num_tokens, num_experts = gating_output.shape
++    topk_weights = torch.empty(num_tokens, topk, dtype=torch.float32, device=device)
++    topk_ids = torch.empty(num_tokens, topk, dtype=torch.int32, device=device)
++    num_valid_tensor = (
++        None
++        if num_valid is None
++        else torch.tensor([num_valid], dtype=torch.int32, device=device)
++    )
++
++    sgl_kernel.muse_spark_moe_routing_xe35(
++        topk_weights,
++        topk_ids,
++        gating_output,
++        bias,
++        router_output_multiplier,
++        route_scale,
++        division_eps,
++        local_expert_mapping,
++        num_valid_tensor,
++    )
++
++    _, ref_ids, scores, rank_keys = routing_torch_native_xe35(
++        gating_output, bias, topk, route_scale, router_output_multiplier, division_eps
++    )
++    scores = scores.cpu()
++    ref_ids = ref_ids.cpu()
++    rank_keys = rank_keys.cpu()
++    got_ids = topk_ids.cpu()
++    got_weights = topk_weights.cpu()
++
++    inverse = None
++    if local_expert_mapping is not None:
++        mapping = local_expert_mapping.cpu().tolist()
++        inverse = {local: glob for glob, local in enumerate(mapping)}
++
++    valid = num_tokens if num_valid is None else num_valid
++    for token in range(num_tokens):
++        if token >= valid:
++            assert torch.equal(
++                got_ids[token], torch.full((topk,), -1, dtype=torch.int32)
++            ), f"padded row {token} ids {got_ids[token].tolist()}"
++            assert torch.all(got_weights[token] == 0.0), f"padded row {token} weights"
++            continue
++
++        selected = []
++        for k in range(topk):
++            expert = int(got_ids[token, k])
++            if inverse is not None:
++                assert (
++                    expert in inverse
++                ), f"token {token} rank {k}: id {expert} not local"
++                expert = inverse[expert]
++            assert 0 <= expert < num_experts, f"token {token} rank {k}: id {expert}"
++            assert expert not in selected, f"token {token} rank {k}: duplicate {expert}"
++            selected.append(expert)
++
++        assert torch.equal(
++            rank_keys[token, selected],
++            rank_keys[token, ref_ids[token]],
++        ), f"token {token}: rank scores differ for {selected} vs {ref_ids[token].tolist()}"
++
++        total = sum(float(scores[token, e]) for e in selected)
++        for k in range(topk):
++            want = (
++                float(scores[token, selected[k]]) * route_scale / (total + division_eps)
++            )
++            got = float(got_weights[token, k])
++            assert abs(got - want) <= 2.5e-4 * max(
++                1.0, abs(want)
++            ), f"token {token} rank {k}: weight {got} vs {want}"
++
++
++@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
++@pytest.mark.parametrize("num_tokens", [1, 7, 8, 33, 129, 1024])
++@pytest.mark.parametrize("num_experts", [128, 256])
++def test_moe_routing_production_shape_xe35(dtype, num_tokens, num_experts):
++    """256 experts / top-k 8 is the production shape; 128 uses the same path."""
++    # Muse decode is B8/E256/topk8; other rows and E128 are generic edge cases.
++    torch.manual_seed(1024)
++    gating_output = torch.randn(num_tokens, num_experts, dtype=dtype, device=device)
++    bias = torch.randn(num_experts, dtype=torch.float32, device=device)
++    check_routing_xe35(
++        gating_output,
++        bias,
++        topk=8,
++        route_scale=1.0,
++        # 32 ** -0.5, the metap multiplier of Muse Spark 1.2 L3.
++        router_output_multiplier=0.3535533905932738,
++        division_eps=1e-15,
++    )
++
++
++@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
++@pytest.mark.parametrize("num_experts", [2, 8, 33, 96, 255])
++@pytest.mark.parametrize("topk", [1, 4, 8])
++def test_moe_routing_generic_shapes_xe35(dtype, num_experts, topk):
++    """Cover partial subgroup tiles, different top-k values and dtypes."""
++    if topk > num_experts:
++        pytest.skip("topk must not exceed the expert count")
++    torch.manual_seed(7)
++    gating_output = torch.randn(17, num_experts, dtype=dtype, device=device)
++    bias = torch.randn(num_experts, dtype=torch.float32, device=device)
++    check_routing_xe35(
++        gating_output,
++        bias,
++        topk=topk,
++        route_scale=2.5,
++        router_output_multiplier=1.0,
++        division_eps=0.0,
++    )
++
++
++def test_moe_routing_prefill_xe35():
++    # Muse prefill is B8/ISL4096/E256/topk8/TP1/EP1 with an FP32 router.
++    torch.manual_seed(20261016)
++    tokens, experts, topk = 8 * 4096, 256, 8
++    logits = torch.randn(tokens, experts, dtype=torch.float32, device=device)
++    bias = torch.randn(experts, dtype=torch.float32, device=device)
++    weights = torch.empty(tokens, topk, dtype=torch.float32, device=device)
++    indices = torch.empty(tokens, topk, dtype=torch.int32, device=device)
++    multiplier = 0.3535533905932738
++    sgl_kernel.muse_spark_moe_routing_xe35(
++        weights, indices, logits, bias, multiplier, 1.0, 1e-15
++    )
++    _, _, scores, ranking_scores = routing_torch_native_xe35(
++        logits, bias, topk, 1.0, multiplier, 1e-15
++    )
++    assert bool(((indices >= 0) & (indices < experts)).all())
++    assert bool((torch.diff(torch.sort(indices, dim=-1).values, dim=-1) != 0).all())
++    torch.testing.assert_close(
++        ranking_scores.gather(1, indices.long()),
++        torch.topk(ranking_scores, topk, dim=-1, sorted=True).values,
++        rtol=0,
++        atol=0,
++    )
++    selected = scores.gather(1, indices.long())
++    expected_weights = selected / (selected.sum(dim=-1, keepdim=True) + 1e-15)
++    torch.testing.assert_close(weights, expected_weights, rtol=0, atol=2.5e-4)
++
++
++@pytest.mark.parametrize("num_experts", [96, 256])
++def test_moe_routing_no_bias_xe35(num_experts):
++    torch.manual_seed(11)
++    gating_output = torch.randn(9, num_experts, dtype=torch.float32, device=device)
++    check_routing_xe35(
++        gating_output,
++        None,
++        topk=8,
++        route_scale=1.0,
++        router_output_multiplier=0.5,
++        division_eps=1e-15,
++    )
++
++
++@pytest.mark.parametrize("num_experts", [96, 256])
++@pytest.mark.parametrize("num_valid", [0, 1, 11])
++def test_moe_routing_padded_rows_xe35(num_experts, num_valid):
++    """Rows past the device-scalar valid count get id -1 and weight 0."""
++    torch.manual_seed(13)
++    gating_output = torch.randn(20, num_experts, dtype=torch.float32, device=device)
++    bias = torch.randn(num_experts, dtype=torch.float32, device=device)
++    check_routing_xe35(
++        gating_output,
++        bias,
++        topk=8,
++        route_scale=1.0,
++        router_output_multiplier=0.3535533905932738,
++        division_eps=1e-15,
++        num_valid=num_valid,
++    )
++
++
++@pytest.mark.parametrize("num_experts", [48, 256])
++@pytest.mark.parametrize("num_valid", [None, 11])
++def test_moe_routing_local_expert_mapping_xe35(num_experts, num_valid):
++    """Expert-parallel remap: only the emitted id changes, never the selection."""
++    torch.manual_seed(17)
++    topk = 8 if num_experts == 256 else 6
++    gating_output = torch.randn(20, num_experts, dtype=torch.float32, device=device)
++    bias = torch.randn(num_experts, dtype=torch.float32, device=device)
++    # A reversing permutation: distinguishable from the identity at every id.
++    mapping = torch.arange(num_experts - 1, -1, -1, dtype=torch.int32, device=device)
++    check_routing_xe35(
++        gating_output,
++        bias,
++        topk=topk,
++        route_scale=1.0,
++        router_output_multiplier=0.3535533905932738,
++        division_eps=1e-15,
++        local_expert_mapping=mapping,
++        num_valid=num_valid,
++    )
++
++
++def test_moe_routing_zero_multiplier_xe35():
++    """A zero multiplier makes every sigmoid exactly 0.5, so bias alone ranks."""
++    torch.manual_seed(19)
++    gating_output = torch.randn(5, 256, dtype=torch.float32, device=device)
++    bias = torch.randn(256, dtype=torch.float32, device=device)
++    topk_weights = torch.empty(5, 8, dtype=torch.float32, device=device)
++    topk_ids = torch.empty(5, 8, dtype=torch.int32, device=device)
++    sgl_kernel.muse_spark_moe_routing_xe35(
++        topk_weights, topk_ids, gating_output, bias, 0.0, 1.0, 1e-15, None, None
++    )
++    torch.testing.assert_close(
++        topk_weights.cpu(), torch.full((5, 8), 0.125), rtol=0, atol=1e-6
++    )
++    expected = torch.topk(bias, k=8, dim=-1, sorted=True)[1].to(torch.int32)
++    for token in range(5):
++        assert torch.equal(topk_ids[token].cpu(), expected.cpu())
++
++
++@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
++@pytest.mark.parametrize("num_experts", [32, 63, 64, 65, 127, 128, 129, 255, 256])
++@pytest.mark.parametrize("topk", [7, 8])
++def test_moe_routing_equal_scores_choose_lowest_xe35(dtype, num_experts, topk):
++    """Equal scores select lowest IDs across vector tiles and masked tails."""
++    logits = torch.zeros(3, num_experts, dtype=dtype, device=device)
++    bias = torch.zeros(num_experts, dtype=torch.float32, device=device)
++    valid = torch.tensor([2], dtype=torch.int32, device=device)
++    weights = torch.empty(3, topk, dtype=torch.float32, device=device)
++    ids = torch.empty(3, topk, dtype=torch.int32, device=device)
++    sgl_kernel.muse_spark_moe_routing_xe35(
++        weights, ids, logits, bias, 1.0, 1.0, 1e-15, None, valid
++    )
++    expected_ids = torch.arange(topk, dtype=torch.int32, device=device)
++    for row in range(2):
++        torch.testing.assert_close(ids[row], expected_ids, rtol=0, atol=0)
++        torch.testing.assert_close(
++            weights[row], torch.full_like(weights[row], 1.0 / topk), rtol=0, atol=1e-6
++        )
++    torch.testing.assert_close(ids[2], torch.full_like(ids[2], -1), rtol=0, atol=0)
++    torch.testing.assert_close(weights[2], torch.zeros_like(weights[2]), rtol=0, atol=0)
++
++
++@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
++@pytest.mark.parametrize("num_experts", [63, 64, 65, 127, 128, 129, 255, 256])
++@pytest.mark.parametrize("topk", [7, 8])
++def test_moe_routing_full_tile_neighbors_xe35(dtype, num_experts, topk):
++    torch.manual_seed(30000 + num_experts + topk)
++    logits = torch.randn(17, num_experts, dtype=dtype, device=device)
++    bias = torch.randn(num_experts, dtype=torch.float32, device=device)
++    check_routing_xe35(logits, bias, topk, 1.0, 0.3535533905932738, 1e-15)
++
++
++@pytest.mark.parametrize("num_experts", [128, 256])
++def test_moe_routing_near_topk_boundary_xe35(num_experts):
++    """A small biased-score gap must preserve the production expert ID."""
++    multiplier = 0.3535533905932738
++    logits_cpu = torch.zeros(1, num_experts, dtype=torch.float32)
++    logits_cpu[0, 70], logits_cpu[0, 71] = 1.8000080585479736, 2.9113547801971436
++    scores = torch.sigmoid(logits_cpu * multiplier)
++    bias_cpu = torch.full((num_experts,), -2.0)
++    bias_cpu[:7] = torch.linspace(2.0, 1.4, 7)
++    bias_cpu[70] = 0.9 - scores[0, 70]
++    bias_cpu[71] = 0.9 - 1e-7 - scores[0, 71]
++    _, expected_ids, _, keys = routing_torch_native_xe35(
++        logits_cpu, bias_cpu, 8, 1.0, multiplier, 1e-15
++    )
++    assert 0 < keys[0, 70] - keys[0, 71] < 1e-6
++    assert expected_ids[0, -1] == 70
++    check_routing_xe35(
++        logits_cpu.to(device),
++        bias_cpu.to(device),
++        topk=8,
++        route_scale=1.0,
++        router_output_multiplier=multiplier,
++        division_eps=1e-15,
++    )
++
++
++if __name__ == "__main__":
++    pytest.main([__file__])
+diff --git a/tests/test_per_token_group_quant_mxfp4_routing.py b/tests/test_per_token_group_quant_mxfp4_routing.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..21c716aedfbf7a9303db8fbdcef5fcad5909fdc6
+--- /dev/null
++++ b/tests/test_per_token_group_quant_mxfp4_routing.py
+@@ -0,0 +1,699 @@
++# SPDX-License-Identifier: Apache-2.0
++"""
++Tests for MXFP4 (E2M1) Per-Token Group Quantization on Intel XPU
++
++MXFP4 follows the OpenCompute MX (Microscaling) format specification:
++- Data type: E2M1 (4-bit float with 2-bit exponent, 1-bit mantissa)
++- Block size: 32 elements per scale factor
++- Scale format: UE8M0 (unsigned 8-bit exponent-only, no mantissa)
++
++Rounding: Per OCP MX spec (section 5.3.3), FP4 conversion uses
++roundTiesToEven — at midpoints between representable values, the
++value with even mantissa (mantissa bit = 0) is chosen.
++
++Usage:
++    pytest test_per_token_group_quant_mxfp4.py -v
++"""
++
++import pytest
++import torch
++
++MXFP4_BLOCK_SIZE = 32
++FLOAT4_E2M1_MAX = 6.0
++
++# E2M1 format parameters (from Microsoft microxcaling formats.py)
++E2M1_EBITS = 2
++E2M1_MBITS = 3  # includes sign bit and implicit one
++E2M1_EMAX = 2 ** (E2M1_EBITS - 1)  # = 2
++E2M1_MAX_NORM = (
++    2**E2M1_EMAX * float(2 ** (E2M1_MBITS - 1) - 1) / 2 ** (E2M1_MBITS - 2)
++)  # = 6.0
++
++FP32_EXPONENT_BIAS = 127
++FP32_MIN_NORMAL = 2 ** (-FP32_EXPONENT_BIAS + 1)  # 2^(-126)
++
++kE2M1ToFloat = torch.tensor(
++    [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0], dtype=torch.float32
++)
++
++
++def is_xpu_available_xe35() -> bool:
++    return hasattr(torch, "xpu") and torch.xpu.is_available()
++
++
++def _round_mantissa_even_xe35(A: torch.Tensor) -> torch.Tensor:
++    """Round mantissa using roundTiesToEven (from Microsoft microxcaling).
++
++    At exact 0.5 midpoints (i.e., values like 0.5, 2.5, 4.5, ...),
++    round to the nearest even integer (the one whose LSB is 0).
++
++    Ref: https://github.com/microsoft/microxcaling/blob/main_xe35/mx/elemwise_ops.py
++    """
++    absA = torch.abs(A)
++    # Identify exact midpoints: 0.5, 2.5, 4.5, ...  i.e. (absA - 0.5) % 2 == 0
++    maskA = ((absA - 0.5) % 2 == torch.zeros_like(A)).type(A.dtype)
++    # round half up, then subtract 1 at midpoints to get even
++    return torch.sign(A) * (torch.floor(absA + 0.5) - maskA)
++
++
++def _quantize_elemwise_core_e2m1_xe35(
++    A: torch.Tensor, saturate_normals: bool = True
++) -> torch.Tensor:
++    """Element-wise quantization to E2M1 using Microsoft microxcaling's
++    _quantize_elemwise_core algorithm with round='even'.
++
++    E2M1 format: ebits=2, mbits=3, emax=2, max_norm=6.0
++    min_exp = -(2^(ebits-1)) + 2 = 0
++
++    Algorithm (from Microsoft microxcaling elemwise_ops.py):
++      1. Compute per-element private exponent = floor(log2(|A|)),
++         clamped to min_exp.
++      2. Left-shift: out = A / 2^private_exp * 2^(mbits-2)
++      3. Round mantissa with roundTiesToEven
++      4. Right-shift: out = out / 2^(mbits-2) * 2^private_exp
++      5. Clamp to [-max_norm, max_norm] if saturate_normals
++
++    Ref: https://github.com/microsoft/microxcaling/blob/main_xe35/mx/elemwise_ops.py
++    """
++    ebits = E2M1_EBITS  # 2
++    mbits = E2M1_MBITS  # 3
++    max_norm = E2M1_MAX_NORM  # 6.0
++
++    # min representable exponent: -(2^(ebits-1)) + 2 = 0
++    min_exp = -(2 ** (ebits - 1)) + 2  # 0
++
++    out = A.clone()
++
++    # Per-element private exponent: floor(log2(|A|))
++    # Add guard for zeros: log2(0) is -inf, we use (A==0) to avoid that
++    private_exp = torch.floor(torch.log2(torch.abs(A) + (A == 0).type(A.dtype)))
++    private_exp = private_exp.clip(min=min_exp)
++
++    # Left-shift: scale up so mantissa bits land in integer portion
++    # out = A / 2^private_exp * 2^(mbits-2)
++    shift = mbits - 2  # = 1
++    out = out / (2**private_exp) * (2**shift)
++
++    # Round mantissa with roundTiesToEven
++    out = _round_mantissa_even_xe35(out)
++
++    # Right-shift: undo scaling
++    # out = out / 2^(mbits-2) * 2^private_exp
++    out = out / (2**shift) * (2**private_exp)
++
++    # Saturate to [-max_norm, max_norm]
++    if saturate_normals:
++        out = torch.clamp(out, min=-max_norm, max=max_norm)
++
++    return out
++
++
++def _float_to_e2m1_code_xe35(val: torch.Tensor) -> torch.Tensor:
++    """Convert quantized float values back to E2M1 4-bit codes.
++
++    After _quantize_elemwise_core_e2m1_xe35, values are one of the 8 representable
++    E2M1 magnitudes: {0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0}.
++    This maps them to 4-bit codes (sign in bit 3, magnitude in bits 0-2).
++    """
++    sign = torch.signbit(val).to(torch.uint8)
++    abs_val = val.abs()
++
++    # Map representable magnitudes to 3-bit indices via the kE2M1ToFloat LUT.
++    indices = torch.zeros_like(abs_val, dtype=torch.uint8)
++    lut = kE2M1ToFloat.to(device=val.device)
++    for i in range(8):
++        indices = torch.where(
++            abs_val == lut[i],
++            torch.tensor(i, dtype=torch.uint8, device=val.device),
++            indices,
++        )
++
++    return (sign << 3) | indices
++
++
++def quantize_to_e2m1_xe35(tensor: torch.Tensor) -> torch.Tensor:
++    """Quantize tensor values to E2M1 format (4-bit indices).
++
++    Uses the Microsoft microxcaling _quantize_elemwise_core algorithm
++    with roundTiesToEven, then maps the resulting float values to 4-bit codes.
++
++    Ref: https://github.com/microsoft/microxcaling/blob/main_xe35/mx/elemwise_ops.py
++    """
++    quantized_float = _quantize_elemwise_core_e2m1_xe35(
++        tensor.float(), saturate_normals=True
++    )
++    return _float_to_e2m1_code_xe35(quantized_float)
++
++
++def pack_fp4_xe35(tensor: torch.Tensor) -> torch.Tensor:
++    assert tensor.shape[-1] % 2 == 0
++    shape = tensor.shape[:-1] + (tensor.shape[-1] // 2, 2)
++    paired = tensor.reshape(shape)
++    packed = (paired[..., 0] & 0x0F) | ((paired[..., 1] & 0x0F) << 4)
++    return packed.to(torch.uint8)
++
++
++def unpack_fp4_xe35(packed: torch.Tensor) -> torch.Tensor:
++    low = packed & 0x0F
++    high = (packed >> 4) & 0x0F
++    unpacked = torch.stack([low, high], dim=-1).reshape(*packed.shape[:-1], -1)
++    return unpacked
++
++
++def dequantize_e2m1_xe35(
++    quantized: torch.Tensor, dtype: torch.dtype = torch.float32
++) -> torch.Tensor:
++    sign = ((quantized >> 3) & 1).to(torch.bool)
++    magnitude_idx = (quantized & 0x07).to(torch.long)
++    kE2M1 = kE2M1ToFloat.to(device=quantized.device)
++    magnitude = kE2M1[magnitude_idx]
++    result = torch.where(sign, -magnitude, magnitude)
++    return result.to(dtype)
++
++
++def _shared_exponents_xe35(A: torch.Tensor, axis: int) -> torch.Tensor:
++    """Compute shared exponents per block using Microsoft microxcaling's
++    _shared_exponents_xe35 algorithm with method="max".
++
++    Algorithm:
++      1. shared_exp = max(|A|) along axis (per block)
++      2. shared_exp = floor(log2(shared_exp + FP32_MIN_NORMAL * (shared_exp == 0)))
++         The FP32_MIN_NORMAL guard ensures log2(0) doesn't produce -inf.
++      3. Offset by emax: shared_exp = shared_exp - emax
++
++    Ref: https://github.com/microsoft/microxcaling/blob/main_xe35/mx/mx_ops.py
++    """
++    shared_exp = torch.max(torch.abs(A), dim=axis, keepdim=True).values
++
++    # floor(log2(...)) with zero-guard from microxcaling
++    shared_exp = torch.floor(
++        torch.log2(
++            shared_exp + FP32_MIN_NORMAL * (shared_exp == 0).type(shared_exp.dtype)
++        )
++    )
++
++    # Offset by the largest representable exponent in E2M1
++    shared_exp = shared_exp - E2M1_EMAX
++
++    return shared_exp
++
++
++def quantize_to_mxfp4_xe35(
++    tensor: torch.Tensor, block_size: int = MXFP4_BLOCK_SIZE, eps: float = 1e-10
++) -> tuple:
++    """Quantize to MXFP4 using Microsoft microxcaling's _quantize_mx algorithm.
++
++    Algorithm (from mx_ops.py _quantize_mx):
++      1. Reshape into blocks
++      2. Compute shared exponent per block via _shared_exponents_xe35
++      3. Clamp shared_exp to scale_emax range [-127, 127]
++      4. Scale elements: A = A / 2^shared_exp
++      5. Quantize element-wise with _quantize_elemwise_core (saturate_normals=True)
++      6. Rescale: A = A * 2^shared_exp (implicitly stored in UE8M0 scale)
++
++    Ref: https://github.com/microsoft/microxcaling/blob/main_xe35/mx/mx_ops.py
++    """
++    assert tensor.dim() == 2
++    m, k = tensor.shape
++    assert k % block_size == 0
++    assert k % 2 == 0
++
++    tensor_fp32 = tensor.float()
++    num_blocks = k // block_size
++    tensor_blocks = tensor_fp32.reshape(m, num_blocks, block_size)
++
++    # Compute shared exponents (microxcaling _shared_exponents_xe35 + offset by emax)
++    shared_exp = _shared_exponents_xe35(tensor_blocks, axis=-1)
++
++    # Clamp to UE8M0 scale range: scale_bits=8, scale_emax = 2^(8-1)-1 = 127
++    scale_emax = 127
++    shared_exp = shared_exp.clamp(min=-scale_emax, max=scale_emax)
++
++    # Encode as UE8M0: stored_scale = shared_exp + 127
++    scales_ue8m0 = (shared_exp.to(torch.int32) + 127).to(torch.uint8).squeeze(-1)
++
++    # Scale elements by shared exponent: A = A / 2^shared_exp
++    scaled_tensor = tensor_blocks / (2.0**shared_exp)
++
++    # Quantize element-wise with microxcaling core (roundTiesToEven, saturate)
++    quantized_float = _quantize_elemwise_core_e2m1_xe35(scaled_tensor, saturate_normals=True)
++
++    # Convert quantized float values to 4-bit E2M1 codes
++    quantized_blocks = _float_to_e2m1_code_xe35(quantized_float)
++
++    quantized = quantized_blocks.reshape(m, k)
++    packed = pack_fp4_xe35(quantized)
++
++    return packed, scales_ue8m0
++
++
++def dequantize_mxfp4_xe35(
++    packed: torch.Tensor,
++    scales: torch.Tensor,
++    dtype: torch.dtype = torch.float32,
++    block_size: int = MXFP4_BLOCK_SIZE,
++) -> torch.Tensor:
++    m, packed_k = packed.shape
++    k = packed_k * 2
++
++    unpacked = unpack_fp4_xe35(packed)
++    dequantized = dequantize_e2m1_xe35(unpacked, dtype)
++
++    num_blocks = k // block_size
++    dequantized_blocks = dequantized.reshape(m, num_blocks, block_size)
++
++    scale_exp = scales.to(torch.int32) - 127
++    scale_values = torch.pow(2.0, scale_exp.float()).unsqueeze(-1)
++    scaled = dequantized_blocks * scale_values
++
++    return scaled.reshape(m, k).to(dtype)
++
++
++class TestMXFP4ReferenceQuantization:
++    def test_e2m1_zero_codes_exact_xe35(self):
++        values = torch.tensor([-0.25, -0.125, -0.0, 0.0, 0.125, 0.25])
++        expected = torch.tensor([8, 8, 0, 0, 0, 0], dtype=torch.uint8)
++        torch.testing.assert_close(quantize_to_e2m1_xe35(values), expected, rtol=0, atol=0)
++
++    @pytest.mark.parametrize(
++        "dtype,gate,up",
++        [
++            (torch.bfloat16, 0.5, 2.40625),
++            (torch.float16, 0.004001617431640625, 374.0),
++        ],
++    )
++    def test_swiglu_output_rounding_changes_fp4_xe35(self, dtype, gate, up):
++        """The separate silu_and_mul writes dtype before MXFP4 quantization."""
++        x = torch.zeros(1, 64, dtype=dtype)
++        x[0, 0], x[0, 32] = gate, up
++        x[0, 1], x[0, 33] = 4.0, 1.25  # Keep the block scale at 1.
++        activated_fp32 = torch.nn.functional.silu(x[:, :32].float()) * x[:, 32:].float()
++        separate = activated_fp32.to(dtype).float()
++        assert activated_fp32[0, 0] < 0.75
++        assert separate[0, 0] == 0.75
++        rounded_q, rounded_s = quantize_to_mxfp4_xe35(separate)
++        direct_q, direct_s = quantize_to_mxfp4_xe35(activated_fp32)
++        assert torch.equal(rounded_s, direct_s)
++        assert rounded_s[0, 0] == 127
++        assert unpack_fp4_xe35(rounded_q)[0, 0] == 2  # 0.75 ties to 1.0.
++        assert unpack_fp4_xe35(direct_q)[0, 0] == 1  # Below 0.75 gives 0.5.
++
++    def test_e2m1_roundtrip_xe35(self):
++        device = torch.device("cpu")
++        test_values = torch.tensor(
++            [
++                0.0,
++                0.5,
++                1.0,
++                1.5,
++                2.0,
++                3.0,
++                4.0,
++                6.0,
++                -0.5,
++                -1.0,
++                -1.5,
++                -2.0,
++                -3.0,
++                -4.0,
++                -6.0,
++            ],
++            dtype=torch.float32,
++            device=device,
++        )
++        quantized = quantize_to_e2m1_xe35(test_values)
++        dequantized = dequantize_e2m1_xe35(quantized)
++        torch.testing.assert_close(dequantized, test_values, atol=0.0, rtol=0.0)
++
++    def test_e2m1_round_ties_to_even_xe35(self):
++        """Test that midpoints between representable values round to even (m=0).
++
++        Per OCP MX spec section 5.3.3, FP4 must use roundTiesToEven.
++        At midpoints, the value with even mantissa (m=0) is chosen.
++        """
++        device = torch.device("cpu")
++        # Midpoint values and their expected quantized results
++        # (midpoint_value, expected_dequantized_value)
++        midpoint_tests = [
++            (0.25, 0.0),  # midpoint of (0.0, 0.5) -> 0.0 (m=0, even)
++            (0.75, 1.0),  # midpoint of (0.5, 1.0) -> 1.0 (m=0, even)
++            (1.25, 1.0),  # midpoint of (1.0, 1.5) -> 1.0 (m=0, even)
++            (1.75, 2.0),  # midpoint of (1.5, 2.0) -> 2.0 (m=0, even)
++            (2.5, 2.0),  # midpoint of (2.0, 3.0) -> 2.0 (m=0, even)
++            (3.5, 4.0),  # midpoint of (3.0, 4.0) -> 4.0 (m=0, even)
++            (5.0, 4.0),  # midpoint of (4.0, 6.0) -> 4.0 (m=0, even)
++            # Negative midpoints
++            (-0.25, 0.0),  # -> -0.0 = 0.0
++            (-0.75, -1.0),
++            (-1.25, -1.0),
++            (-1.75, -2.0),
++            (-2.5, -2.0),
++            (-3.5, -4.0),
++            (-5.0, -4.0),
++        ]
++        for midpoint, expected in midpoint_tests:
++            tensor = torch.tensor([midpoint], dtype=torch.float32, device=device)
++            quantized = quantize_to_e2m1_xe35(tensor)
++            dequantized = dequantize_e2m1_xe35(quantized)
++            # For -0.25, dequantized is -0.0 which equals 0.0
++            assert dequantized.item() == expected or (
++                expected == 0.0 and abs(dequantized.item()) == 0.0
++            ), f"Midpoint {midpoint}: expected {expected}, got {dequantized.item()}"
++
++    def test_pack_unpack_roundtrip_xe35(self):
++        device = torch.device("cpu")
++        m, k = 16, 64
++        original = torch.randint(0, 16, (m, k), dtype=torch.uint8, device=device)
++        packed = pack_fp4_xe35(original)
++        unpacked = unpack_fp4_xe35(packed)
++        torch.testing.assert_close(unpacked, original)
++
++    def test_mxfp4_quantization_shape_xe35(self):
++        device = torch.device("cpu")
++        m, k = 32, 128
++        original = torch.randn(m, k, dtype=torch.float32, device=device)
++        packed, scales = quantize_to_mxfp4_xe35(original)
++        assert packed.shape == (m, k // 2)
++        assert scales.shape == (m, k // MXFP4_BLOCK_SIZE)
++        assert packed.dtype == torch.uint8
++        assert scales.dtype == torch.uint8
++
++    def test_mxfp4_dequantization_accuracy_xe35(self):
++        device = torch.device("cpu")
++        m, k = 32, 128
++        original = torch.randn(m, k, dtype=torch.float32, device=device) * 3.0
++        packed, scales = quantize_to_mxfp4_xe35(original)
++        dequantized = dequantize_mxfp4_xe35(packed, scales, torch.float32)
++        assert dequantized.shape == original.shape
++        relative_error = (dequantized - original).abs() / (original.abs() + 1e-6)
++        mean_error = relative_error.mean().item()
++        assert mean_error < 0.5
++
++
++def is_cri_device_xe35() -> bool:
++    from sgl_kernel import is_xe3_arch
++
++    return is_xe3_arch()
++
++
++@pytest.mark.skipif(
++    not is_xpu_available_xe35() or not is_cri_device_xe35(),
++    reason="MXFP4 routing quant kernels require Intel Xe3.5",
++)
++class TestPerTokenGroupQuantFP4XPU:
++    @pytest.fixture(autouse=True)
++    def setup_xe35(self):
++        import utils
++
++        self.device = utils.get_device()
++        self.eps = 1e-10
++
++    def _import_kernel_xe35(self):
++        try:
++            from sgl_kernel import sgl_per_token_group_quant_fp4_xe35
++
++            return sgl_per_token_group_quant_fp4_xe35
++        except ImportError:
++            pytest.skip("sgl_per_token_group_quant_fp4_xe35 kernel not available")
++
++    @pytest.mark.parametrize(
++        "dtype,gate,up",
++        [
++            (torch.bfloat16, 0.5, 2.40625),
++            (torch.float16, 0.004001617431640625, 374.0),
++        ],
++    )
++    def test_fused_swiglu_matches_separate_dtype_surface_xe35(self, dtype, gate, up):
++        from sgl_kernel import silu_and_mul
++
++        x = torch.zeros(1, 64, dtype=dtype, device=self.device)
++        x[0, 0], x[0, 32] = gate, up
++        x[0, 1], x[0, 33] = 4.0, 1.25
++        activated = torch.empty(1, 32, dtype=dtype, device=self.device)
++        silu_and_mul(x, out=activated)
++        quant = self._import_kernel_xe35()
++        values_cpu = x.cpu().float()
++        expected_activation = (
++            torch.nn.functional.silu(values_cpu[:, :32]) * values_cpu[:, 32:]
++        ).to(dtype)
++        expected_q, expected_s = quantize_to_mxfp4_xe35(expected_activation)
++        separate_q, separate_s = quant(activated)
++        actual_q, actual_s = quant(x, fuse_silu_and_mul=True)
++        torch.testing.assert_close(separate_q.cpu(), expected_q, rtol=0, atol=0)
++        torch.testing.assert_close(separate_s.cpu(), expected_s, rtol=0, atol=0)
++        torch.testing.assert_close(actual_s.cpu(), expected_s, rtol=0, atol=0)
++        torch.testing.assert_close(
++            actual_q.cpu(),
++            expected_q,
++            rtol=0,
++            atol=0,
++        )
++
++    @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
++    @pytest.mark.parametrize("hidden", [256, 8192])
++    def test_fused_swiglu_cpu_reference_xe35(self, dtype, hidden):
++        # Muse decode is B8/hidden8192; hidden256 exercises a generic small surface.
++        from sgl_kernel import silu_and_mul
++
++        generator = torch.Generator().manual_seed(20261016 + hidden)
++        values = torch.randn(8, 2 * hidden, generator=generator).to(dtype)
++        activation = (
++            torch.nn.functional.silu(values[:, :hidden].float())
++            * values[:, hidden:].float()
++        ).to(dtype)
++        expected_q, expected_s = quantize_to_mxfp4_xe35(activation)
++        values_xpu = values.to(self.device)
++        separate_activation = silu_and_mul(values_xpu)
++        quant = self._import_kernel_xe35()
++        separate_q, separate_s = quant(separate_activation)
++        fused_q, fused_s = quant(values_xpu, fuse_silu_and_mul=True)
++        for actual_q, actual_s in ((separate_q, separate_s), (fused_q, fused_s)):
++            torch.testing.assert_close(actual_q.cpu(), expected_q, rtol=0, atol=0)
++            torch.testing.assert_close(actual_s.cpu(), expected_s, rtol=0, atol=0)
++
++    def _test_against_reference_xe35(
++        self,
++        num_tokens: int,
++        hidden_dim: int,
++        src_dtype: torch.dtype = torch.bfloat16,
++        seed: int = 42,
++    ):
++        sgl_per_token_group_quant_fp4_xe35 = self._import_kernel_xe35()
++        group_size = MXFP4_BLOCK_SIZE
++
++        torch.manual_seed(seed)
++
++        x_cpu = torch.randn(num_tokens, hidden_dim, dtype=src_dtype, device="cpu")
++        x_q_ref, scales_ref = quantize_to_mxfp4_xe35(x_cpu.float(), group_size, eps=self.eps)
++
++        x_xpu = x_cpu.to(self.device)
++        x_q_xpu, scales_xpu = sgl_per_token_group_quant_fp4_xe35(
++            x=x_xpu,
++            group_size=group_size,
++            eps=self.eps,
++        )
++
++        x_q_xpu_cpu = x_q_xpu.cpu()
++        scales_xpu_cpu = scales_xpu.cpu()
++
++        assert (
++            x_q_xpu_cpu.shape == x_q_ref.shape
++        ), f"Quantized shape mismatch: {x_q_xpu_cpu.shape} vs {x_q_ref.shape}"
++        assert (
++            scales_xpu_cpu.shape == scales_ref.shape
++        ), f"Scales shape mismatch: {scales_xpu_cpu.shape} vs {scales_ref.shape}"
++        assert x_q_xpu_cpu.dtype == torch.uint8
++        assert scales_xpu_cpu.dtype == torch.uint8
++
++        torch.testing.assert_close(x_q_xpu_cpu, x_q_ref, rtol=0, atol=0)
++
++        scale_exp_ref = scales_ref.to(torch.int32) - 127
++        scale_exp_xpu = scales_xpu_cpu.to(torch.int32) - 127
++        exp_diff = (scale_exp_ref - scale_exp_xpu).abs()
++        assert exp_diff.max() == 0, f"Scale exponent difference: {exp_diff.max()}"
++
++        # Compare dequantized outputs
++        x_dq_ref = dequantize_mxfp4_xe35(x_q_ref, scales_ref, torch.float32, group_size)
++        x_dq_xpu = dequantize_mxfp4_xe35(
++            x_q_xpu_cpu, scales_xpu_cpu, torch.float32, group_size
++        )
++        torch.testing.assert_close(x_dq_xpu, x_dq_ref, rtol=0.0, atol=0.0)
++
++    @pytest.mark.parametrize(
++        "num_tokens,hidden_dim,src_dtype",
++        [
++            # Muse BF16 decode surface is B8/hidden8192; other shapes are generic edges.
++            (8, 8192, torch.bfloat16),
++            (128, 256, torch.bfloat16),
++            (64, 128, torch.float16),
++            (64, 128, torch.float32),
++            (256, 2048, torch.bfloat16),
++            # Past the small-surface cutoff: one lane per group.
++            (4096, 4096, torch.bfloat16),
++        ],
++    )
++    def test_quantization_vs_reference_xe35(self, num_tokens, hidden_dim, src_dtype):
++        self._test_against_reference_xe35(num_tokens, hidden_dim, src_dtype)
++
++    def test_quantize_dequantize_roundtrip_xe35(self):
++        sgl_per_token_group_quant_fp4_xe35 = self._import_kernel_xe35()
++
++        torch.manual_seed(42)
++        m, k = 128, 256
++
++        x_cpu = torch.randn(m, k, dtype=torch.bfloat16, device="cpu")
++        x_xpu = x_cpu.to(self.device)
++
++        x_q, scales = sgl_per_token_group_quant_fp4_xe35(
++            x=x_xpu, group_size=MXFP4_BLOCK_SIZE
++        )
++        expected_q, expected_scales = quantize_to_mxfp4_xe35(x_cpu, MXFP4_BLOCK_SIZE)
++        torch.testing.assert_close(x_q.cpu(), expected_q, rtol=0, atol=0)
++        torch.testing.assert_close(scales.cpu(), expected_scales, rtol=0, atol=0)
++
++        x_dq = dequantize_mxfp4_xe35(
++            x_q.cpu(), scales.cpu(), torch.float32, MXFP4_BLOCK_SIZE
++        )
++
++        correlation = torch.corrcoef(
++            torch.stack([x_dq.flatten(), x_cpu.float().flatten()])
++        )[0, 1]
++        assert correlation > 0.9, f"Correlation too low: {correlation}"
++
++    @pytest.mark.parametrize("src_dtype", [torch.bfloat16, torch.float16])
++    @pytest.mark.parametrize("map_dtype", [torch.int32, torch.int64])
++    def test_padded_gather_matches_index_select_then_quantize_xe35(
++        self, src_dtype, map_dtype
++    ):
++        from sgl_kernel import (
++            sgl_padded_gather_per_token_group_quant_fp4_xe35,
++            sgl_per_token_group_quant_fp4_xe35,
++        )
++
++        torch.manual_seed(123)
++        source = torch.randn(7, 256, dtype=src_dtype, device=self.device)
++        # Repeated source row 0 represents padding; the remaining entries cover
++        # a nontrivial permutation with further repeated routed rows.
++        row_map = torch.tensor(
++            [3, 1, 0, 0, 6, 2, 0, 5, 4, 0, 3],
++            dtype=map_dtype,
++            device=self.device,
++        )
++
++        expected_q, expected_s = sgl_per_token_group_quant_fp4_xe35(
++            source.index_select(0, row_map.to(torch.int64))
++        )
++        actual_q, actual_s = sgl_padded_gather_per_token_group_quant_fp4_xe35(
++            source, row_map
++        )
++
++        assert torch.equal(actual_q.cpu(), expected_q.cpu())
++        assert torch.equal(actual_s.cpu(), expected_s.cpu())
++
++    def test_padded_gather_empty_map_xe35(self):
++        from sgl_kernel import sgl_padded_gather_per_token_group_quant_fp4_xe35
++
++        source = torch.empty(2, 64, dtype=torch.bfloat16, device=self.device)
++        row_map = torch.empty(0, dtype=torch.int32, device=self.device)
++        output_q, output_s = sgl_padded_gather_per_token_group_quant_fp4_xe35(
++            source, row_map
++        )
++        assert output_q.shape == (0, 32)
++        assert output_s.shape == (0, 2)
++
++    @pytest.mark.parametrize("fuse_silu_and_mul", [False, True])
++    def test_scale_map_writes_mn_major_blocks_xe35(self, fuse_silu_and_mul):
++        """`scale_map` rows (start, rows) store MN-major per-block scales,
++        (start, -rows) pad rows store only a zero scale, (r, 0) slack nothing."""
++        from sgl_kernel import (
++            sgl_padded_gather_per_token_group_quant_fp4_xe35,
++            sgl_per_token_group_quant_fp4_xe35,
++        )
++
++        torch.manual_seed(7)
++        groups = 8
++        # Two 4-row blocks, the first with two pad rows, the second with one,
++        # followed by three slack rows.
++        scale_map = torch.tensor(
++            [[0, 4], [0, 4], [0, -4], [0, -4], [4, 4], [4, 4], [4, 4], [4, -4]]
++            + [[8, 0], [9, 0], [10, 0]],
++            dtype=torch.int32,
++            device=self.device,
++        )
++        routed = (scale_map[:, 1] > 0).cpu()
++        if fuse_silu_and_mul:
++            x = torch.randn(
++                11, 2 * groups * 32, dtype=torch.bfloat16, device=self.device
++            )
++            ref_q, ref_s = sgl_per_token_group_quant_fp4_xe35(x, fuse_silu_and_mul=True)
++            q, s = sgl_per_token_group_quant_fp4_xe35(
++                x, fuse_silu_and_mul=True, scale_map=scale_map
++            )
++        else:
++            x = torch.randn(5, groups * 32, dtype=torch.bfloat16, device=self.device)
++            row_map = torch.tensor(
++                [3, 1, 0, 0, 4, 2, 0, 0, 0, 0, 0], dtype=torch.int32, device=self.device
++            )
++            ref_q, ref_s = sgl_padded_gather_per_token_group_quant_fp4_xe35(x, row_map)
++            q, s = sgl_padded_gather_per_token_group_quant_fp4_xe35(
++                x, row_map, scale_map=scale_map
++            )
++
++        ref_s = ref_s.cpu()
++        ref_s[scale_map[:, 1].cpu() < 0] = 0
++        want = torch.cat([ref_s[0:4].t().flatten(), ref_s[4:8].t().flatten()])
++        assert torch.equal(q.cpu()[routed], ref_q.cpu()[routed])
++        assert torch.equal(s.cpu().flatten()[: 8 * groups], want)
++
++    def test_round_ties_to_even_on_xpu_xe35(self):
++        """Test that the kernel implements roundTiesToEven at midpoints."""
++        sgl_per_token_group_quant_fp4_xe35 = self._import_kernel_xe35()
++
++        # Create a tensor of exactly 32 elements (one group) containing
++        # midpoint values. Scale will be 1.0 (exponent=0) since max abs is 5.0
++        # which maps to scale = 2^(floor(log2(5.0)) - 2) = 2^(2 - 2) = 2^0 = 1.0
++        midpoints = [
++            0.25,
++            0.75,
++            1.25,
++            1.75,
++            2.5,
++            3.5,
++            5.0,
++            -0.25,
++            -0.75,
++            -1.25,
++            -1.75,
++            -2.5,
++            -3.5,
++            -5.0,
++        ]
++        # Pad to 32 elements with zeros
++        padded = midpoints + [0.0] * (32 - len(midpoints))
++        x = torch.tensor([padded], dtype=torch.float32, device=self.device)
++
++        x_q, scales = sgl_per_token_group_quant_fp4_xe35(
++            x=x, group_size=MXFP4_BLOCK_SIZE, eps=self.eps
++        )
++
++        # Reference
++        x_q_ref, scales_ref = quantize_to_mxfp4_xe35(
++            x.cpu().float(), MXFP4_BLOCK_SIZE, eps=self.eps
++        )
++        torch.testing.assert_close(x_q.cpu(), x_q_ref, rtol=0, atol=0)
++        torch.testing.assert_close(scales.cpu(), scales_ref, rtol=0, atol=0)
++
++        x_dq_xpu = dequantize_mxfp4_xe35(
++            x_q.cpu(), scales.cpu(), torch.float32, MXFP4_BLOCK_SIZE
++        )
++        x_dq_ref = dequantize_mxfp4_xe35(
++            x_q_ref, scales_ref, torch.float32, MXFP4_BLOCK_SIZE
++        )
++
++        torch.testing.assert_close(x_dq_xpu, x_dq_ref, atol=0.0, rtol=0.0)
++
++
++if __name__ == "__main__":
++    import sys
++
++    sys.exit(pytest.main([__file__, "-v"]))
+diff --git a/tests/test_routing_benchmark_scope.py b/tests/test_routing_benchmark_scope.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..98e409a6157a7e3dc27d9f9af825ef21a8cd070a
+--- /dev/null
++++ b/tests/test_routing_benchmark_scope.py
+@@ -0,0 +1,67 @@
++import importlib.util
++import subprocess
++import sys
++from pathlib import Path
++
++import pytest
++
++
++@pytest.mark.parametrize("batch", [1, 7, 9])
++@pytest.mark.parametrize("mode", ["audit", "padded-gather"])
++def test_routing_benchmark_rejects_serving_batch_override_xe35(batch, mode):
++    benchmark = (
++        Path(__file__).resolve().parents[1]
++        / "benchmark"
++        / "bench_routing_quant_audit.py"
++    )
++    result = subprocess.run(
++        [
++            sys.executable,
++            "-S",
++            str(benchmark),
++            "--mode",
++            mode,
++            "--serving-batch",
++            str(batch),
++        ],
++        capture_output=True,
++        text=True,
++        timeout=10,
++    )
++    assert result.returncode == 2
++    assert "Muse-Spark serving benchmarks require --serving-batch 8" in result.stderr
++    assert "ModuleNotFoundError" not in result.stderr
++
++
++@pytest.mark.parametrize("mode", ["audit", "padded-gather"])
++def test_routing_benchmark_help_without_device_imports_xe35(mode):
++    benchmark = (
++        Path(__file__).resolve().parents[1]
++        / "benchmark"
++        / "bench_routing_quant_audit.py"
++    )
++    result = subprocess.run(
++        [sys.executable, "-S", str(benchmark), "--mode", mode, "--help"],
++        capture_output=True,
++        text=True,
++        timeout=10,
++    )
++    assert result.returncode == 0
++    assert "--op" in result.stdout
++
++
++@pytest.mark.parametrize("mode,warmup", [("audit", 5), ("padded-gather", 3)])
++def test_routing_benchmark_mode_defaults_xe35(mode, warmup):
++    benchmark = (
++        Path(__file__).resolve().parents[1]
++        / "benchmark"
++        / "bench_routing_quant_audit.py"
++    )
++    spec = importlib.util.spec_from_file_location("routing_benchmark_cli", benchmark)
++    module = importlib.util.module_from_spec(spec)
++    spec.loader.exec_module(module)
++    parsed = module.parse_args_xe35(["--mode", mode])
++    assert parsed.warmup == warmup
++    assert parsed.serving_batch == 8
++    assert parsed.tokens == (8, 32768)
++    assert parsed.graph_replay == 1
+diff --git a/tests/test_topk_sigmoid_routing.py b/tests/test_topk_sigmoid_routing.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..652222bc963cdf4e6dad1abb0cfec35ae3192c34
+--- /dev/null
++++ b/tests/test_topk_sigmoid_routing.py
+@@ -0,0 +1,267 @@
++import sys
++from typing import Optional
++
++import pytest
++import sgl_kernel
++import torch
++import torch.nn.functional as F
++import utils
++
++device = utils.get_device()
++requires_xe35 = pytest.mark.skipif(
++    not torch.xpu.is_available() or not sgl_kernel.is_xe3_arch(),
++    reason="routing topk Xe35 kernels require Intel Xe3.5",
++)
++
++
++def fused_topk_sigmoid_torch_native_xe35(
++    hidden_states: torch.Tensor,
++    gating_output: torch.Tensor,
++    topk: int,
++    renormalize: bool,
++    correction_bias: Optional[torch.Tensor],
++):
++    assert (
++        hidden_states.shape[0] == gating_output.shape[0]
++    ), f"Number of tokens mismatch, {hidden_states.shape=} vs {gating_output.shape=}"
++    if correction_bias is not None:
++        n_routed_experts = gating_output.shape[-1]
++        scores = F.sigmoid(gating_output)
++        scores_for_choice = scores.view(
++            -1, n_routed_experts
++        ) + correction_bias.unsqueeze(0)
++        topk_ids = torch.topk(scores_for_choice, k=topk, dim=-1, sorted=False)[1]
++        topk_weights = scores.gather(1, topk_ids)
++    else:
++        M, _ = hidden_states.shape
++        topk_weights = torch.empty(
++            M, topk, dtype=torch.float32, device=hidden_states.device
++        )
++        topk_ids = torch.empty(M, topk, dtype=torch.int32, device=hidden_states.device)
++        topk_weights = F.sigmoid(gating_output.float())
++        topk_weights, topk_ids = torch.topk(topk_weights, topk, dim=-1)
++    if renormalize:
++        topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
++    return topk_weights, topk_ids
++
++
++def assert_topk_sigmoid_contract_xe35(
++    weights, indices, gating_output, renormalize, correction_bias, *, atol, rtol
++):
++    scores = torch.sigmoid(gating_output.float())
++    ranking_scores = scores if correction_bias is None else scores + correction_bias
++    assert indices.dtype == torch.int32
++    assert weights.shape == indices.shape
++    assert bool(((indices >= 0) & (indices < gating_output.size(1))).all())
++    sorted_indices = torch.sort(indices, dim=-1).values
++    assert bool((torch.diff(sorted_indices, dim=-1) != 0).all())
++    selected_ranking_scores = ranking_scores.gather(1, indices.long())
++    expected_ranking_scores = torch.topk(
++        ranking_scores, indices.size(1), dim=-1, sorted=True
++    ).values
++    torch.testing.assert_close(
++        selected_ranking_scores, expected_ranking_scores, atol=0, rtol=0
++    )
++    expected_weights = scores.gather(1, indices.long())
++    if renormalize:
++        expected_weights = expected_weights / expected_weights.sum(dim=-1, keepdim=True)
++    torch.testing.assert_close(weights, expected_weights, atol=atol, rtol=rtol)
++
++
++# float32 covers the fp32 gating-logits path: some models (e.g.
++# Nemotron-3-Nano MoE) emit float32 router logits. Before the kernel dispatch
++# was widened from AT_DISPATCH_REDUCED_FLOATING_TYPES to also cover Float, this
++# call raised "not implemented for 'Float'". The kernel upcasts to float
++# internally, so fp32 in must match the float reference within the same
++# tolerance as the reduced-float path.
++# n_token / n_expert / n_topk lists expanded to cover PO topk_sigmoid_xe35 CFGs.
++@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
++@pytest.mark.parametrize("n_token", [1, 2, 32, 128, 4096])
++@pytest.mark.parametrize("n_expert", [8, 32, 128, 256])
++@pytest.mark.parametrize("n_topk", [1, 2, 4, 8])
++@pytest.mark.parametrize("renormalize", [False, True])
++@pytest.mark.parametrize("with_correction_bias", [False, True])
++@requires_xe35
++def test_topk_sigmoid_xe35(
++    dtype, n_token, n_topk, n_expert, renormalize, with_correction_bias
++):
++    torch.manual_seed(1024)
++
++    # expand gating_output by M, otherwise bfloat16 fall into same value after truncating
++    hidden_states = torch.randn(n_token, 100, device=device, dtype=dtype)
++    gating_output = torch.randn(n_token, n_expert, device=device, dtype=dtype)
++    correction_bias = None
++    if with_correction_bias:
++        correction_bias = torch.randn((n_expert), dtype=torch.float32, device=device)
++
++    assert hidden_states.shape[0] == gating_output.shape[0], "Number of tokens mismatch"
++
++    M, _ = hidden_states.shape
++
++    topk_weights = torch.empty(
++        M, n_topk, dtype=torch.float32, device=hidden_states.device
++    )
++    topk_indices = torch.empty(
++        M, n_topk, dtype=torch.int32, device=hidden_states.device
++    )
++
++    sgl_kernel.topk_sigmoid_xe35(
++        topk_weights,
++        topk_indices,
++        gating_output,
++        renormalize,
++        correction_bias,
++    )
++
++    assert_topk_sigmoid_contract_xe35(
++        topk_weights,
++        topk_indices,
++        gating_output,
++        renormalize,
++        correction_bias,
++        atol=1e-3,
++        rtol=1e-3,
++    )
++
++
++@pytest.mark.parametrize("renormalize", [False, True])
++def test_topk_sigmoid_oracle_accepts_equal_score_alternatives_xe35(renormalize):
++    logits = torch.tensor([[-2.0, -1.0, 0.0, 1.0]])
++    scores = torch.sigmoid(logits)
++    bias = 1.0 - scores[0]
++    for indices in (torch.tensor([[0, 2]]), torch.tensor([[3, 1]])):
++        weights = scores.gather(1, indices)
++        if renormalize:
++            weights = weights / weights.sum(dim=-1, keepdim=True)
++        assert_topk_sigmoid_contract_xe35(
++            weights, indices.int(), logits, renormalize, bias, atol=1e-3, rtol=1e-3
++        )
++
++
++@pytest.mark.parametrize(
++    "invalid", ["negative", "out_of_range", "duplicate", "non_topk", "weight"]
++)
++def test_topk_sigmoid_oracle_rejects_invalid_outputs_xe35(invalid):
++    logits = torch.tensor([[0.0, 1.0, 2.0, 3.0]])
++    indices = torch.tensor([[3, 2]], dtype=torch.int32)
++    weights = torch.sigmoid(logits).gather(1, indices.long())
++    if invalid == "negative":
++        indices[0, 1] = -1
++    elif invalid == "out_of_range":
++        indices[0, 1] = 4
++    elif invalid == "duplicate":
++        indices[0, 1] = 3
++    elif invalid == "non_topk":
++        indices[0, 1] = 1
++    else:
++        weights[0, 1] = 0.0
++    with pytest.raises(AssertionError):
++        assert_topk_sigmoid_contract_xe35(
++            weights, indices, logits, False, None, atol=1e-3, rtol=1e-3
++        )
++
++
++@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
++@pytest.mark.parametrize("n_token", [1, 7, 9, 17, 33, 129, 512, 2048, 4096])
++@pytest.mark.parametrize("n_expert", [32, 64, 128, 256])
++@requires_xe35
++def test_topk8_fast_path_xe35(dtype, n_token, n_expert):
++    """Check all full subgroup vector tiles, allowing equal-score ID ties."""
++    torch.manual_seed(20260916 + n_token + n_expert)
++    gating_output = torch.empty(n_token, n_expert, dtype=dtype, device=device).uniform_(
++        -7.0, 7.0
++    )
++    correction_bias = torch.empty(
++        n_expert, dtype=torch.float32, device=device
++    ).uniform_(-0.15, 0.15)
++
++    expected_scores = torch.sigmoid(gating_output.float())
++    ranking_scores = expected_scores + correction_bias.unsqueeze(0)
++    expected_rank_scores = torch.topk(
++        ranking_scores,
++        k=8,
++        dim=-1,
++        sorted=True,
++    ).values
++
++    actual_weights = torch.empty(n_token, 8, dtype=torch.float32, device=device)
++    actual_ids = torch.empty(n_token, 8, dtype=torch.int32, device=device)
++    sgl_kernel.topk_sigmoid_xe35(
++        actual_weights,
++        actual_ids,
++        gating_output,
++        True,
++        correction_bias,
++    )
++
++    assert bool(((actual_ids >= 0) & (actual_ids < n_expert)).all())
++    assert bool((torch.diff(torch.sort(actual_ids, dim=-1).values, dim=-1) != 0).all())
++    torch.testing.assert_close(
++        ranking_scores.gather(1, actual_ids.long()),
++        expected_rank_scores,
++        atol=0,
++        rtol=0,
++    )
++    selected_scores = expected_scores.gather(1, actual_ids.long())
++    expected_weights = selected_scores / selected_scores.sum(dim=-1, keepdim=True)
++    torch.testing.assert_close(actual_weights, expected_weights, atol=2.5e-4, rtol=0)
++
++
++@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
++@pytest.mark.parametrize("n_expert", [32, 64, 128, 256])
++@requires_xe35
++def test_topk8_ties_choose_lowest_expert_xe35(dtype, n_expert):
++    gating_output = torch.zeros(9, n_expert, dtype=dtype, device=device)
++    correction_bias = torch.zeros(n_expert, dtype=torch.float32, device=device)
++    actual_weights = torch.empty(9, 8, dtype=torch.float32, device=device)
++    actual_ids = torch.empty(9, 8, dtype=torch.int32, device=device)
++
++    sgl_kernel.topk_sigmoid_xe35(
++        actual_weights,
++        actual_ids,
++        gating_output,
++        True,
++        correction_bias,
++    )
++
++    expected_ids = torch.arange(8, dtype=torch.int32, device=device).expand(9, 8)
++    torch.testing.assert_close(actual_ids, expected_ids)
++    torch.testing.assert_close(
++        actual_weights,
++        torch.full_like(actual_weights, 0.125),
++        atol=0,
++        rtol=0,
++    )
++
++
++@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
++@pytest.mark.parametrize("n_expert", [32, 64, 128, 256])
++@pytest.mark.parametrize("n_token", [1, 129])
++@pytest.mark.parametrize("renormalize", [False, True])
++@pytest.mark.parametrize("with_bias", [False, True])
++@requires_xe35
++def test_full_tile_topk8_options_xe35(dtype, n_expert, n_token, renormalize, with_bias):
++    torch.manual_seed(31000 + n_expert + n_token)
++    logits = torch.randn(n_token, n_expert, dtype=dtype, device=device)
++    bias = (
++        torch.randn(n_expert, dtype=torch.float32, device=device) if with_bias else None
++    )
++    weights = torch.empty(n_token, 8, dtype=torch.float32, device=device)
++    ids = torch.empty(n_token, 8, dtype=torch.int32, device=device)
++    sgl_kernel.topk_sigmoid_xe35(weights, ids, logits, renormalize, bias)
++
++    scores = torch.sigmoid(logits.float())
++    rank = scores if bias is None else scores + bias
++    torch.testing.assert_close(
++        rank.gather(1, ids.long()),
++        torch.topk(rank, 8, dim=-1, sorted=True).values,
++        rtol=0,
++        atol=0,
++    )
++    selected = scores.gather(1, ids.long())
++    expected = selected / selected.sum(-1, keepdim=True) if renormalize else selected
++    torch.testing.assert_close(weights, expected, rtol=0, atol=2.5e-4)
++
++
++if __name__ == "__main__":
++    sys.exit(pytest.main([__file__]))

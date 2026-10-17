@@ -1,0 +1,28 @@
+{
+  "directory": "/home/syk/worktrees/sgl-kernel-xpu-up/pr/muse-routing-quant-xe35",
+  "head": "833c95208dccd2af5628c121222f91186a5b2de7",
+  "branch": "pr/muse-routing-quant-xe35",
+  "patch_sha256": "1abf95e934e687c3a0a4c45b1687ce18678e47cf408ee9d8c2342e9f577fa99d",
+  "tracked_paths": [
+    "cmake/BuildFlags.cmake",
+    "include/sgl_kernel_ops.h",
+    "python/sgl_kernel/__init__.py",
+    "src/BuildOnLinux.cmake",
+    "src/sycl/Device.cpp",
+    "src/sycl/HCHead.cpp",
+    "src/torch_extension_sycl.cc"
+  ],
+  "untracked_code": [
+    "benchmark/bench_routing_quant_audit.py",
+    "include/sgl_kernel/xe35/routing_quant.h",
+    "python/sgl_kernel/routing_quant.py",
+    "src/sycl/xe35/muse_routing_quant.cpp",
+    "src/sycl/xe35/mxfp4_moe_scale_layout.cpp",
+    "src/sycl/xe35/per_token_group_quant_fp4.cpp",
+    "tests/test_moe_routing.py",
+    "tests/test_per_token_group_quant_mxfp4_routing.py",
+    "tests/test_routing_benchmark_scope.py",
+    "tests/test_topk_sigmoid_routing.py"
+  ],
+  "apply_check": "PASS"
+}

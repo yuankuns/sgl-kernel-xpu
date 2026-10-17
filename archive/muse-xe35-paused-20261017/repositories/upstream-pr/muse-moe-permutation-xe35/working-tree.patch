@@ -1,0 +1,545 @@
+diff --git a/benchmark/bench_mxfp4_small_permutation.py b/benchmark/bench_mxfp4_small_permutation.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..6436ba4271b003fbd0155496bca496c06f5d4295
+--- /dev/null
++++ b/benchmark/bench_mxfp4_small_permutation.py
+@@ -0,0 +1,72 @@
++"""Device time for the registered Muse Spark B8 small permutation kernel."""
++
++import argparse
++import os
++
++
++def main_xe35() -> None:
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument("--serving-batch", type=int, default=8)
++    parser.add_argument("--isl", type=int, default=4096)
++    parser.add_argument("--osl", type=int, default=16)
++    parser.add_argument("--tp", type=int, default=1)
++    parser.add_argument("--ep", type=int, default=1)
++    parser.add_argument("--experts", type=int, choices=[128, 256, 512], default=256)
++    parser.add_argument("--alignment", type=int, choices=[4, 16], default=4)
++    parser.add_argument("--warmup-ms", type=int, default=100)
++    parser.add_argument("--rep-ms", type=int, default=500)
++    args = parser.parse_args()
++    if (args.serving_batch, args.isl, args.osl, args.tp, args.ep) != (
++        8,
++        4096,
++        16,
++        1,
++        1,
++    ) or os.environ.get("BATCHES", "8") != "8":
++        parser.error("Muse-Spark serving scope requires B=8, ISL=4096, OSL=16, TP1/EP1")
++    if args.warmup_ms <= 0 or args.rep_ms <= 0:
++        parser.error("warmup and repetition times must be positive")
++
++    import sgl_kernel
++    import torch
++    import triton.testing
++    from sgl_kernel import mxfp4_small_permutation_xe35
++
++    if not torch.xpu.is_available() or not sgl_kernel.is_xe3_arch():
++        raise RuntimeError("Small permutation benchmark requires Xe35 (capability 3.5)")
++
++    tokens, topk = 8, 8
++    pairs = tokens * topk
++    rows = pairs * args.alignment
++    topk_ids = (
++        torch.arange(pairs, device="xpu", dtype=torch.int32).reshape(tokens, topk)
++        % args.experts
++    )
++    padded_counts = torch.empty(args.experts, device="xpu", dtype=torch.int32)
++    perm_src = torch.empty(rows, device="xpu", dtype=torch.int32)
++    expanded_to_permuted = torch.empty(pairs, device="xpu", dtype=torch.int32)
++    scale_map = torch.empty(rows, 2, device="xpu", dtype=torch.int32)
++
++    def run_xe35() -> None:
++        mxfp4_small_permutation_xe35(
++            topk_ids,
++            padded_counts,
++            perm_src,
++            expanded_to_permuted,
++            scale_map,
++            args.alignment,
++        )
++
++    run_xe35()
++    torch.xpu.synchronize()
++    p50, p20, p80 = triton.testing.do_bench(
++        run_xe35, warmup=args.warmup_ms, rep=args.rep_ms, quantiles=[0.5, 0.2, 0.8]
++    )
++    print(
++        f"B8 topk={topk} experts={args.experts} alignment={args.alignment}: "
++        f"p20={p20:.6f} ms p50={p50:.6f} ms p80={p80:.6f} ms"
++    )
++
++
++if __name__ == "__main__":
++    main_xe35()
+diff --git a/cmake/BuildFlags.cmake b/cmake/BuildFlags.cmake
+index 5dfb191b37ff61b04b4329536b487308b197cc44..086239cefe6af99520acbb1c4423744a46d9a4cc 100644
+--- a/cmake/BuildFlags.cmake
++++ b/cmake/BuildFlags.cmake
+@@ -26,7 +26,7 @@ function(CHECK_SYCL_FLAG FLAG VARIABLE_NAME)
+ endfunction()
+ 
+ # Support GCC on Linux.
+-if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
++if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" OR CMAKE_CXX_COMPILER_ID STREQUAL "IntelLLVM")
+   message(STATUS "sgl-kernel-xpu build type: ${CMAKE_BUILD_TYPE}")
+   set(SYCL_HOST_FLAGS)
+   set(SYCL_KERNEL_OPTIONS)
+@@ -185,6 +185,6 @@ if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+ 
+   set(SYCL_OFFLINE_COMPILER_FLAGS "${SYCL_OFFLINE_COMPILER_AOT_OPTIONS}${SYCL_OFFLINE_COMPILER_CG_OPTIONS}")
+ else()
+-  message("Not compiling with XPU. Currently only support GCC compiler on Linux as CXX compiler.")
++  message("Not compiling with XPU. Currently only support GNU or IntelLLVM compiler on Linux as CXX compiler.")
+   return()
+ endif()
+diff --git a/include/sgl_kernel/xe35/mxfp4_permutation_ops.h b/include/sgl_kernel/xe35/mxfp4_permutation_ops.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..c2300a0773eee85c82beb5992db6c911b6d0ee6d
+--- /dev/null
++++ b/include/sgl_kernel/xe35/mxfp4_permutation_ops.h
+@@ -0,0 +1,15 @@
++#pragma once
++
++#include <torch/types.h>
++
++#include "sgl_kernel_export.h"
++
++namespace at::native::xpu {
++SGL_KERNEL_EXPORT void mxfp4_small_permutation_xe35(
++    torch::Tensor topk_ids,
++    torch::Tensor padded_counts,
++    torch::Tensor perm_src,
++    torch::Tensor expanded_to_permuted,
++    torch::Tensor scale_map,
++    int64_t alignment);
++}
+diff --git a/include/sgl_kernel_ops.h b/include/sgl_kernel_ops.h
+index 0b71dcef0d0cd28a7b2bf892845c95d6c12a547f..30dbc77c6607c1793ca7b59bd73998001ebbe3d9 100644
+--- a/include/sgl_kernel_ops.h
++++ b/include/sgl_kernel_ops.h
+@@ -26,6 +26,10 @@ limitations under the License.
+ #include <tuple>
+ #include <vector>
+ 
++#if SYCL_INTEL_TARGET == 35 && defined(USE_MOE)
++#include "sgl_kernel/xe35/mxfp4_permutation_ops.h"
++#endif
++
+ #define _CONCAT(A, B) A##B
+ #define CONCAT(A, B) _CONCAT(A, B)
+ 
+diff --git a/python/sgl_kernel/__init__.py b/python/sgl_kernel/__init__.py
+index a9a03451df67b5d0d712636f0ef87e9a7a766c12..7eefb90e4c07f03cd298888651445f35fd4cb801 100644
+--- a/python/sgl_kernel/__init__.py
++++ b/python/sgl_kernel/__init__.py
+@@ -5,6 +5,8 @@ from typing import Optional
+ 
+ import torch
+ 
++from sgl_kernel.moe_permutation import mxfp4_small_permutation_xe35
++
+ SYSTEM_ARCH = platform.machine()
+ 
+ 
+diff --git a/python/sgl_kernel/moe_permutation.py b/python/sgl_kernel/moe_permutation.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..77d0009a10c50ca73c0ffa735e533cf9906185e3
+--- /dev/null
++++ b/python/sgl_kernel/moe_permutation.py
+@@ -0,0 +1,14 @@
++import torch
++
++
++def mxfp4_small_permutation_xe35(
++    topk_ids: torch.Tensor,
++    padded_counts: torch.Tensor,
++    perm_src: torch.Tensor,
++    expanded_to_permuted: torch.Tensor,
++    scale_map: torch.Tensor,
++    alignment: int,
++) -> None:
++    torch.ops.sgl_kernel.mxfp4_small_permutation_xe35.default(
++        topk_ids, padded_counts, perm_src, expanded_to_permuted, scale_map, alignment
++    )
+diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
+index b05b9702d4128357afe20f13e2e169b19f337012..5bf85d7618d18d8573ca265c98ad311040da013a 100644
+--- a/src/CMakeLists.txt
++++ b/src/CMakeLists.txt
+@@ -125,6 +125,7 @@ if(NOT USE_QSA OR NOT DPCPP_SYCL_TARGET MATCHES "bmg")
+     list(FILTER device_cpp EXCLUDE REGEX "/QSAMqaXe20\\.cpp$")
+ endif()
+ if(NOT USE_MOE)
++    list(FILTER device_cpp EXCLUDE REGEX "/xe35/mxfp4_small_permutation\\.cpp$")
+     list(FILTER device_cpp EXCLUDE REGEX "/(GroupGemm(Xe20|W4A16Xe20|W8A16Xe20)|MoE(Align|PrepareInputs|Sum|_fused_gate|_sum_reduce))\\.cpp$")
+     list(FILTER device_cpp EXCLUDE REGEX "/xe35/(GroupGemm|GroupGemmMxfp4W4A16|blockwise_moe_mxfp4|blockwise_moe_mxfp8)\\.cpp$")
+ endif()
+diff --git a/src/sycl/Device.cpp b/src/sycl/Device.cpp
+index 44590db8a7c078bf6d8526548e75f80608b757af..2ab1b2262242d5741f5da3d55703004c257bb013 100644
+--- a/src/sycl/Device.cpp
++++ b/src/sycl/Device.cpp
+@@ -22,7 +22,8 @@ SGL_KERNEL_EXPORT std::tuple<int64_t, int64_t> query_device(int64_t device_index
+ // Need oneAPI 2026.2 or later to support `architecture::intel_gpu_cri`. Check the release
+ // (__INTEL_LLVM_COMPILER) rather than the build date (__SYCL_COMPILER_VERSION): 2026.1.x
+ // patch releases (e.g. 2026.1.3, 20260724) are built later but still lack this enum.
+-#if defined(__INTEL_LLVM_COMPILER) && __INTEL_LLVM_COMPILER >= 20260200
++#if (defined(__INTEL_LLVM_COMPILER) && __INTEL_LLVM_COMPILER >= 20260200) || \
++    (defined(__INTEL_LLVM_COMPILER_VERSION) && __INTEL_LLVM_COMPILER_VERSION >= 20260200)
+     case syclex::architecture::intel_gpu_cri:
+       return std::make_tuple(3, 5);
+ #endif
+diff --git a/src/sycl/HCHead.cpp b/src/sycl/HCHead.cpp
+index 78464246ed88cb8056af87e388bad9fc222d4053..1b2ace4419e74f6e6276cea4a8bcffc0b2078a6e 100644
+--- a/src/sycl/HCHead.cpp
++++ b/src/sycl/HCHead.cpp
+@@ -67,7 +67,10 @@ struct FusedHCHeadKernel : public __SYCL_KER_CONFIG_CONVENTION__ {
+     slm_ = sycl::local_accessor<float, 1>(slm_size, cgh);
+   }
+ 
+-  [[sycl::reqd_work_group_size(WG_SIZE)]] [[sycl::reqd_sub_group_size(SG_SIZE)]] void
++#ifdef __SYCL_DEVICE_ONLY__
++  [[sycl::reqd_work_group_size(WG_SIZE)]] [[sycl::reqd_sub_group_size(SG_SIZE)]]
++#endif
++  void
+   operator()(sycl::nd_item<1> item) const {
+     const int token_id = static_cast<int>(item.get_group(0));
+     const int tid = static_cast<int>(item.get_local_id(0));
+diff --git a/src/sycl/xe35/mxfp4_small_permutation.cpp b/src/sycl/xe35/mxfp4_small_permutation.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..55e5372fdc26b80a34a4d3d2899cfa7cb34b03ab
+--- /dev/null
++++ b/src/sycl/xe35/mxfp4_small_permutation.cpp
+@@ -0,0 +1,239 @@
++#include <ATen/ATen.h>
++#include <c10/xpu/XPUStream.h>
++#include <torch/all.h>
++
++#include <algorithm>
++#include <sycl/sycl.hpp>
++
++#include "sycl/SYCLHelpers.h"
++#include "sgl_kernel/xe35/mxfp4_permutation_ops.h"
++
++namespace at::native::xpu {
++namespace {
++constexpr int kWorkgroup_xe35 = 256;
++
++template <typename Index>
++struct Mxfp4SmallPermutationKernel_xe35 : __SYCL_KER_CONFIG_CONVENTION__ {
++  Mxfp4SmallPermutationKernel_xe35(
++      const Index* topk_ids,
++      int32_t* padded_counts,
++      int32_t* perm_src,
++      int32_t* expanded_to_permuted,
++      int32_t* scale_map,
++      int num_pairs,
++      int num_experts,
++      int num_rows,
++      int topk,
++      int alignment)
++      : topk_ids(topk_ids),
++        padded_counts(padded_counts),
++        perm_src(perm_src),
++        expanded_to_permuted(expanded_to_permuted),
++        scale_map(scale_map),
++        num_pairs(num_pairs),
++        num_experts(num_experts),
++        num_rows(num_rows),
++        topk(topk),
++        alignment(alignment) {}
++
++  void sycl_ker_config_convention(sycl::handler& cgh) {
++    counts = sycl::local_accessor<int32_t, 1>(sycl::range<1>(num_experts), cgh);
++    starts = sycl::local_accessor<int32_t, 1>(sycl::range<1>(num_experts), cgh);
++    padded = sycl::local_accessor<int32_t, 1>(sycl::range<1>(num_experts), cgh);
++    expert_ids = sycl::local_accessor<int32_t, 1>(sycl::range<1>(kWorkgroup_xe35), cgh);
++    total_rows = sycl::local_accessor<int32_t, 1>(sycl::range<1>(1), cgh);
++  }
++
++  void operator()(sycl::nd_item<1> item) const {
++    const int lane = static_cast<int>(item.get_local_id(0));
++    for (int expert = lane; expert < num_experts; expert += kWorkgroup_xe35) {
++      counts[expert] = 0;
++    }
++    if (lane < num_pairs) {
++      expert_ids[lane] = static_cast<int32_t>(topk_ids[lane]);
++    }
++    item.barrier(sycl::access::fence_space::local_space);
++    if (lane < num_pairs) {
++      sycl::atomic_ref<
++          int32_t,
++          sycl::memory_order::relaxed,
++          sycl::memory_scope::work_group,
++          sycl::access::address_space::local_space>
++          count(counts[expert_ids[lane]]);
++      count.fetch_add(1);
++    }
++    item.barrier(sycl::access::fence_space::local_space);
++    if (num_experts <= kWorkgroup_xe35) {
++      const int rows = lane < num_experts ? ((counts[lane] + alignment - 1) / alignment) * alignment : 0;
++      const int base = sycl::exclusive_scan_over_group(item.get_group(), rows, sycl::plus<int>());
++      if (lane < num_experts) {
++        starts[lane] = base;
++        padded[lane] = rows;
++        padded_counts[lane] = rows;
++      }
++      if (lane == kWorkgroup_xe35 - 1) total_rows[0] = base + rows;
++    } else {
++      // Power-of-two expert counts above 256 assign two or four adjacent
++      // experts per lane. A workgroup scan replaces the serial 1024-expert
++      // prefix and keeps starts in expert order for stable routing.
++      const int per_lane = num_experts / kWorkgroup_xe35;
++      const int first = lane * per_lane;
++      int sum = 0;
++      for (int j = 0; j < per_lane; ++j) {
++        const int count = counts[first + j];
++        sum += ((count + alignment - 1) / alignment) * alignment;
++      }
++      int row = sycl::exclusive_scan_over_group(item.get_group(), sum, sycl::plus<int>());
++      for (int j = 0; j < per_lane; ++j) {
++        const int expert = first + j;
++        const int rows = ((counts[expert] + alignment - 1) / alignment) * alignment;
++        starts[expert] = row;
++        padded[expert] = rows;
++        padded_counts[expert] = rows;
++        row += rows;
++      }
++      if (lane == kWorkgroup_xe35 - 1) total_rows[0] = row;
++    }
++    item.barrier(sycl::access::fence_space::local_space);
++    for (int row = total_rows[0] + lane; row < num_rows; row += kWorkgroup_xe35) {
++      perm_src[row] = 0;
++      scale_map[2 * row] = row;
++      scale_map[2 * row + 1] = 0;
++    }
++    if (lane >= num_pairs) return;
++    const int expert = expert_ids[lane];
++    int rank = 0;
++    int earlier = 0;
++    for (; earlier + 3 < lane; earlier += 4) {
++      rank += (expert_ids[earlier] == expert) + (expert_ids[earlier + 1] == expert) +
++              (expert_ids[earlier + 2] == expert) + (expert_ids[earlier + 3] == expert);
++    }
++    for (; earlier < lane; ++earlier) {
++      rank += expert_ids[earlier] == expert;
++    }
++    const int base = starts[expert];
++    const int rows = padded[expert];
++    const int dst = base + rank;
++    expanded_to_permuted[lane] = dst;
++    perm_src[dst] = lane / topk;
++    scale_map[2 * dst] = base;
++    scale_map[2 * dst + 1] = rows;
++    if (rank == counts[expert] - 1) {
++      for (int k = 1; k < alignment && dst + k < base + rows; ++k) {
++        const int pad = dst + k;
++        perm_src[pad] = 0;
++        scale_map[2 * pad] = base;
++        scale_map[2 * pad + 1] = -rows;
++      }
++    }
++  }
++
++  const Index* topk_ids;
++  int32_t* padded_counts;
++  int32_t* perm_src;
++  int32_t* expanded_to_permuted;
++  int32_t* scale_map;
++  int num_pairs;
++  int num_experts;
++  int num_rows;
++  int topk;
++  int alignment;
++  sycl::local_accessor<int32_t, 1> counts;
++  sycl::local_accessor<int32_t, 1> starts;
++  sycl::local_accessor<int32_t, 1> padded;
++  sycl::local_accessor<int32_t, 1> expert_ids;
++  sycl::local_accessor<int32_t, 1> total_rows;
++};
++
++template <typename Index>
++void launch_small_permutation_xe35(
++    const Index* topk_ids,
++    int32_t* padded_counts,
++    int32_t* perm_src,
++    int32_t* expanded_to_permuted,
++    int32_t* scale_map,
++    int num_pairs,
++    int num_experts,
++    int num_rows,
++    int topk,
++    int alignment,
++    sycl::queue& queue) {
++  Mxfp4SmallPermutationKernel_xe35<Index> kernel(
++      topk_ids,
++      padded_counts,
++      perm_src,
++      expanded_to_permuted,
++      scale_map,
++      num_pairs,
++      num_experts,
++      num_rows,
++      topk,
++      alignment);
++  sycl_kernel_submit(sycl::range<1>(kWorkgroup_xe35), sycl::range<1>(kWorkgroup_xe35), queue, kernel);
++}
++}  // namespace
++
++void mxfp4_small_permutation_xe35(
++    torch::Tensor topk_ids,
++    torch::Tensor padded_counts,
++    torch::Tensor perm_src,
++    torch::Tensor expanded_to_permuted,
++    torch::Tensor scale_map,
++    int64_t alignment) {
++  TORCH_CHECK(
++      topk_ids.is_xpu() && topk_ids.dim() == 2 && topk_ids.is_contiguous() &&
++          (topk_ids.scalar_type() == at::kInt || topk_ids.scalar_type() == at::kLong),
++      "topk_ids must be contiguous XPU int32 or int64 [tokens, topk]");
++  TORCH_CHECK(
++      padded_counts.is_xpu() && padded_counts.dim() == 1 && padded_counts.is_contiguous() &&
++          padded_counts.scalar_type() == at::kInt,
++      "padded_counts must be contiguous XPU int32 [experts]");
++  TORCH_CHECK(
++      perm_src.is_xpu() && perm_src.dim() == 1 && perm_src.is_contiguous() && perm_src.scalar_type() == at::kInt,
++      "perm_src must be contiguous XPU int32 [padded_rows]");
++  TORCH_CHECK(
++      expanded_to_permuted.is_xpu() && expanded_to_permuted.dim() == 1 && expanded_to_permuted.is_contiguous() &&
++          expanded_to_permuted.scalar_type() == at::kInt,
++      "expanded_to_permuted must be contiguous XPU int32 [pairs]");
++  TORCH_CHECK(
++      scale_map.is_xpu() && scale_map.dim() == 2 && scale_map.is_contiguous() && scale_map.scalar_type() == at::kInt &&
++          scale_map.size(1) == 2,
++      "scale_map must be contiguous XPU int32 [padded_rows, 2]");
++  const auto pairs = topk_ids.numel();
++  const auto experts = padded_counts.numel();
++  TORCH_CHECK(
++      topk_ids.size(1) > 0 && pairs <= kWorkgroup_xe35 && experts > 0 && experts <= 1024 && (experts & (experts - 1)) == 0 &&
++          alignment > 0 && alignment <= 64 && expanded_to_permuted.numel() == pairs &&
++          scale_map.size(0) == perm_src.numel() &&
++          perm_src.numel() >= pairs + (alignment - 1) * std::min(experts, pairs),
++      "invalid small permutation dimensions or alignment");
++  auto queue = at::xpu::getCurrentXPUStream().queue();
++  if (topk_ids.scalar_type() == at::kInt) {
++    launch_small_permutation_xe35(
++        topk_ids.data_ptr<int32_t>(),
++        padded_counts.data_ptr<int32_t>(),
++        perm_src.data_ptr<int32_t>(),
++        expanded_to_permuted.data_ptr<int32_t>(),
++        scale_map.data_ptr<int32_t>(),
++        static_cast<int>(pairs),
++        static_cast<int>(experts),
++        static_cast<int>(perm_src.numel()),
++        static_cast<int>(topk_ids.size(1)),
++        static_cast<int>(alignment),
++        queue);
++  } else {
++    launch_small_permutation_xe35(
++        topk_ids.data_ptr<int64_t>(),
++        padded_counts.data_ptr<int32_t>(),
++        perm_src.data_ptr<int32_t>(),
++        expanded_to_permuted.data_ptr<int32_t>(),
++        scale_map.data_ptr<int32_t>(),
++        static_cast<int>(pairs),
++        static_cast<int>(experts),
++        static_cast<int>(perm_src.numel()),
++        static_cast<int>(topk_ids.size(1)),
++        static_cast<int>(alignment),
++        queue);
++  }
++}
++}  // namespace at::native::xpu
+diff --git a/src/torch_extension_sycl.cc b/src/torch_extension_sycl.cc
+index 8603e536b016ae275cc7e77d48e1a312532d48c2..5a80b1c6d130e3e89218cec9fbf678aa96599c04 100644
+--- a/src/torch_extension_sycl.cc
++++ b/src/torch_extension_sycl.cc
+@@ -20,6 +20,13 @@ limitations under the License.
+ #include "sgl_kernel_ops.h"
+ #include "sgl_kernel_torch_shim.h"
+ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
++#if SYCL_INTEL_TARGET == 35 && defined(USE_MOE)
++  m.def(
++      "mxfp4_small_permutation_xe35(Tensor topk_ids, Tensor(a!) padded_counts, "
++      "Tensor(b!) perm_src, Tensor(c!) expanded_to_permuted, Tensor(d!) scale_map, "
++      "int alignment) -> ()");
++  m.impl("mxfp4_small_permutation_xe35", torch::kXPU, &at::native::xpu::mxfp4_small_permutation_xe35);
++#endif
+   m.def("weak_ref_tensor(Tensor(a) tensor) -> Tensor(a)");
+   m.impl("weak_ref_tensor", torch::kXPU, &weak_ref_tensor);
+ 
+diff --git a/tests/test_mxfp4_small_permutation.py b/tests/test_mxfp4_small_permutation.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..984bdcddb1bfa6176b4a5ce8a5f462058890d0eb
+--- /dev/null
++++ b/tests/test_mxfp4_small_permutation.py
+@@ -0,0 +1,66 @@
++import os
++import time
++
++if os.environ.get("BATCHES", "8") != "8":
++    raise SystemExit("BATCHES must be 8; rejected before GPU work")
++
++import pytest
++import sgl_kernel  # noqa: F401
++import torch
++
++
++@pytest.fixture(autouse=True)
++def cooldown_xe35():
++    if torch.xpu.is_available() and sgl_kernel.is_xe3_arch():
++        torch.xpu.synchronize()
++        time.sleep(2)
++
++
++@pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64])
++@pytest.mark.parametrize("experts,alignment", [(128, 4), (256, 4), (512, 16)])
++@pytest.mark.parametrize("tokens", [1, 7, 8, 9, 16])
++def test_mxfp4_small_permutation_xe35(index_dtype, experts, alignment, tokens):
++    # Muse decode is B8/E256/topk8/alignment4; other shapes are generic edges.
++    if not torch.xpu.is_available() or not sgl_kernel.is_xe3_arch():
++        pytest.skip("Xe35 XPU is required")
++
++    topk = 8
++    ids_cpu = (
++        torch.arange(tokens * topk, dtype=torch.int64).reshape(tokens, topk) * 7
++    ) % 23
++    ids = ids_cpu.to(device="xpu", dtype=index_dtype)
++    pairs = tokens * topk
++    upper_rows = pairs + (alignment - 1) * pairs
++    counts = torch.empty(experts, device="xpu", dtype=torch.int32)
++    perm_src = torch.empty(upper_rows, device="xpu", dtype=torch.int32)
++    expanded_to_permuted = torch.empty(pairs, device="xpu", dtype=torch.int32)
++    scale_map = torch.empty(upper_rows, 2, device="xpu", dtype=torch.int32)
++
++    torch.ops.sgl_kernel.mxfp4_small_permutation_xe35(
++        ids, counts, perm_src, expanded_to_permuted, scale_map, alignment
++    )
++
++    flat_ids = ids_cpu.flatten().tolist()
++    raw_counts = [flat_ids.count(expert) for expert in range(experts)]
++    expected_counts = [
++        (count + alignment - 1) // alignment * alignment for count in raw_counts
++    ]
++    expected_perm_src = [0] * upper_rows
++    expected_expanded_to_permuted = [0] * pairs
++    expected_scale_map = [[row, 0] for row in range(upper_rows)]
++    start = 0
++    for expert, padded in enumerate(expected_counts):
++        indices = [index for index, value in enumerate(flat_ids) if value == expert]
++        for rank, index in enumerate(indices):
++            row = start + rank
++            expected_perm_src[row] = index // topk
++            expected_expanded_to_permuted[index] = row
++            expected_scale_map[row] = [start, padded]
++        for row in range(start + len(indices), start + padded):
++            expected_scale_map[row] = [start, -padded]
++        start += padded
++
++    assert counts.cpu().tolist() == expected_counts
++    assert perm_src.cpu().tolist() == expected_perm_src
++    assert expanded_to_permuted.cpu().tolist() == expected_expanded_to_permuted
++    assert scale_map.cpu().tolist() == expected_scale_map

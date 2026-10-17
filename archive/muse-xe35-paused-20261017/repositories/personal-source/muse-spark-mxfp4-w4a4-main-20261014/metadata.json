@@ -1,0 +1,9 @@
+{
+  "directory": "/home/syk/worktrees/sgl-kernel-xpu/muse-spark-mxfp4-w4a4-main-20261014",
+  "head": "54216962c83b2d489702fd38c58d71116f3a6969",
+  "branch": "muse_mxfp4_w4a4",
+  "patch_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "tracked_paths": [],
+  "untracked_code": [],
+  "apply_check": "NO_CHANGES"
+}

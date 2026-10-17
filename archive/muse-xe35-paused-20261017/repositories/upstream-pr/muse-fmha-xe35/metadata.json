@@ -1,0 +1,43 @@
+{
+  "directory": "/home/syk/worktrees/sgl-kernel-xpu-up/pr/muse-fmha-xe35",
+  "head": "833c95208dccd2af5628c121222f91186a5b2de7",
+  "branch": "pr/muse-fmha-xe35",
+  "patch_sha256": "15ebf3ffe6ab1e90a1799171b27a9699a6ea96504572fd3cd1e0c4503735dcce",
+  "tracked_paths": [
+    "cmake/BuildFlags.cmake",
+    "src/CMakeLists.txt",
+    "src/sycl/Device.cpp",
+    "src/sycl/HCHead.cpp"
+  ],
+  "untracked_code": [
+    "benchmark/bench_muse_fmha.py",
+    "src/FMHADecodeXe35.cmake",
+    "src/FMHAPrefillXe35.cmake",
+    "src/sycl/xe35/fmha/collective/copy_block_slm.hpp",
+    "src/sycl/xe35/fmha/collective/copy_payloads.hpp",
+    "src/sycl/xe35/fmha/collective/copy_traits_cache.hpp",
+    "src/sycl/xe35/fmha/collective/fmha_fusion.hpp",
+    "src/sycl/xe35/fmha/collective/xe_fmha_fwd_epilogue.hpp",
+    "src/sycl/xe35/fmha/collective/xe_fmha_fwd_mainloop.hpp",
+    "src/sycl/xe35/fmha/collective/xe_mma_blockscaled_scale_traits.hpp",
+    "src/sycl/xe35/fmha/common.hpp",
+    "src/sycl/xe35/fmha/dispatch.hpp",
+    "src/sycl/xe35/fmha/entry.cpp",
+    "src/sycl/xe35/fmha/flash_attention.cpp",
+    "src/sycl/xe35/fmha/fmha_decode_kernel.cpp.in",
+    "src/sycl/xe35/fmha/fmha_decode_nopage_kernel.cpp.in",
+    "src/sycl/xe35/fmha/fmha_prefill_kernel.cpp.in",
+    "src/sycl/xe35/fmha/fmha_prefill_nopage_kernel.cpp.in",
+    "src/sycl/xe35/fmha/kernel/xe_fmha_fwd_decode_splitkv_kernel.hpp",
+    "src/sycl/xe35/fmha/kernel/xe_fmha_fwd_kernel.hpp",
+    "src/sycl/xe35/fmha/kernel/xe_reduce_split_k.hpp",
+    "src/sycl/xe35/fmha/kernel/xe_tile_scheduler.hpp",
+    "src/sycl/xe35/fmha/upstream_adapter.cpp",
+    "src/sycl/xe35/fmha/xe_fmha_fwd_decode_dispatch.hpp",
+    "src/sycl/xe35/fmha/xe_fmha_fwd_decode_runner.hpp",
+    "src/sycl/xe35/fmha/xe_fmha_fwd_prefill_dispatch.hpp",
+    "src/sycl/xe35/fmha/xe_fmha_fwd_prefill_runner.hpp",
+    "tests/test_flash_attention_guard.py"
+  ],
+  "apply_check": "PASS"
+}

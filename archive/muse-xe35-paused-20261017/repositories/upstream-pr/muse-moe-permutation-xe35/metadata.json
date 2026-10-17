@@ -1,0 +1,23 @@
+{
+  "directory": "/home/syk/worktrees/sgl-kernel-xpu-up/pr/muse-moe-permutation-xe35",
+  "head": "833c95208dccd2af5628c121222f91186a5b2de7",
+  "branch": "pr/muse-moe-permutation-xe35",
+  "patch_sha256": "65f6e9e53e201ec2bcf62c0ded2867e20e94a67b1ac8bc5602c3dcd60b707ce4",
+  "tracked_paths": [
+    "cmake/BuildFlags.cmake",
+    "include/sgl_kernel_ops.h",
+    "python/sgl_kernel/__init__.py",
+    "src/CMakeLists.txt",
+    "src/sycl/Device.cpp",
+    "src/sycl/HCHead.cpp",
+    "src/torch_extension_sycl.cc"
+  ],
+  "untracked_code": [
+    "benchmark/bench_mxfp4_small_permutation.py",
+    "include/sgl_kernel/xe35/mxfp4_permutation_ops.h",
+    "python/sgl_kernel/moe_permutation.py",
+    "src/sycl/xe35/mxfp4_small_permutation.cpp",
+    "tests/test_mxfp4_small_permutation.py"
+  ],
+  "apply_check": "PASS"
+}

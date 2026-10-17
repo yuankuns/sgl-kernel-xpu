@@ -1,0 +1,23 @@
+{
+  "directory": "/home/syk/worktrees/sgl-kernel-xpu-up/pr/muse-logits-vocab-xe35",
+  "head": "833c95208dccd2af5628c121222f91186a5b2de7",
+  "branch": "pr/muse-logits-vocab-xe35",
+  "patch_sha256": "33d95d75caa19d3d39ab26d3affab11966276be2d1733270190547226d2f3d09",
+  "tracked_paths": [
+    "cmake/BuildFlags.cmake",
+    "include/sgl_kernel_ops.h",
+    "src/sycl/Device.cpp",
+    "src/sycl/HCHead.cpp",
+    "src/torch_extension_sycl.cc"
+  ],
+  "untracked_code": [
+    "benchmark/bench_logits_vocab_sweep.py",
+    "include/sgl_kernel/xe35/logits_vocab_ops.h",
+    "src/sycl/xe35/SoftcapLogits.cpp",
+    "src/sycl/xe35/VocabMask.cpp",
+    "tests/test_logits_benchmark_scope.py",
+    "tests/test_softcap_logits.py",
+    "tests/test_vocab_mask.py"
+  ],
+  "apply_check": "PASS"
+}

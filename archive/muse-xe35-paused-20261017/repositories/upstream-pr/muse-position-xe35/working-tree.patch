@@ -1,0 +1,627 @@
+diff --git a/benchmark/bench_position_occupancy.py b/benchmark/bench_position_occupancy.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..a2807f3dc60587bbf64a051c4fc62c5ca4336dfb
+--- /dev/null
++++ b/benchmark/bench_position_occupancy.py
+@@ -0,0 +1,198 @@
++"""Compare main Triton position kernel and the registered SYCL kernel on XPU."""
++
++import argparse
++import os
++
++if __name__ == "__main__":
++    scope_parser_xe35 = argparse.ArgumentParser(add_help=False)
++    scope_parser_xe35.add_argument("--batch", "--serving-batch", type=int, default=8)
++    scope_parser_xe35.add_argument("--isl", type=int, default=4096)
++    scope_parser_xe35.add_argument("--osl", type=int, default=16)
++    scope_parser_xe35.add_argument("--tp", type=int, default=1)
++    scope_parser_xe35.add_argument("--ep", type=int, default=1)
++    scope_xe35, _unknown_xe35 = scope_parser_xe35.parse_known_args()
++    if (scope_xe35.batch, scope_xe35.isl, scope_xe35.osl, scope_xe35.tp, scope_xe35.ep) != (
++        8, 4096, 16, 1, 1
++    ) or any(
++        os.environ.get(name, "8") != "8"
++        for name in ("BATCHES", "BATCH_SIZE", "SERVING_BATCH")
++    ):
++        scope_parser_xe35.error("Muse-Spark serving scope requires B8/ISL4096/OSL16/TP1/EP1")
++
++import importlib
++import json
++import tempfile
++from pathlib import Path
++from statistics import median
++
++import sgl_kernel
++import torch
++
++
++def measure(triton_fn, sycl_fn, samples, reverse_order):
++    order = (sycl_fn, triton_fn) if reverse_order else (triton_fn, sycl_fn)
++    for _ in range(5):
++        for fn in order:
++            fn()
++    torch.xpu.synchronize()
++    activities = [
++        torch.profiler.ProfilerActivity.CPU,
++        torch.profiler.ProfilerActivity.XPU,
++    ]
++    with torch.profiler.profile(activities=activities) as profile:
++        for _ in range(samples):
++            for fn in order:
++                fn()
++        torch.xpu.synchronize()
++    with tempfile.TemporaryDirectory() as directory:
++        path = Path(directory) / "trace.json"
++        profile.export_chrome_trace(str(path))
++        events = json.loads(path.read_text())["traceEvents"]
++    kernels = [
++        event for event in events if event.get("cat") == "kernel" and "dur" in event
++    ]
++    triton_us = [
++        float(event["dur"])
++        for event in kernels
++        if "compute_position_kernel" in event["name"]
++    ]
++    sycl_us = [
++        float(event["dur"])
++        for event in kernels
++        if "ComputePositionKernel_xe35" in event["name"]
++    ]
++    assert len(triton_us) == len(sycl_us) == samples, [
++        (event["name"], event["dur"]) for event in kernels[:10]
++    ]
++    return triton_us, sycl_us
++
++
++def spread(samples):
++    ordered = sorted(samples)
++    last = len(ordered) - 1
++    return ordered[round(0.2 * last)], ordered[round(0.8 * last)]
++
++
++def main():
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument("--batch", type=int, default=8)
++    parser.add_argument("--lengths", default="16,64,128,256,512,1024,2048,4096")
++    parser.add_argument("--samples", type=int, default=7)
++    parser.add_argument("--length-dtype", choices=["int32", "int64"], default="int32")
++    parser.add_argument("--isl", type=int, default=4096)
++    parser.add_argument("--osl", type=int, default=16)
++    parser.add_argument("--tp", type=int, default=1)
++    parser.add_argument("--ep", type=int, default=1)
++    parser.add_argument("--skew", action="store_true")
++    parser.add_argument("--max-seq-len-hint", type=int, default=-1)
++    parser.add_argument("--reverse-order", action="store_true")
++    parser.add_argument("--prefix-mode", choices=["zero", "staggered"], default="zero")
++    args = parser.parse_args()
++    if args.batch != 8:
++        parser.error("Muse-Spark serving workload requires B=8")
++    if (args.isl, args.osl, args.tp, args.ep) != (4096, 16, 1, 1):
++        parser.error("Muse-Spark workload requires ISL4096/OSL16/TP1/EP1")
++    if not torch.xpu.is_available() or not sgl_kernel.is_xe3_arch():
++        parser.error("SYCL position kernels require Xe35 compute capability 3.5")
++    position_module = importlib.import_module("sglang.kernels.ops.attention.position")
++    compute_position_kernel = position_module.compute_position_kernel
++    length_dtype = getattr(torch, args.length_dtype)
++    assert args.batch > 0 and args.samples > 0
++    assert torch.xpu.is_available()
++    print(
++        json.dumps(
++            {
++                "meta": {
++                    "device": torch.xpu.get_device_name(0),
++                    "dtype": f"{args.length_dtype} lengths; int64 positions; int32 starts",
++                    "layout": "contiguous",
++                    "method": "torch.profiler XPU kernel event duration; us",
++                    "batch": args.batch,
++                    "isl": args.isl,
++                    "osl": args.osl,
++                    "tp": args.tp,
++                    "ep": args.ep,
++                    "samples": args.samples,
++                    "skew": args.skew,
++                    "max_seq_len_hint": args.max_seq_len_hint,
++                    "reverse_order": args.reverse_order,
++                    "prefix_mode": args.prefix_mode,
++                }
++            }
++        ),
++        flush=True,
++    )
++    for length in map(int, args.lengths.split(",")):
++        assert length >= 0
++        lengths = (
++            [length] + [0] * (args.batch - 1) if args.skew else [length] * args.batch
++        )
++        tokens = sum(lengths)
++        seq = torch.tensor(lengths, dtype=length_dtype, device="xpu")
++        prefix = torch.zeros(args.batch, dtype=length_dtype, device="xpu")
++        if args.prefix_mode == "staggered":
++            prefix = torch.arange(args.batch, dtype=length_dtype, device="xpu") * 3
++        positions_t = torch.empty(tokens, dtype=torch.int64, device="xpu")
++        starts_t = torch.empty(args.batch, dtype=torch.int32, device="xpu")
++        positions_s = torch.empty_like(positions_t)
++        starts_s = torch.empty_like(starts_t)
++
++        def main_triton():
++            compute_position_kernel[(args.batch,)](
++                positions_t, starts_t, prefix, seq, True
++            )
++
++        def branch_sycl():
++            if args.max_seq_len_hint >= 0:
++                torch.ops.sgl_kernel.compute_position_with_hint_xe35(
++                    positions_s, starts_s, prefix, seq, args.max_seq_len_hint
++                )
++            else:
++                torch.ops.sgl_kernel.compute_position_xe35(
++                    positions_s, starts_s, prefix, seq
++                )
++
++        main_triton()
++        branch_sycl()
++        torch.xpu.synchronize()
++        expected = torch.cat(
++            [
++                torch.arange(size, dtype=torch.int64)
++                + (i * 3 if args.prefix_mode == "staggered" else 0)
++                for i, size in enumerate(lengths)
++            ]
++        )
++        expected_starts = torch.tensor(
++            [sum(lengths[:i]) for i in range(args.batch)],
++            dtype=torch.int32,
++        )
++        for pos, starts in ((positions_t, starts_t), (positions_s, starts_s)):
++            torch.testing.assert_close(pos.cpu(), expected, rtol=0, atol=0)
++            torch.testing.assert_close(starts.cpu(), expected_starts, rtol=0, atol=0)
++        t, s = measure(main_triton, branch_sycl, args.samples, args.reverse_order)
++        t_p20, t_p80 = spread(t)
++        s_p20, s_p80 = spread(s)
++        print(
++            json.dumps(
++                {
++                    "length": length,
++                    "tokens": tokens,
++                    "main_triton_us": t,
++                    "branch_sycl_us": s,
++                    "main_p50_us": median(t),
++                    "branch_p50_us": median(s),
++                    "main_p20_us": t_p20,
++                    "main_p80_us": t_p80,
++                    "branch_p20_us": s_p20,
++                    "branch_p80_us": s_p80,
++                    "main_span_us": max(t) - min(t),
++                    "branch_span_us": max(s) - min(s),
++                }
++            ),
++            flush=True,
++        )
++        torch.xpu.synchronize()
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/cmake/BuildFlags.cmake b/cmake/BuildFlags.cmake
+index 5dfb191b37ff61b04b4329536b487308b197cc44..086239cefe6af99520acbb1c4423744a46d9a4cc 100644
+--- a/cmake/BuildFlags.cmake
++++ b/cmake/BuildFlags.cmake
+@@ -26,7 +26,7 @@ function(CHECK_SYCL_FLAG FLAG VARIABLE_NAME)
+ endfunction()
+ 
+ # Support GCC on Linux.
+-if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
++if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" OR CMAKE_CXX_COMPILER_ID STREQUAL "IntelLLVM")
+   message(STATUS "sgl-kernel-xpu build type: ${CMAKE_BUILD_TYPE}")
+   set(SYCL_HOST_FLAGS)
+   set(SYCL_KERNEL_OPTIONS)
+@@ -185,6 +185,6 @@ if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+ 
+   set(SYCL_OFFLINE_COMPILER_FLAGS "${SYCL_OFFLINE_COMPILER_AOT_OPTIONS}${SYCL_OFFLINE_COMPILER_CG_OPTIONS}")
+ else()
+-  message("Not compiling with XPU. Currently only support GCC compiler on Linux as CXX compiler.")
++  message("Not compiling with XPU. Currently only support GNU or IntelLLVM compiler on Linux as CXX compiler.")
+   return()
+ endif()
+diff --git a/include/sgl_kernel/xe35/position_ops.h b/include/sgl_kernel/xe35/position_ops.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..f65ac14bb92874219b237b4064a8ca8aa0f78803
+--- /dev/null
++++ b/include/sgl_kernel/xe35/position_ops.h
+@@ -0,0 +1,17 @@
++#pragma once
++
++#include <torch/all.h>
++
++#include "sgl_kernel_export.h"
++
++namespace at::native::xpu {
++SGL_KERNEL_EXPORT void compute_position_xe35(
++    torch::Tensor positions, torch::Tensor extend_start_loc, torch::Tensor prefix_lens, torch::Tensor seq_lens);
++SGL_KERNEL_EXPORT void compute_position_with_hint_xe35(
++    torch::Tensor positions,
++    torch::Tensor extend_start_loc,
++    torch::Tensor prefix_lens,
++    torch::Tensor seq_lens,
++    int64_t max_seq_len_hint);
++
++}
+diff --git a/include/sgl_kernel_ops.h b/include/sgl_kernel_ops.h
+index 0b71dcef0d0cd28a7b2bf892845c95d6c12a547f..6aa2529d948929cd0d0982bc81b60a380c7100ee 100644
+--- a/include/sgl_kernel_ops.h
++++ b/include/sgl_kernel_ops.h
+@@ -21,6 +21,10 @@ limitations under the License.
+ #include <torch/library.h>
+ #include <torch/torch.h>
+ 
++#if SYCL_INTEL_TARGET == 35
++#include "sgl_kernel/xe35/position_ops.h"
++#endif
++
+ #include <optional>
+ #include <sycl/sycl.hpp>
+ #include <tuple>
+diff --git a/src/sycl/Device.cpp b/src/sycl/Device.cpp
+index 44590db8a7c078bf6d8526548e75f80608b757af..2ab1b2262242d5741f5da3d55703004c257bb013 100644
+--- a/src/sycl/Device.cpp
++++ b/src/sycl/Device.cpp
+@@ -22,7 +22,8 @@ SGL_KERNEL_EXPORT std::tuple<int64_t, int64_t> query_device(int64_t device_index
+ // Need oneAPI 2026.2 or later to support `architecture::intel_gpu_cri`. Check the release
+ // (__INTEL_LLVM_COMPILER) rather than the build date (__SYCL_COMPILER_VERSION): 2026.1.x
+ // patch releases (e.g. 2026.1.3, 20260724) are built later but still lack this enum.
+-#if defined(__INTEL_LLVM_COMPILER) && __INTEL_LLVM_COMPILER >= 20260200
++#if (defined(__INTEL_LLVM_COMPILER) && __INTEL_LLVM_COMPILER >= 20260200) || \
++    (defined(__INTEL_LLVM_COMPILER_VERSION) && __INTEL_LLVM_COMPILER_VERSION >= 20260200)
+     case syclex::architecture::intel_gpu_cri:
+       return std::make_tuple(3, 5);
+ #endif
+diff --git a/src/sycl/HCHead.cpp b/src/sycl/HCHead.cpp
+index 78464246ed88cb8056af87e388bad9fc222d4053..1b2ace4419e74f6e6276cea4a8bcffc0b2078a6e 100644
+--- a/src/sycl/HCHead.cpp
++++ b/src/sycl/HCHead.cpp
+@@ -67,7 +67,10 @@ struct FusedHCHeadKernel : public __SYCL_KER_CONFIG_CONVENTION__ {
+     slm_ = sycl::local_accessor<float, 1>(slm_size, cgh);
+   }
+ 
+-  [[sycl::reqd_work_group_size(WG_SIZE)]] [[sycl::reqd_sub_group_size(SG_SIZE)]] void
++#ifdef __SYCL_DEVICE_ONLY__
++  [[sycl::reqd_work_group_size(WG_SIZE)]] [[sycl::reqd_sub_group_size(SG_SIZE)]]
++#endif
++  void
+   operator()(sycl::nd_item<1> item) const {
+     const int token_id = static_cast<int>(item.get_group(0));
+     const int tid = static_cast<int>(item.get_local_id(0));
+diff --git a/src/sycl/xe35/ComputePosition.cpp b/src/sycl/xe35/ComputePosition.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..e4c9741fe85c6b95f10df47fdcc87710484f2e21
+--- /dev/null
++++ b/src/sycl/xe35/ComputePosition.cpp
+@@ -0,0 +1,148 @@
++#include <ATen/ATen.h>
++#include <c10/xpu/XPUStream.h>
++#include <torch/all.h>
++
++#include "sgl_kernel/xe35/position_ops.h"
++
++#include <algorithm>
++#include <sycl/sycl.hpp>
++
++#include "../SYCLHelpers.h"
++
++namespace at::native::xpu {
++namespace {
++
++constexpr int kPositionWorkgroup = 256;
++
++template <typename PrefixScalar, typename SeqScalar>
++struct ComputePositionKernel_xe35 {
++  int64_t* __restrict__ positions;
++  int32_t* __restrict__ extend_start_loc;
++  const PrefixScalar* __restrict__ prefix_lens;
++  const SeqScalar* __restrict__ seq_lens;
++  int64_t batch;
++  int64_t groups_per_request;
++  bool has_prefix;
++
++  void operator()(sycl::nd_item<1> item) const {
++    const int64_t req = item.get_group(0) / groups_per_request;
++    const int64_t tile = item.get_group(0) % groups_per_request;
++    const int64_t lane = item.get_local_id(0);
++    if (req >= batch) {
++      return;
++    }
++    int64_t start = 0;
++    for (int64_t i = 0; i < req; ++i) {
++      start += seq_lens[i];
++    }
++    const int64_t prefix = has_prefix ? prefix_lens[req] : 0;
++    const int64_t extend = seq_lens[req];
++    for (int64_t i = tile * kPositionWorkgroup + lane; i < extend; i += groups_per_request * kPositionWorkgroup) {
++      positions[start + i] = prefix + i;
++    }
++    if (tile == 0 && lane == 0) {
++      extend_start_loc[req] = static_cast<int32_t>(start);
++    }
++  }
++};
++
++}  // namespace
++
++void compute_position_impl_xe35(
++    torch::Tensor positions,
++    torch::Tensor extend_start_loc,
++    torch::Tensor prefix_lens,
++    torch::Tensor seq_lens,
++    int64_t max_seq_len_hint) {
++  TORCH_CHECK(
++      positions.is_xpu() && positions.scalar_type() == at::kLong && positions.is_contiguous(),
++      "positions must be contiguous XPU int64");
++  TORCH_CHECK(
++      extend_start_loc.is_xpu() && extend_start_loc.scalar_type() == at::kInt && extend_start_loc.is_contiguous(),
++      "extend_start_loc must be contiguous XPU int32");
++  TORCH_CHECK(
++      prefix_lens.is_xpu() && (prefix_lens.scalar_type() == at::kInt || prefix_lens.scalar_type() == at::kLong) &&
++          prefix_lens.is_contiguous() && seq_lens.is_xpu() &&
++          (seq_lens.scalar_type() == at::kInt || seq_lens.scalar_type() == at::kLong) && seq_lens.is_contiguous(),
++      "lengths must be contiguous XPU int32 or int64");
++  const int64_t batch = seq_lens.numel();
++  TORCH_CHECK(
++      extend_start_loc.numel() == batch && (prefix_lens.numel() == 0 || prefix_lens.numel() == batch),
++      "lengths must match batch");
++  if (batch == 0) {
++    return;
++  }
++  auto queue = at::xpu::getCurrentXPUStream().queue();
++  const bool has_prefix = prefix_lens.numel() == batch;
++  // Spread long requests across workgroups; keep one group for short requests.
++  // The model already has a host length list. Its maximum avoids stranding a
++  // long request when the average length is diluted by empty/short requests.
++  // A stale or missing hint only changes occupancy: the kernel's strided loop
++  // still covers every sequence element.
++  const int64_t average_groups = (positions.numel() + batch * 512 - 1) / (batch * 512);
++  const int64_t hinted_groups = max_seq_len_hint > 0 ? (max_seq_len_hint + 511) / 512 : 1;
++  // There is no benefit in launching more groups per request than there are
++  // workgroup-sized chunks in the entire positions output.
++  const int64_t useful_groups = std::max<int64_t>(1, (positions.numel() + kPositionWorkgroup - 1) / kPositionWorkgroup);
++  const int64_t groups_per_request = std::min(useful_groups, std::max({int64_t{1}, average_groups, hinted_groups}));
++  const auto global_size = sycl::range<1>(batch * groups_per_request * kPositionWorkgroup);
++  const auto local_size = sycl::range<1>(kPositionWorkgroup);
++  if (prefix_lens.scalar_type() == at::kInt && seq_lens.scalar_type() == at::kInt) {
++    ComputePositionKernel_xe35<int32_t, int32_t> kernel{
++        positions.data_ptr<int64_t>(),
++        extend_start_loc.data_ptr<int32_t>(),
++        prefix_lens.data_ptr<int32_t>(),
++        seq_lens.data_ptr<int32_t>(),
++        batch,
++        groups_per_request,
++        has_prefix};
++    sycl_kernel_submit(global_size, local_size, queue, kernel);
++  } else if (prefix_lens.scalar_type() == at::kLong && seq_lens.scalar_type() == at::kLong) {
++    ComputePositionKernel_xe35<int64_t, int64_t> kernel{
++        positions.data_ptr<int64_t>(),
++        extend_start_loc.data_ptr<int32_t>(),
++        prefix_lens.data_ptr<int64_t>(),
++        seq_lens.data_ptr<int64_t>(),
++        batch,
++        groups_per_request,
++        has_prefix};
++    sycl_kernel_submit(global_size, local_size, queue, kernel);
++  } else if (prefix_lens.scalar_type() == at::kInt) {
++    ComputePositionKernel_xe35<int32_t, int64_t> kernel{
++        positions.data_ptr<int64_t>(),
++        extend_start_loc.data_ptr<int32_t>(),
++        prefix_lens.data_ptr<int32_t>(),
++        seq_lens.data_ptr<int64_t>(),
++        batch,
++        groups_per_request,
++        has_prefix};
++    sycl_kernel_submit(global_size, local_size, queue, kernel);
++  } else {
++    ComputePositionKernel_xe35<int64_t, int32_t> kernel{
++        positions.data_ptr<int64_t>(),
++        extend_start_loc.data_ptr<int32_t>(),
++        prefix_lens.data_ptr<int64_t>(),
++        seq_lens.data_ptr<int32_t>(),
++        batch,
++        groups_per_request,
++        has_prefix};
++    sycl_kernel_submit(global_size, local_size, queue, kernel);
++  }
++}
++
++void compute_position_xe35(
++    torch::Tensor positions, torch::Tensor extend_start_loc, torch::Tensor prefix_lens, torch::Tensor seq_lens) {
++  compute_position_impl_xe35(positions, extend_start_loc, prefix_lens, seq_lens, -1);
++}
++
++void compute_position_with_hint_xe35(
++    torch::Tensor positions,
++    torch::Tensor extend_start_loc,
++    torch::Tensor prefix_lens,
++    torch::Tensor seq_lens,
++    int64_t max_seq_len_hint) {
++  TORCH_CHECK(max_seq_len_hint >= 0, "max_seq_len_hint must be nonnegative");
++  compute_position_impl_xe35(positions, extend_start_loc, prefix_lens, seq_lens, max_seq_len_hint);
++}
++
++}  // namespace at::native::xpu
+diff --git a/src/torch_extension_sycl.cc b/src/torch_extension_sycl.cc
+index 8603e536b016ae275cc7e77d48e1a312532d48c2..9efaccd6a38d3f12334eee27b122f394a7d2ab1a 100644
+--- a/src/torch_extension_sycl.cc
++++ b/src/torch_extension_sycl.cc
+@@ -58,6 +58,18 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
+   m.def("hadamard_transform(Tensor input, float scale=1.0) -> Tensor");
+   m.impl("hadamard_transform", torch::kXPU, &at::native::xpu::hadamard_transform);
+ 
++#if SYCL_INTEL_TARGET == 35
++  m.def(
++      "compute_position_xe35(Tensor! positions, Tensor! extend_start_loc, Tensor prefix_lens, Tensor seq_lens) -> ()");
++  m.impl("compute_position_xe35", torch::kXPU, &at::native::xpu::compute_position_xe35);
++
++  m.def(
++      "compute_position_with_hint_xe35(Tensor! positions, Tensor! extend_start_loc, "
++      "Tensor prefix_lens, Tensor seq_lens, int max_seq_len_hint) -> ()");
++  m.impl("compute_position_with_hint_xe35", torch::kXPU, &at::native::xpu::compute_position_with_hint_xe35);
++
++#endif
++
+   m.def("topk_softmax(Tensor! topk_weights, Tensor! topk_indices, Tensor gating_output, bool renormalize) -> ()");
+   m.impl("topk_softmax", torch::kXPU, &at::native::xpu::topk_softmax);
+ 
+diff --git a/tests/test_compute_position.py b/tests/test_compute_position.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..e398ae61320211fe6b01bdf1969cad8303ce367a
+--- /dev/null
++++ b/tests/test_compute_position.py
+@@ -0,0 +1,112 @@
++import pytest
++import sgl_kernel
++import torch
++
++
++pytestmark = pytest.mark.skipif(
++    not torch.xpu.is_available() or not sgl_kernel.is_xe3_arch(),
++    reason="Xe35 kernels require compute capability 3.5",
++)
++
++
++@pytest.mark.parametrize("length_dtype", [torch.int32, torch.int64])
++@pytest.mark.parametrize("with_prefix", [False, True])
++def test_compute_position_production_exact(length_dtype, with_prefix):
++    if not torch.xpu.is_available():
++        pytest.skip("XPU unavailable")
++    # Muse-Spark position: B8, ISL4096, OSL16, TP1/EP1.
++    lengths = torch.full((8,), 4096, dtype=length_dtype, device="xpu")
++    prefix = torch.zeros(8 if with_prefix else 0, dtype=length_dtype, device="xpu")
++    positions = torch.empty(8 * 4096, dtype=torch.int64, device="xpu")
++    starts = torch.empty(8, dtype=torch.int32, device="xpu")
++    torch.ops.sgl_kernel.compute_position_xe35(positions, starts, prefix, lengths)
++    torch.testing.assert_close(
++        positions.cpu(), torch.arange(4096).repeat(8), atol=0, rtol=0
++    )
++    torch.testing.assert_close(
++        starts.cpu(), torch.arange(8, dtype=torch.int32) * 4096, atol=0, rtol=0
++    )
++
++
++def test_compute_position_with_prefix():
++    if not torch.xpu.is_available():
++        pytest.skip("XPU unavailable")
++    seq = torch.tensor([2, 0, 3], device="xpu", dtype=torch.int32)
++    prefix = torch.tensor([4, 2, 7], device="xpu", dtype=torch.int32)
++    positions = torch.empty(5, device="xpu", dtype=torch.int64)
++    starts = torch.empty(3, device="xpu", dtype=torch.int32)
++    torch.ops.sgl_kernel.compute_position_xe35(positions, starts, prefix, seq)
++    torch.testing.assert_close(
++        positions, torch.tensor([4, 5, 7, 8, 9], device="xpu", dtype=torch.int64)
++    )
++    torch.testing.assert_close(
++        starts, torch.tensor([0, 2, 2], device="xpu", dtype=torch.int32)
++    )
++
++
++def test_compute_position_multiple_workgroups_irregular():
++    if not torch.xpu.is_available():
++        pytest.skip("XPU unavailable")
++    lengths = torch.tensor([1, 4097, 33], device="xpu", dtype=torch.int64)
++    prefix = torch.tensor([2, 4, 6], device="xpu", dtype=torch.int64)
++    positions = torch.empty(4131, device="xpu", dtype=torch.int64)
++    starts = torch.empty(3, device="xpu", dtype=torch.int32)
++    torch.ops.sgl_kernel.compute_position_xe35(positions, starts, prefix, lengths)
++    expected = torch.cat(
++        [
++            torch.arange(int(length), device="xpu") + int(base)
++            for length, base in zip(lengths.cpu(), prefix.cpu())
++        ]
++    )
++    torch.testing.assert_close(positions, expected)
++    torch.testing.assert_close(
++        starts, torch.tensor([0, 1, 4098], device="xpu", dtype=torch.int32)
++    )
++
++
++def test_compute_position_multiple_workgroups_no_prefix():
++    if not torch.xpu.is_available():
++        pytest.skip("XPU unavailable")
++    lengths = torch.tensor([2049, 1], device="xpu", dtype=torch.int32)
++    prefix = torch.empty(0, device="xpu", dtype=torch.int32)
++    positions = torch.empty(2050, device="xpu", dtype=torch.int64)
++    starts = torch.empty(2, device="xpu", dtype=torch.int32)
++    torch.ops.sgl_kernel.compute_position_xe35(positions, starts, prefix, lengths)
++    torch.testing.assert_close(
++        positions,
++        torch.cat([torch.arange(2049, device="xpu"), torch.arange(1, device="xpu")]),
++    )
++    torch.testing.assert_close(
++        starts, torch.tensor([0, 2049], device="xpu", dtype=torch.int32)
++    )
++
++
++@pytest.mark.parametrize("long_request", [4096, 8193])
++def test_compute_position_with_host_max_hint_skew_b8(long_request):
++    if not torch.xpu.is_available():
++        pytest.skip("XPU unavailable")
++    lengths = torch.tensor([long_request] + [0] * 7, device="xpu", dtype=torch.int32)
++    prefix = torch.arange(8, device="xpu", dtype=torch.int32) * 3
++    positions = torch.empty(long_request, device="xpu", dtype=torch.int64)
++    starts = torch.empty(8, device="xpu", dtype=torch.int32)
++    torch.ops.sgl_kernel.compute_position_with_hint_xe35(
++        positions, starts, prefix, lengths, long_request
++    )
++    torch.testing.assert_close(positions, torch.arange(long_request, device="xpu"))
++    torch.testing.assert_close(
++        starts,
++        torch.tensor(
++            [0] + [long_request] * 7,
++            device="xpu",
++            dtype=torch.int32,
++        ),
++    )
++    # A deliberately low hint must remain correct; it only affects occupancy.
++    torch.ops.sgl_kernel.compute_position_with_hint_xe35(
++        positions, starts, prefix, lengths, 1
++    )
++    torch.testing.assert_close(positions, torch.arange(long_request, device="xpu"))
++    with pytest.raises(RuntimeError, match="nonnegative"):
++        torch.ops.sgl_kernel.compute_position_with_hint_xe35(
++            positions, starts, prefix, lengths, -1
++        )
+diff --git a/tests/test_position_benchmark_scope.py b/tests/test_position_benchmark_scope.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..2c40754e474b174dc311265dcdefc6ed9447d051
+--- /dev/null
++++ b/tests/test_position_benchmark_scope.py
+@@ -0,0 +1,33 @@
++import os
++import subprocess
++import sys
++from pathlib import Path
++
++import pytest
++
++
++@pytest.mark.parametrize("batch", [1, 7, 9])
++def test_position_benchmark_rejects_serving_batch_before_imports(batch):
++    benchmark = Path(__file__).resolve().parents[1] / "benchmark" / "bench_position_occupancy.py"
++    result = subprocess.run(
++        [sys.executable, "-S", str(benchmark), "--batch", str(batch)],
++        capture_output=True,
++        text=True,
++        timeout=10,
++    )
++    assert result.returncode == 2
++    assert "B8/ISL4096/OSL16/TP1/EP1" in result.stderr
++    assert "ModuleNotFoundError" not in result.stderr
++
++
++def test_position_benchmark_rejects_environment_batch_before_imports():
++    benchmark = Path(__file__).resolve().parents[1] / "benchmark" / "bench_position_occupancy.py"
++    result = subprocess.run(
++        [sys.executable, "-S", str(benchmark)],
++        env={**os.environ, "BATCHES": "7"},
++        capture_output=True,
++        text=True,
++        timeout=10,
++    )
++    assert result.returncode == 2
++    assert "ModuleNotFoundError" not in result.stderr

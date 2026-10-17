@@ -1,0 +1,9 @@
+{
+  "directory": "/home/syk/worktrees/sgl-kernel-xpu/muse-spark-bf16-gemm-main-20261014",
+  "head": "8289c798a9ba71bf17378b708f69cac20367428e",
+  "branch": "muse_bf16_gemm",
+  "patch_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "tracked_paths": [],
+  "untracked_code": [],
+  "apply_check": "NO_CHANGES"
+}

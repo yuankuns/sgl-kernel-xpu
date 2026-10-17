@@ -1,0 +1,23 @@
+{
+  "directory": "/home/syk/worktrees/sgl-kernel-xpu-up/pr/muse-memory-xe35",
+  "head": "833c95208dccd2af5628c121222f91186a5b2de7",
+  "branch": "pr/muse-memory-xe35",
+  "patch_sha256": "cd213ad8c7dca48e1b4113fbda174bab145e5a749284be92045dacb0fff37626",
+  "tracked_paths": [
+    "cmake/BuildFlags.cmake",
+    "include/sgl_kernel_ops.h",
+    "src/sycl/Device.cpp",
+    "src/sycl/HCHead.cpp",
+    "src/torch_extension_sycl.cc"
+  ],
+  "untracked_code": [
+    "benchmark/bench_memory_compare.py",
+    "include/sgl_kernel/xe35/memory_ops.h",
+    "src/sycl/xe35/PagedAlloc.cpp",
+    "src/sycl/xe35/WriteReqToTokenPool.cpp",
+    "tests/test_memory_benchmark_scope.py",
+    "tests/test_paged_alloc.py",
+    "tests/test_write_req_to_token_pool.py"
+  ],
+  "apply_check": "PASS"
+}

@@ -1,0 +1,22 @@
+{
+  "directory": "/home/syk/worktrees/sgl-kernel-xpu-up/pr/muse-residual-norm-xe35",
+  "head": "833c95208dccd2af5628c121222f91186a5b2de7",
+  "branch": "pr/muse-residual-norm-xe35",
+  "patch_sha256": "c3228aaf437caba5da7c75952f6a5ba45eac3b722d61f36a509546e7231bcac3",
+  "tracked_paths": [
+    "cmake/BuildFlags.cmake",
+    "include/sgl_kernel_ops.h",
+    "python/sgl_kernel/__init__.py",
+    "src/sycl/Device.cpp",
+    "src/sycl/HCHead.cpp",
+    "src/torch_extension_sycl.cc",
+    "tests/test_norm.py"
+  ],
+  "untracked_code": [
+    "benchmark/bench_fused_norm_residual.py",
+    "include/sgl_kernel/xe35/residual_norm_ops.h",
+    "python/sgl_kernel/residual_norm.py",
+    "src/sycl/xe35/FusedNormResidual.cpp"
+  ],
+  "apply_check": "PASS"
+}

@@ -1,0 +1,24 @@
+{
+  "directory": "/home/syk/worktrees/sgl-kernel-xpu-up/pr/muse-bf16-gemm-xe35",
+  "head": "833c95208dccd2af5628c121222f91186a5b2de7",
+  "branch": "pr/muse-bf16-gemm-xe35",
+  "patch_sha256": "842e6c689a456231ff087a6be871249572a4c9e402e84d7fc264e2e84ac72b41",
+  "tracked_paths": [
+    "cmake/BuildFlags.cmake",
+    "include/sgl_kernel_ops.h",
+    "python/sgl_kernel/__init__.py",
+    "src/BuildOnLinux.cmake",
+    "src/sycl/Device.cpp",
+    "src/sycl/HCHead.cpp",
+    "src/torch_extension_sycl.cc"
+  ],
+  "untracked_code": [
+    "benchmark/bench_bf16_gemm_nt.py",
+    "include/sgl_kernel/xe35/bf16_gemm_ops.h",
+    "python/sgl_kernel/bf16_gemm.py",
+    "src/sycl/xe35/bf16_gemm_nt.cpp",
+    "tests/test_bf16_gemm_nt_xpu.py",
+    "tests/test_device_arch_guard.py"
+  ],
+  "apply_check": "PASS"
+}

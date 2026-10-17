@@ -1,0 +1,40 @@
+--- future-unmeasured-collector/graphs.py
++++ future-unmeasured-collector/graphs.py
+@@
+ def proof_graph(torch, method, qkv, initial, actual_call, directory, inputs, expected, bindings):
++    save(directory / 'binding-before-capture.json', bindings)
++    save(directory / 'live-tensors-before-capture.json', {
++        'qkv': tensor_metadata(qkv), 'initial': tensor_metadata(initial)})
+@@
+             with torch.profiler.record_function('QK_V2_PROOF_INSTANTIATE_ONLY'):
+                 metadata = graph_metadata(graph, directory, method)
++                save(directory / 'metadata-before-output-assert.json', {
++                    **metadata, 'bindings': bindings,
++                    'cast_records': observer.records,
++                    'cast_wrapper_liveness': observer.python_wrapper_liveness()})
+@@
+             with torch.profiler.record_function(REPLAY_MARKER):
++                save(directory / 'binding-before-replay.json', {
++                    'qkv': tensor_metadata(qkv), 'initial': tensor_metadata(initial),
++                    'cast_records': observer.records,
++                    'cast_wrapper_liveness': observer.python_wrapper_liveness()})
+                 graph.replay()
+                 torch.xpu.synchronize()
+@@
+     correctness = output_proof(torch, qkv, initial, inputs, expected, method, directory)
++    save(directory / 'cast-after-replay.json', {
++        'records': observer.records,
++        'wrapper_liveness': observer.python_wrapper_liveness()})
+
+This is a CPU-reviewed proposal for a NEW unmeasured collector only, NOT an
+applicable patch to frozen v2. tensor_metadata/make_cast_observer come from
+proposed_binding_probe.py. An independently authorized future collector would
+create one observer before capture and put the UNCHANGED capture_body inside
+its context. Observe-only records weak references; the retention-control arm
+stores the very same real aten._to_copy results through replay/reset/sync.
+Both arms must use the same observer API and original adapter/positions/math;
+no kernel substitution, registration, source edit, timing or tolerance change.
+Persist snapshots BEFORE any accuracy assertion. Expose retained outputs only
+after real replay/sync for full original int32 positions comparison, never read
+dead-process pointers or claim Python wrapper absence proves freed graph storage.
+This patch alone cannot recover native packed QK argument values from pArguments.

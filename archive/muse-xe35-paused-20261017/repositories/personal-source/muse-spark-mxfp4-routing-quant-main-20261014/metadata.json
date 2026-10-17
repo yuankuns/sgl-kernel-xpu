@@ -1,0 +1,9 @@
+{
+  "directory": "/home/syk/worktrees/sgl-kernel-xpu/muse-spark-mxfp4-routing-quant-main-20261014",
+  "head": "4cb5e929f84ebcebf98ec6702a26f1ee93190828",
+  "branch": "muse_routing_quant",
+  "patch_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "tracked_paths": [],
+  "untracked_code": [],
+  "apply_check": "NO_CHANGES"
+}

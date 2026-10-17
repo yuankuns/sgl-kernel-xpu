@@ -1,0 +1,265 @@
+:: setting up Intel GPU environment ...
+ 
+:: initializing oneAPI environment ...
+   bash: BASH_VERSION = 5.2.21(1)-release
+   args: Using "$@" for setvars.sh arguments: --force
+:: umf -- latest
+:: oneAPI environment initialized ::
+ 
+   umf: OK
+   oneccl: OK  (ONECCL_ROOT=/opt/gfx-deps/oneccl)
+   dpcpp: OK
+   cobalt: SKIPPED (set ENABLE_COBALT=1 to activate)
+:: environment ready.
+--- benchmark/muse_scope_xe35.py	2026-10-16 16:52:03.722402+00:00
++++ benchmark/muse_scope_xe35.py	2026-10-16 16:58:43.870498+00:00
+@@ -1,19 +1,19 @@
+ import os
+ 
+ 
+ def require_muse_b8_xe35():
+     expected = {
+-        'BATCHES': '8',
+-        'BATCH_SIZE': '8',
+-        'BATCH': '8',
+-        'SERVING_BATCH': '8',
+-        'SERVING_BATCH_SIZE': '8',
+-        'SGLANG_BATCH_SIZE': '8',
+-        'ISL': '4096',
+-        'OSL': '16',
+-        'TP': '1',
+-        'EP': '1',
++        "BATCHES": "8",
++        "BATCH_SIZE": "8",
++        "BATCH": "8",
++        "SERVING_BATCH": "8",
++        "SERVING_BATCH_SIZE": "8",
++        "SGLANG_BATCH_SIZE": "8",
++        "ISL": "4096",
++        "OSL": "16",
++        "TP": "1",
++        "EP": "1",
+     }
+     for name, value in expected.items():
+         if os.environ.get(name, value) != value:
+-            raise SystemExit(f'scope error: {name} must be {value}; Muse B8 only')
++            raise SystemExit(f"scope error: {name} must be {value}; Muse B8 only")
+--- tests/test_fused_qk_norm_rope_xe35.py	2026-10-16 16:58:15.602398+00:00
++++ tests/test_fused_qk_norm_rope_xe35.py	2026-10-16 16:58:43.938945+00:00
+@@ -3,50 +3,77 @@
+ import sys
+ import time
+ 
+ import pytest
+ 
+-benchmark = Path(__file__).resolve().parents[1] / 'benchmark'
++benchmark = Path(__file__).resolve().parents[1] / "benchmark"
+ sys.path.insert(0, str(benchmark))
+ from muse_scope_xe35 import require_muse_b8_xe35
+ 
+ require_muse_b8_xe35()
+ 
+ import torch
+ import sgl_kernel
+ 
+ 
+-@pytest.mark.parametrize('tokens', [8, 32768])
++@pytest.mark.parametrize("tokens", [8, 32768])
+ def test_production_reference_xe35(tokens, monkeypatch):
+     spec = importlib.util.spec_from_file_location(
+-        'validate_qk_norm_rope_b8_xe35', benchmark / 'validate_qk_norm_rope_b8_xe35.py'
++        "validate_qk_norm_rope_b8_xe35", benchmark / "validate_qk_norm_rope_b8_xe35.py"
+     )
+     module = importlib.util.module_from_spec(spec)
+     spec.loader.exec_module(module)
+-    monkeypatch.setattr(sys, 'argv', ['validate', '--tokens', str(tokens), '--entry', 'xe35'])
++    monkeypatch.setattr(
++        sys, "argv", ["validate", "--tokens", str(tokens), "--entry", "xe35"]
++    )
+     module.main_xe35()
+     torch.xpu.synchronize()
+     time.sleep(2)
+ 
+ 
+-@pytest.mark.parametrize('dtype', [torch.bfloat16, torch.float16])
+-@pytest.mark.parametrize('execution', ['cold_graph', 'streams'])
++@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
++@pytest.mark.parametrize("execution", ["cold_graph", "streams"])
+ def test_frequency_lifetime_and_generic_dispatch_xe35(dtype, execution):
+     torch.manual_seed(127)
+     tokens, dim = 8, 64
+-    original = torch.randn(tokens, 288 * dim, device='xpu:0', dtype=dtype)
+-    weights_q = torch.full((dim,), 43.7840518911 / dim**0.5, device='xpu:0', dtype=dtype)
+-    weights_k = torch.ones(dim, device='xpu:0', dtype=dtype)
+-    positions = torch.tensor([0, 1, 255, 1023, 2047, 4094, 4095, 4095], device='xpu:0', dtype=torch.int32)
+-    base = 130003.0 + (16 if dtype == torch.float16 else 0) + (10000 if execution == 'streams' else 0)
++    original = torch.randn(tokens, 288 * dim, device="xpu:0", dtype=dtype)
++    weights_q = torch.full(
++        (dim,), 43.7840518911 / dim**0.5, device="xpu:0", dtype=dtype
++    )
++    weights_k = torch.ones(dim, device="xpu:0", dtype=dtype)
++    positions = torch.tensor(
++        [0, 1, 255, 1023, 2047, 4094, 4095, 4095], device="xpu:0", dtype=torch.int32
++    )
++    base = (
++        130003.0
++        + (16 if dtype == torch.float16 else 0)
++        + (10000 if execution == "streams" else 0)
++    )
+     buffers = [original.clone(), original.clone()]
+ 
+     def invoke_xe35(buffer, generic=False):
+-        entry = sgl_kernel.fused_qk_norm_rope if generic else sgl_kernel.fused_qk_norm_rope_xe35
+-        entry(buffer, 128, 16, 144, dim, 1e-5, weights_q, weights_k, base, False, positions, rotary_dim=dim)
++        entry = (
++            sgl_kernel.fused_qk_norm_rope
++            if generic
++            else sgl_kernel.fused_qk_norm_rope_xe35
++        )
++        entry(
++            buffer,
++            128,
++            16,
++            144,
++            dim,
++            1e-5,
++            weights_q,
++            weights_k,
++            base,
++            False,
++            positions,
++            rotary_dim=dim,
++        )
+ 
+-    if execution == 'cold_graph':
++    if execution == "cold_graph":
+         graph = torch.xpu.XPUGraph()
+         with torch.xpu.graph(graph):
+             invoke_xe35(buffers[0])
+         graph.replay()
+         invoke_xe35(buffers[1], generic=True)
+@@ -55,22 +82,37 @@
+         for stream, buffer in zip(streams, buffers):
+             stream.wait_stream(torch.xpu.current_stream())
+             with torch.xpu.stream(stream):
+                 invoke_xe35(buffer, generic=buffer is buffers[1])
+     torch.xpu.synchronize()
+-    frequencies = (base ** (-torch.arange(0, dim, 2, dtype=torch.float64) / dim)).float()
++    frequencies = (
++        base ** (-torch.arange(0, dim, 2, dtype=torch.float64) / dim)
++    ).float()
+     theta = positions.cpu().float()[:, None] * frequencies[None, :]
+     cosine, sine = theta.cos()[:, None, :], theta.sin()[:, None, :]
+     rows = original.cpu().reshape(tokens, 288, dim).float()
+     active = rows[:, :144]
+-    weights = torch.cat((weights_q.cpu().float().expand(128, dim), weights_k.cpu().float().expand(16, dim)))
+-    normalized = active * torch.rsqrt(active.square().mean(-1, keepdim=True) + 1e-5) * weights
++    weights = torch.cat(
++        (
++            weights_q.cpu().float().expand(128, dim),
++            weights_k.cpu().float().expand(16, dim),
++        )
++    )
++    normalized = (
++        active * torch.rsqrt(active.square().mean(-1, keepdim=True) + 1e-5) * weights
++    )
+     even, odd = normalized[..., ::2], normalized[..., 1::2]
+-    expected = torch.stack((even * cosine - odd * sine, odd * cosine + even * sine), -1).flatten(-2)
++    expected = torch.stack(
++        (even * cosine - odd * sine, odd * cosine + even * sine), -1
++    ).flatten(-2)
+     tolerance = 5e-3 if dtype == torch.bfloat16 else 1e-3
+     for buffer in buffers:
+         actual = buffer.cpu().reshape(tokens, 288, dim)
+-        torch.testing.assert_close(actual[:, :144].float(), expected, atol=tolerance, rtol=tolerance)
+-        assert torch.equal(actual[:, 144:], original.cpu().reshape(tokens, 288, dim)[:, 144:])
++        torch.testing.assert_close(
++            actual[:, :144].float(), expected, atol=tolerance, rtol=tolerance
++        )
++        assert torch.equal(
++            actual[:, 144:], original.cpu().reshape(tokens, 288, dim)[:, 144:]
++        )
+     assert torch.equal(buffers[0], buffers[1])
+     torch.xpu.synchronize()
+     time.sleep(2)
+--- benchmark/bench_fused_qk_norm_rope_xe35.py	2026-10-16 16:52:47.670634+00:00
++++ benchmark/bench_fused_qk_norm_rope_xe35.py	2026-10-16 16:58:43.945250+00:00
+@@ -10,19 +10,22 @@
+ 
+ import torch
+ from sgl_kernel import fused_qk_norm_rope
+ 
+ DTYPE_MAP = {"bf16": torch.bfloat16}
+-parser = argparse.ArgumentParser(description="B8 production SOURCE versus PORT graph benchmark")
++parser = argparse.ArgumentParser(
++    description="B8 production SOURCE versus PORT graph benchmark"
++)
+ parser.add_argument("--tokens", type=int, choices=(8, 32768), required=True)
+ parser.add_argument("--output", type=Path, required=True)
+ args = parser.parse_args()
+ args.tokens = [args.tokens]
+ args.repeats, args.samples, args.warmup = 32, 21, 5
+ args.q_heads, args.k_heads, args.tail_heads, args.head_dim = 128, 16, 144, 64
+ args.dtype = "bf16"
+ args.profile = False
++
+ 
+ def benchmark_graph_xe35():
+     torch.manual_seed(42)
+     tokens, repeats, samples, warmup = (
+         args.tokens[0],
+--- benchmark/validate_qk_norm_rope_b8_xe35.py	2026-10-16 16:52:03.759402+00:00
++++ benchmark/validate_qk_norm_rope_b8_xe35.py	2026-10-16 16:58:43.973360+00:00
+@@ -21,14 +21,20 @@
+     parser.add_argument("--tail-heads", type=int, default=144)
+     parser.add_argument("--head-dim", type=int, choices=(64, 128, 256), default=64)
+     parser.add_argument("--dtype", choices=("bf16", "fp16"), default="bf16")
+     parser.add_argument("--entry", choices=("generic", "xe35"), default="generic")
+     args = parser.parse_args()
+-    if args.tokens not in (8, 32768) or (args.q_heads, args.k_heads, args.tail_heads, args.head_dim) != (128, 16, 144, 64):
++    if args.tokens not in (8, 32768) or (
++        args.q_heads,
++        args.k_heads,
++        args.tail_heads,
++        args.head_dim,
++    ) != (128, 16, 144, 64):
+         parser.error("requires B8 T8/T32768 Q128/K16/tail144/D64")
+     if args.entry == "xe35":
+         from sgl_kernel import fused_qk_norm_rope_xe35
++
+         invoke = fused_qk_norm_rope_xe35
+     else:
+         invoke = fused_qk_norm_rope
+     if min(args.tokens, args.q_heads, args.k_heads) <= 0 or args.tail_heads < 0:
+         parser.error(
+@@ -128,14 +134,26 @@
+             .item()
+         )
+     tail_equal = torch.equal(
+         actual[:, (heads_q + heads_k) * dim :], original[:, (heads_q + heads_k) * dim :]
+     )
+-    mapped = sorted({line.split()[-1] for line in Path("/proc/self/maps").read_text().splitlines() if "libsgl-ops-sycl-FusedQKNormRope" in line})
+-    libraries = {path: hashlib.sha256(Path(path).read_bytes()).hexdigest() for path in mapped}
+-    output_hash = hashlib.sha256(actual.view(torch.uint16).numpy().tobytes()).hexdigest()
+-    input_hash = hashlib.sha256(original.view(torch.uint16).numpy().tobytes()).hexdigest()
++    mapped = sorted(
++        {
++            line.split()[-1]
++            for line in Path("/proc/self/maps").read_text().splitlines()
++            if "libsgl-ops-sycl-FusedQKNormRope" in line
++        }
++    )
++    libraries = {
++        path: hashlib.sha256(Path(path).read_bytes()).hexdigest() for path in mapped
++    }
++    output_hash = hashlib.sha256(
++        actual.view(torch.uint16).numpy().tobytes()
++    ).hexdigest()
++    input_hash = hashlib.sha256(
++        original.view(torch.uint16).numpy().tobytes()
++    ).hexdigest()
+     print(
+         json.dumps(
+             {
+                 "entry": args.entry,
+                 "input_sha256": input_hash,

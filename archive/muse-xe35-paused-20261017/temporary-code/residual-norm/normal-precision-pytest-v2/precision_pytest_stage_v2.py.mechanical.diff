@@ -1,0 +1,20 @@
+--- precision_pytest_stage_v1.py
++++ precision_pytest_stage_v2.py
+@@ -4,7 +4,7 @@
+ import time
+ 
+ import history24_stage as monitor
+-import precision_pytest_v1 as check
++import precision_pytest_v2 as check
+ 
+ 
+ def main():
+@@ -13,7 +13,7 @@
+     parser.add_argument("--python", required=True)
+     parser.add_argument("--mode", required=True)
+     args = parser.parse_args()
+-    command = [args.python, "-B", str(check.ROOT / "precision_pytest_v1.py"), "--mode", args.mode]
++    command = [args.python, "-B", str(check.ROOT / "precision_pytest_v2.py"), "--mode", args.mode]
+     check.write(args.phase + ".command.json", command)
+     peak_worker = peak_tree = 0
+     violation = False

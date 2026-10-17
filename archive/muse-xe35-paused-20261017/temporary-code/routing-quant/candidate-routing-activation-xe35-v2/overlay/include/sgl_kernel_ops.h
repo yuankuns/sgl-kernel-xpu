@@ -1,0 +1,1582 @@
+/* Copyright 2025 SGLang Team. All Rights Reserved.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+==============================================================================*/
+
+#pragma once
+
+#include <ATen/ATen.h>
+#include <ATen/Tensor.h>
+#include <Python.h>
+#include <torch/library.h>
+#include <torch/torch.h>
+
+#include <optional>
+#include <sycl/sycl.hpp>
+#include <tuple>
+#include <vector>
+
+#define _CONCAT(A, B) A##B
+#define CONCAT(A, B) _CONCAT(A, B)
+
+#define _STRINGIFY(A) #A
+#define STRINGIFY(A) _STRINGIFY(A)
+
+#define TORCH_LIBRARY_EXPAND(NAME, MODULE) TORCH_LIBRARY(NAME, MODULE)
+
+#define REGISTER_EXTENSION(NAME)                                                                      \
+  PyMODINIT_FUNC CONCAT(PyInit_, NAME)() {                                                            \
+    static struct PyModuleDef module = {PyModuleDef_HEAD_INIT, STRINGIFY(NAME), nullptr, 0, nullptr}; \
+    return PyModule_Create(&module);                                                                  \
+  }
+
+using fptr_t = int64_t;
+
+// The kernels below are defined in the per-kernel SYCL shared libraries and
+// called from common_ops (torch_extension_sycl.cc). The SYCL libraries are
+// built with -fvisibility=hidden, so their public entry points must be given
+// default visibility to remain exported and dynamically linkable.
+#pragma GCC visibility push(default)
+
+/*
+ * From csrc/allreduce
+ */
+#ifdef USE_ROCM
+// ROCM custom allreduce
+fptr_t init_custom_ar(
+    torch::Tensor& meta,
+    torch::Tensor& rank_data,
+    const std::vector<std::string>& handles,
+    const std::vector<int64_t>& offsets,
+    int64_t rank,
+    bool full_nvlink);
+void all_reduce_reg(fptr_t _fa, torch::Tensor& inp, torch::Tensor& out);
+void all_reduce_unreg(fptr_t _fa, torch::Tensor& inp, torch::Tensor& reg_buffer, torch::Tensor& out);
+void dispose(fptr_t _fa);
+int64_t meta_size();
+void register_buffer(
+    fptr_t _fa, torch::Tensor& t, const std::vector<std::string>& handles, const std::vector<int64_t>& offsets);
+std::tuple<torch::Tensor, std::vector<int64_t>> get_graph_buffer_ipc_meta(fptr_t _fa);
+void register_graph_buffers(
+    fptr_t _fa, const std::vector<std::string>& handles, const std::vector<std::vector<int64_t>>& offsets);
+torch::Tensor allocate_meta_buffer(int64_t size);
+torch::Tensor get_meta_buffer_ipc_handle(torch::Tensor& inp);
+#else
+// custom allreduce
+fptr_t
+init_custom_ar(const std::vector<fptr_t>& fake_ipc_ptrs, torch::Tensor& rank_data, int64_t rank, bool full_nvlink);
+void dispose(fptr_t _fa);
+int64_t meta_size();
+void all_reduce(fptr_t _fa, torch::Tensor& inp, torch::Tensor& out, fptr_t _reg_buffer, int64_t reg_buffer_sz_bytes);
+std::tuple<std::vector<int64_t>, std::vector<int64_t>> get_graph_buffer_ipc_meta(fptr_t _fa);
+void register_buffer(fptr_t _fa, const std::vector<fptr_t>& fake_ipc_ptrs);
+void register_graph_buffers(
+    fptr_t _fa, const std::vector<std::vector<int64_t>>& handles, const std::vector<std::vector<int64_t>>& offsets);
+torch::Tensor mscclpp_generate_unique_id();
+fptr_t mscclpp_init_context(
+    const torch::Tensor& unique_id,
+    const int64_t rank,
+    const int64_t world_size,
+    torch::Tensor& scratch,
+    torch::Tensor& put_buffer,
+    const int64_t nranks_per_node,
+    const std::vector<int64_t>& rank_to_node,
+    const std::vector<int64_t>& rank_to_ib,
+    const int64_t context_selection);
+void mscclpp_allreduce(fptr_t _context, torch::Tensor& inp, torch::Tensor& out, int64_t nthreads, int64_t nblocks);
+#endif
+
+/*
+ * From csrc/attention
+ */
+void lightning_attention_decode(
+    const torch::Tensor& q,
+    const torch::Tensor& k,
+    const torch::Tensor& v,
+    const torch::Tensor& past_kv,
+    const torch::Tensor& slope,
+    torch::Tensor output,
+    torch::Tensor new_kv);
+void merge_state(
+    at::Tensor v_a, at::Tensor s_a, at::Tensor v_b, at::Tensor s_b, at::Tensor v_merged, at::Tensor s_merged);
+void merge_state_v2(
+    at::Tensor v_a, at::Tensor s_a, at::Tensor v_b, at::Tensor s_b, at::Tensor v_merged, at::Tensor s_merged);
+
+at::Tensor weak_ref_tensor(const at::Tensor& tensor);
+
+/*
+ * From csrc/elementwise
+ */
+namespace at::native::xpu {
+void rmsnorm(torch::Tensor& output, torch::Tensor& input, torch::Tensor& weight, double eps);
+void fused_add_rmsnorm(torch::Tensor input, torch::Tensor residual, torch::Tensor weight, double eps);
+void gemma_rmsnorm(torch::Tensor& output, torch::Tensor& input, torch::Tensor& weight, double eps);
+void gemma_fused_add_rmsnorm(torch::Tensor& input, torch::Tensor& residual, torch::Tensor& weight, double eps);
+std::tuple<torch::Tensor, torch::Tensor> fused_scale_residual_norm_scale_shift(
+    const torch::Tensor& residual,
+    const torch::Tensor& x,
+    const std::optional<torch::Tensor>& gate,
+    const std::optional<torch::Tensor>& weight,
+    const std::optional<torch::Tensor>& bias,
+    const torch::Tensor& scale,
+    const torch::Tensor& shift,
+    double eps);
+at::Tensor hadamard_transform(const at::Tensor& input, double scale);
+void fused_q_norm_rope(
+    torch::Tensor& q_input, torch::Tensor& q_output, torch::Tensor& freqs_cis, torch::Tensor& positions, double eps);
+void fused_k_norm_rope_flashmla(
+    torch::Tensor& kv,
+    torch::Tensor& kv_weight,
+    torch::Tensor& freqs_cis,
+    torch::Tensor& positions,
+    torch::Tensor& out_loc,
+    torch::Tensor& kvcache,
+    double eps,
+    int64_t page_size);
+void fused_inplace_qknorm_rope(
+    torch::Tensor& q,
+    torch::Tensor& k,
+    torch::Tensor& q_weight,
+    torch::Tensor& k_weight,
+    torch::Tensor& cos_sin_cache,
+    torch::Tensor& positions,
+    bool is_neox,
+    double eps,
+    int64_t head_dim,
+    int64_t rope_dim);
+void topk_softmax(at::Tensor& topk_weights, at::Tensor& topk_indices, at::Tensor& gating_output, bool renormalize);
+void topk_sigmoid(
+    at::Tensor& topk_weights,
+    at::Tensor& topk_indices,
+    at::Tensor& gating_output,
+    bool renormalize,
+    const c10::optional<at::Tensor>& correction_bias,
+    double routed_scaling_factor = 1.0,
+    int64_t num_fused_shared_experts = 0);
+void hash_topk(
+    const at::Tensor& router_logits,
+    const at::Tensor& input_ids,
+    const at::Tensor& tid2eid,
+    at::Tensor& topk_weights,
+    at::Tensor& topk_ids,
+    double routed_scaling_factor = 1.0);
+
+std::tuple<at::Tensor, at::Tensor> rotary_embedding(
+    at::Tensor& positions,
+    at::Tensor& query,
+    at::Tensor& key,
+    int64_t head_size,
+    at::Tensor& cos_sin_cache,
+    bool is_neox);
+void sgl_per_token_group_quant_8bit(
+    at::Tensor input,
+    at::Tensor output_q,
+    at::Tensor output_s,
+    int64_t group_size,
+    double eps,
+    double fp8_min,
+    double fp8_max,
+    bool scale_ue8m0);
+void sgl_per_token_group_quant_8bit_v2(
+    at::Tensor input,
+    at::Tensor output_q,
+    at::Tensor output_s,
+    int64_t group_size,
+    double eps,
+    double min_8bit,
+    double max_8bit,
+    bool scale_ue8m0,
+    bool fuse_silu_and_mul,
+    const std::optional<torch::Tensor>& masked_m);
+void fused_qk_norm_rope(
+    torch::Tensor& qkv,
+    int64_t num_heads_q,
+    int64_t num_heads_k,
+    int64_t num_heads_v,
+    int64_t head_dim,
+    double eps,
+    torch::Tensor& q_weight,
+    torch::Tensor& k_weight,
+    double base,
+    bool is_neox,
+    torch::Tensor& position_ids,
+    double factor,
+    double low,
+    double high,
+    double attention_factor,
+    int64_t rotary_dim);
+void fused_qk_rope(
+    torch::Tensor& qkv,
+    int64_t num_heads_q,
+    int64_t num_heads_k,
+    int64_t num_heads_v,
+    int64_t head_dim,
+    torch::Tensor& q_weight,
+    torch::Tensor& k_weight,
+    double base,
+    bool is_neox,
+    torch::Tensor& position_ids,
+    double factor,
+    double low,
+    double high,
+    double attention_factor,
+    int64_t rotary_dim);
+void fused_qk_rope_with_cos_sin_cache_inplace(
+    at::Tensor& query,
+    at::Tensor& key,
+    at::Tensor& cos_sin_cache,
+    at::Tensor& positions,
+    int64_t rope_dim,
+    bool is_neox);
+void multimodal_rotary_embedding(
+    at::Tensor& query,
+    at::Tensor& key,
+    const at::Tensor& cos_sin_cache,
+    const at::Tensor& positions,
+    const std::vector<int64_t>& mrope_section,
+    int64_t head_size,
+    int64_t rotary_dim,
+    bool mrope_interleaved,
+    bool mrope_interleaved_glm,
+    bool is_neox_style,
+    const std::optional<at::Tensor>& axis_map);
+void sgl_per_token_group_quant_fp4(
+    at::Tensor input,
+    at::Tensor output_q,
+    at::Tensor output_s,
+    int64_t group_size,
+    double eps,
+    std::optional<at::Tensor> input_secondary = std::nullopt);
+void store_cache(at::Tensor& k, at::Tensor& v, at::Tensor& k_cache, at::Tensor& v_cache, at::Tensor& indices);
+void biased_topk(
+    const at::Tensor& input,
+    const at::Tensor& bias,
+    at::Tensor& output,
+    at::Tensor& indices,
+    int64_t topk,
+    int64_t scoring_func,
+    int64_t num_fused_shared_experts,
+    bool renormalize,
+    double routed_scaling_factor,
+    bool apply_routed_scaling_factor_on_output);
+}  // namespace at::native::xpu
+
+/*
+ * From csrc/kvcacheio — KV cache scatter/gather transfer kernels
+ */
+void transfer_kv_per_layer(
+    const at::Tensor& src_k,
+    at::Tensor& dst_k,
+    const at::Tensor& src_v,
+    at::Tensor& dst_v,
+    const at::Tensor& src_indices,
+    const at::Tensor& dst_indices,
+    int64_t item_size,
+    int64_t block_quota,
+    int64_t sgs_per_wg);
+void transfer_kv_per_layer_mla(
+    const at::Tensor& src,
+    at::Tensor& dst,
+    const at::Tensor& src_indices,
+    const at::Tensor& dst_indices,
+    int64_t item_size,
+    int64_t block_quota,
+    int64_t sgs_per_wg);
+void transfer_kv_all_layer(
+    const at::Tensor& src_k_layers,
+    const at::Tensor& dst_k_layers,
+    const at::Tensor& src_v_layers,
+    const at::Tensor& dst_v_layers,
+    const at::Tensor& src_indices,
+    const at::Tensor& dst_indices,
+    int64_t item_size,
+    int64_t num_layers,
+    int64_t block_quota,
+    int64_t sgs_per_wg);
+void transfer_kv_all_layer_mla(
+    const at::Tensor& src_layers,
+    const at::Tensor& dst_layers,
+    const at::Tensor& src_indices,
+    const at::Tensor& dst_indices,
+    int64_t item_size,
+    int64_t num_layers,
+    int64_t block_quota,
+    int64_t sgs_per_wg);
+void transfer_kv_all_layer_lf_ph(
+    const at::Tensor& src_k_layers,
+    at::Tensor& dst_k,
+    const at::Tensor& src_v_layers,
+    at::Tensor& dst_v,
+    const at::Tensor& src_indices,
+    const at::Tensor& dst_indices,
+    int64_t item_size,
+    int64_t dst_layout_dim,
+    int64_t num_layers,
+    int64_t page_size,
+    int64_t head_num,
+    int64_t block_quota,
+    int64_t sgs_per_wg);
+void transfer_kv_per_layer_ph_lf(
+    const at::Tensor& src_k,
+    at::Tensor& dst_k,
+    const at::Tensor& src_v,
+    at::Tensor& dst_v,
+    const at::Tensor& src_indices,
+    const at::Tensor& dst_indices,
+    int64_t layer_id,
+    int64_t item_size,
+    int64_t src_layout_dim,
+    int64_t page_size,
+    int64_t head_num,
+    int64_t block_quota,
+    int64_t sgs_per_wg);
+void transfer_kv_per_layer_pf_lf(
+    const at::Tensor& src_k,
+    at::Tensor& dst_k,
+    const at::Tensor& src_v,
+    at::Tensor& dst_v,
+    const at::Tensor& src_indices,
+    const at::Tensor& dst_indices,
+    int64_t layer_id,
+    int64_t item_size,
+    int64_t src_layout_dim,
+    int64_t block_quota,
+    int64_t sgs_per_wg);
+void transfer_kv_all_layer_lf_pf(
+    const at::Tensor& src_k_layers,
+    at::Tensor& dst_k,
+    const at::Tensor& src_v_layers,
+    at::Tensor& dst_v,
+    const at::Tensor& src_indices,
+    const at::Tensor& dst_indices,
+    int64_t item_size,
+    int64_t dst_layout_dim,
+    int64_t num_layers,
+    int64_t block_quota,
+    int64_t sgs_per_wg);
+void transfer_kv_per_layer_mla_pf_lf(
+    const at::Tensor& src,
+    at::Tensor& dst,
+    const at::Tensor& src_indices,
+    const at::Tensor& dst_indices,
+    int64_t layer_id,
+    int64_t item_size,
+    int64_t src_layout_dim,
+    int64_t block_quota,
+    int64_t sgs_per_wg);
+void transfer_kv_all_layer_mla_lf_pf(
+    const at::Tensor& src_layers,
+    at::Tensor& dst,
+    const at::Tensor& src_indices,
+    const at::Tensor& dst_indices,
+    int64_t item_size,
+    int64_t dst_layout_dim,
+    int64_t num_layers,
+    int64_t block_quota,
+    int64_t sgs_per_wg);
+void transfer_kv_mamba_pf_lf(
+    const at::Tensor& src,
+    at::Tensor& dst,
+    const at::Tensor& src_indices,
+    const at::Tensor& dst_indices,
+    int64_t layer_id,
+    int64_t item_size,
+    int64_t src_layout_dim);
+void transfer_kv_mamba_lf_pf(
+    const at::Tensor& src_layers,
+    at::Tensor& dst,
+    const at::Tensor& src_indices,
+    const at::Tensor& dst_indices,
+    int64_t item_size,
+    int64_t dst_layout_dim,
+    int64_t num_layers);
+void silu_and_mul(torch::Tensor& out, torch::Tensor& input);
+void silu_and_mul_clamp(torch::Tensor& out, torch::Tensor& input, double swiglu_limit);
+void gelu_tanh_and_mul(torch::Tensor& out, torch::Tensor& input);
+void gelu_and_mul(torch::Tensor& out, torch::Tensor& input);
+void apply_rope_pos_ids_cos_sin_cache(
+    at::Tensor q,
+    at::Tensor k,
+    at::Tensor q_rope,
+    at::Tensor k_rope,
+    at::Tensor cos_sin_cache,
+    at::Tensor pos_ids,
+    bool interleave,
+    int64_t sycl_stream);
+
+/*
+ * Inkling short convolution family.
+ */
+at::Tensor inkling_sconv_forward(
+    const at::Tensor& x,
+    const at::Tensor& weight,
+    const at::Tensor& sconv_cache,
+    const at::Tensor& cache_mask,
+    const at::Tensor& safe_idx,
+    const at::Tensor& cu,
+    const at::Tensor& si,
+    bool silu_activation,
+    bool use_residual,
+    bool is_decode);
+void inkling_update_sconv_cache(
+    const at::Tensor& x,
+    at::Tensor& sconv_cache,
+    const at::Tensor& cache_indices,
+    const at::Tensor& has_initial_state,
+    const at::Tensor& query_start_loc);
+at::Tensor inkling_fused_decode_update_sconv(
+    const at::Tensor& x,
+    const at::Tensor& weight,
+    at::Tensor& sconv_cache,
+    const at::Tensor& cache_indices,
+    const at::Tensor& cache_mask,
+    bool silu_activation,
+    bool use_residual,
+    const std::optional<at::Tensor>& track_mask,
+    const std::optional<at::Tensor>& track_indices);
+void inkling_gather_scatter_sconv_cache(
+    const at::Tensor& hidden_states,
+    at::Tensor& sconv_cache,
+    const at::Tensor& track_conv_indices,
+    const at::Tensor& mask,
+    const at::Tensor& dst_indices);
+void inkling_draft_extend_sconv_cache(
+    const at::Tensor& hidden_states,
+    at::Tensor& sconv_cache,
+    const at::Tensor& cache_indices,
+    const at::Tensor& num_accepted_tokens,
+    int64_t draft_token_num,
+    bool do_tracking,
+    const std::optional<at::Tensor>& crossed,
+    const std::optional<at::Tensor>& track_step,
+    const std::optional<at::Tensor>& mamba_track_indices);
+std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor> inkling_fused_decode_sconv_metadata(
+    int64_t B,
+    const at::Tensor& cache_indices,
+    const std::optional<at::Tensor>& query_start_loc_out,
+    const std::optional<at::Tensor>& has_initial_state_out,
+    const std::optional<at::Tensor>& cache_mask_out,
+    const std::optional<at::Tensor>& safe_idx_out,
+    const std::optional<at::Tensor>& cu_out,
+    const std::optional<at::Tensor>& si_out);
+std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor> inkling_fused_extend_sconv_metadata(
+    int64_t B,
+    int64_t T,
+    const at::Tensor& cache_indices,
+    int64_t his_mode,
+    const std::optional<at::Tensor>& extend_seq_lens,
+    const std::optional<at::Tensor>& his_src,
+    int64_t draft_token_num,
+    const std::optional<at::Tensor>& query_start_loc_out,
+    const std::optional<at::Tensor>& has_initial_state_out,
+    const std::optional<at::Tensor>& cache_mask_out,
+    const std::optional<at::Tensor>& safe_idx_out,
+    const std::optional<at::Tensor>& cu_out,
+    const std::optional<at::Tensor>& si_out);
+at::Tensor inkling_track_conv_indices(
+    const at::Tensor& query_start_loc,
+    const at::Tensor& mamba_track_seqlens,
+    const at::Tensor& extend_prefix_lens,
+    int64_t width_minus_one,
+    int64_t chunk_size,
+    int64_t total_tokens);
+void inkling_save_intermediate_conv_windows(
+    const at::Tensor& sconv_cache,
+    const at::Tensor& hidden_states,
+    const at::Tensor& cache_indices,
+    at::Tensor& intermediate_out,
+    int64_t batch_size,
+    int64_t draft_token_num);
+/*
+ * Inkling fused attention prologue family.
+ */
+std::tuple<at::Tensor, at::Tensor, at::Tensor> inkling_attn_prologue_verify(
+    const at::Tensor& qkvr,
+    const at::Tensor& k_cache,
+    const at::Tensor& v_cache,
+    const at::Tensor& cache_indices,
+    const at::Tensor& cache_mask,
+    const at::Tensor& k_weight,
+    const at::Tensor& v_weight,
+    at::Tensor& k_inter,
+    at::Tensor& v_inter,
+    const at::Tensor& q_gamma,
+    const at::Tensor& k_gamma,
+    double eps,
+    const at::Tensor& loc,
+    at::Tensor& k_buf,
+    at::Tensor& v_buf,
+    int64_t q_off,
+    int64_t k_off,
+    int64_t v_off,
+    int64_t dq,
+    int64_t dkv,
+    int64_t draft_token_num,
+    bool silu_activation,
+    bool use_residual,
+    bool do_store);
+std::tuple<at::Tensor, at::Tensor, at::Tensor> inkling_attn_prologue_decode(
+    const at::Tensor& qkvr,
+    at::Tensor& k_cache,
+    at::Tensor& v_cache,
+    const at::Tensor& cache_indices,
+    const at::Tensor& cache_mask,
+    const at::Tensor& k_weight,
+    const at::Tensor& v_weight,
+    const std::optional<at::Tensor>& track_mask,
+    const std::optional<at::Tensor>& track_indices,
+    const at::Tensor& q_gamma,
+    const at::Tensor& k_gamma,
+    double eps,
+    const at::Tensor& loc,
+    at::Tensor& k_buf,
+    at::Tensor& v_buf,
+    int64_t q_off,
+    int64_t k_off,
+    int64_t v_off,
+    int64_t dq,
+    int64_t dkv,
+    bool silu_activation,
+    bool use_residual,
+    bool do_store);
+std::tuple<at::Tensor, at::Tensor, at::Tensor> inkling_attn_prologue_extend(
+    const at::Tensor& qkvr,
+    at::Tensor& k_cache,
+    at::Tensor& v_cache,
+    const at::Tensor& cache_indices,
+    const at::Tensor& cache_mask,
+    const at::Tensor& has_initial_state,
+    const at::Tensor& cu,
+    const at::Tensor& si,
+    const at::Tensor& k_weight,
+    const at::Tensor& v_weight,
+    const std::optional<at::Tensor>& track_rows,
+    const std::optional<at::Tensor>& track_mask,
+    const std::optional<at::Tensor>& track_dst,
+    const at::Tensor& q_gamma,
+    const at::Tensor& k_gamma,
+    double eps,
+    const at::Tensor& loc,
+    at::Tensor& k_buf,
+    at::Tensor& v_buf,
+    int64_t q_off,
+    int64_t k_off,
+    int64_t v_off,
+    int64_t dq,
+    int64_t dkv,
+    bool silu_activation,
+    bool use_residual,
+    bool do_store,
+    bool do_cache_update);
+
+/*
+ * From csrc/gemm
+ */
+torch::Tensor awq_dequantize(torch::Tensor qweight, torch::Tensor scales, torch::Tensor qzeros);
+void cutlass_scaled_fp4_mm(
+    torch::Tensor& D,
+    torch::Tensor const& A,
+    torch::Tensor const& B,
+    torch::Tensor const& A_sf,
+    torch::Tensor const& B_sf,
+    torch::Tensor const& alpha);
+torch::Tensor int8_scaled_mm(
+    const torch::Tensor& mat_a,
+    const torch::Tensor& mat_b,
+    const torch::Tensor& scales_a,
+    const torch::Tensor& scales_b,
+    const torch::Dtype& out_dtype,
+    const c10::optional<torch::Tensor>& bias);
+torch::Tensor fp8_blockwise_scaled_mm(
+    const torch::Tensor& mat_a,
+    const torch::Tensor& mat_b,
+    const torch::Tensor& scales_a,
+    const torch::Tensor& scales_b,
+    const torch::Dtype& out_dtype);
+void scaled_fp4_quant(
+    torch::Tensor& output, torch::Tensor const& input, torch::Tensor& output_scale, torch::Tensor const& input_scale);
+void sgl_per_tensor_quant_fp8(at::Tensor input, at::Tensor output_q, at::Tensor output_s, bool is_static);
+void sgl_per_token_quant_fp8(at::Tensor input, at::Tensor output_q, at::Tensor output_s);
+void fused_q_indexer_rope_hadamard_quant(
+    const at::Tensor& q_input,
+    at::Tensor& q_fp8,
+    const at::Tensor& weight,
+    at::Tensor& weights_out,
+    double weight_scale,
+    const at::Tensor& rope_cache,
+    const at::Tensor& positions);
+void bmm_fp8(
+    at::Tensor A,
+    at::Tensor B,
+    at::Tensor D,
+    at::Tensor A_scale,
+    at::Tensor B_scale,
+    at::Tensor workspace_buffer,
+    int64_t cublas_handle,
+    int64_t sycl_stream);
+
+/*
+ * From csrc/nsa (Native Sparse Attention)
+ */
+// fp8_mqa_logits (prefill) is implemented in pure Python via sgl_kernel.nsa.
+
+torch::Tensor fp8_paged_mqa_logits(
+    const torch::Tensor& q_fp8,
+    const torch::Tensor& kv_cache,
+    const torch::Tensor& weights,
+    const torch::Tensor& seq_lens,
+    const torch::Tensor& block_tables,
+    const std::optional<torch::Tensor>& schedule_metadata,
+    int64_t max_seq_len,
+    bool clean_logits);
+
+/*
+ * From csrc/moe
+ */
+void moe_align_block_size(
+    torch::Tensor topk_ids,
+    int64_t num_experts,
+    int64_t block_size,
+    torch::Tensor sorted_token_ids,
+    torch::Tensor experts_ids,
+    torch::Tensor num_tokens_post_pad,
+    torch::Tensor cumsum_buffer,
+    bool pad_sorted_token_ids);
+
+void moe_sum(torch::Tensor& input, torch::Tensor& output);
+
+void moe_sum_reduce(at::Tensor& input, at::Tensor& output, double routed_scaling_factor);
+
+void topk_softmax(
+    torch::Tensor& topk_weights,
+    torch::Tensor& topk_indices,
+    torch::Tensor& token_expert_indices,
+    torch::Tensor& gating_output);
+void topk_sigmoid(
+    torch::Tensor& topk_weights,
+    torch::Tensor& topk_indices,
+    torch::Tensor& gating_output,
+    bool renormalize,
+    const std::optional<torch::Tensor>& correction_bias,
+    double routed_scaling_factor = 1.0,
+    int64_t num_fused_shared_experts = 0);
+torch::Tensor swiglu_gpt_oss_sigmoid_alpha(torch::Tensor x, double alpha, double limit);
+
+std::vector<at::Tensor> moe_fused_gate(
+    at::Tensor& input,
+    const std::optional<at::Tensor>& bias,
+    int64_t num_expert_group,
+    int64_t topk_group,
+    int64_t topk,
+    int64_t num_fused_shared_experts,
+    int64_t scoring_func,
+    bool renormalize,
+    double routed_scaling_factor,
+    bool apply_routed_scaling_factor_on_output);
+
+void fp8_blockwise_scaled_grouped_mm(
+    torch::Tensor& output,
+    torch::Tensor& a_ptrs,
+    torch::Tensor& b_ptrs,
+    torch::Tensor& out_ptrs,
+    torch::Tensor& a_scales_ptrs,
+    torch::Tensor& b_scales_ptrs,
+    const torch::Tensor& a,
+    const torch::Tensor& b,
+    const torch::Tensor& scales_a,
+    const torch::Tensor& scales_b,
+    const torch::Tensor& stride_a,
+    const torch::Tensor& stride_b,
+    const torch::Tensor& stride_c,
+    const torch::Tensor& layout_sfa,
+    const torch::Tensor& layout_sfb,
+    const torch::Tensor& problem_sizes,
+    const torch::Tensor& expert_offsets,
+    const torch::Tensor& workspace);
+
+// Xe3 (CRI) blockwise-scaled MXFP4 grouped GEMM for MoE.
+void mxfp4_blockwise_scaled_grouped_mm(
+    torch::Tensor& output,
+    torch::Tensor& a_ptrs,
+    torch::Tensor& b_ptrs,
+    torch::Tensor& out_ptrs,
+    torch::Tensor& a_scales_ptrs,
+    torch::Tensor& b_scales_ptrs,
+    const torch::Tensor& a,
+    const torch::Tensor& b,
+    const torch::Tensor& scales_a,
+    const torch::Tensor& scales_b,
+    const torch::Tensor& problem_sizes,
+    const torch::Tensor& expert_offsets,
+    const torch::Tensor& workspace);
+
+void moe_grouped_mm_nt_xe20(
+    torch::Tensor& output,
+    const torch::Tensor& activations,
+    const torch::Tensor& weights,
+    const std::optional<at::Tensor>& bias,
+    const torch::Tensor& total_rows_for_experts,
+    const int64_t n_experts,
+    const int64_t activation_type = 0,  // 0=silu, 1=gelu, 2=swiglu
+    bool fuse_act = false,
+    double gemm1_alpha = 1.702,
+    double gemm1_limit = 7.0);
+
+// Unified int4/mxfp4 W4A16 MoE grouped GEMM.
+// `packed_weights` is int8 or uint8 [E, N, K/2] with two 4-bit values per byte.
+// `scales` is [E, N, K/group_size], N-outer: activation-dtype direct
+// multiplier for int4, or an E8M0 exponent represented as uint8 or
+// float8_e8m0fnu for mxfp4 (decoded in registers). `zeros` is an optional
+// [E, N, K/group_size] activation-dtype tensor (int4-only) holding the
+// raw per-group zero-point in code units; when supplied, weights dequant as
+// `(code - zp) * scale` instead of requiring the zero-point to be pre-folded
+// into a signed 4-bit code (which overflows for non-symmetric zero-points).
+// `rows_per_expert` holds the per-expert row counts. group_size must be
+// 32/64/128/256. The caller runs the activation between GEMM1 and GEMM2.
+void moe_grouped_mm_nt_xe20_w4a16(
+    torch::Tensor& output,
+    const torch::Tensor& activations,
+    const torch::Tensor& packed_weights,
+    const torch::Tensor& scales,
+    const std::optional<at::Tensor>& zeros,
+    const std::optional<at::Tensor>& bias,
+    const torch::Tensor& rows_per_expert,
+    const int64_t n_experts,
+    bool is_int4,
+    const int64_t group_size);
+
+// W8A16 grouped GEMM. Activations are BF16, weights are 8-bit (FP8 E4M3),
+// and weight_scales is 1D [E] / 2D [E, 1] / [E, 2] for float32 per-expert scalar scales,
+// 3D [E, ceil(N/128), K/128] for 128x128 float32 block scales, or
+// 3D [E, N, K/32] uint8/float8_e8m0fnu for MXFP8 (1x32 UE8M0) block scales.
+void moe_grouped_mm_nt_xe20_w8a16(
+    torch::Tensor& output,
+    const torch::Tensor& activations,
+    const torch::Tensor& weights,
+    const torch::Tensor& weight_scales,
+    const std::optional<at::Tensor>& bias,
+    const torch::Tensor& total_rows_for_experts,
+    const int64_t n_experts);
+
+// Xe3 (CRI) plain bf16 grouped GEMM, tile heuristics tuned for Xe3.
+void moe_grouped_mm_nt_xe35(
+    torch::Tensor& output,
+    const torch::Tensor& activations,
+    const torch::Tensor& weights,
+    const std::optional<at::Tensor>& bias,
+    const torch::Tensor& total_rows_for_experts,
+    const int64_t n_experts,
+    const int64_t activation_type = 0,  // 0=silu, 1=gelu, 2=swiglu
+    bool fuse_act = false,
+    double gemm1_alpha = 1.702,
+    double gemm1_limit = 7.0);
+
+// Xe3 (CRI) tile-fused MXFP4-B x BF16-A W4A16 grouped GEMM.
+void moe_grouped_mm_nt_xe35_mxfp4_w4a16(
+    torch::Tensor& output,
+    const torch::Tensor& activations,
+    const torch::Tensor& packed_weights,
+    const torch::Tensor& scales,
+    const std::optional<at::Tensor>& bias,
+    const torch::Tensor& total_rows_for_experts,
+    const int64_t n_experts,
+    const int64_t activation_type = 0,
+    bool fuse_act = false,
+    double gemm1_alpha = 1.702,
+    double gemm1_limit = 7.0);
+
+void prepare_moe_input(
+    const torch::Tensor& topk_ids,
+    torch::Tensor& expert_offsets,
+    const std::optional<torch::Tensor>& blockscale_offsets,
+    torch::Tensor& problem_sizes1,
+    torch::Tensor& problem_sizes2,
+    torch::Tensor& input_permutation,
+    torch::Tensor& output_permutation,
+    const int64_t num_experts,
+    const int64_t n,
+    const int64_t k);
+
+void prepare_moe_input_small(
+    const torch::Tensor& input,
+    const torch::Tensor& topk_ids,
+    torch::Tensor& expert_counts,
+    torch::Tensor& output_permutation,
+    torch::Tensor& output);
+
+void ep_moe_pre_reorder(
+    torch::Tensor input,
+    torch::Tensor gateup_input,
+    torch::Tensor src2dst,
+    torch::Tensor topk_ids,
+    torch::Tensor a1_scales,
+    int64_t start_expert_id,
+    int64_t end_expert_id,
+    int64_t topk,
+    bool use_per_token_if_dynamic);
+
+void ep_moe_silu_and_mul(
+    torch::Tensor gateup_output,
+    torch::Tensor down_input,
+    torch::Tensor reorder_topk_ids,
+    torch::Tensor scales,
+    int64_t start_expert_id,
+    int64_t end_expert_id);
+
+void ep_moe_post_reorder(
+    torch::Tensor down_output,
+    torch::Tensor output,
+    torch::Tensor src2dst,
+    torch::Tensor topk_ids,
+    torch::Tensor topk_weights,
+    int64_t start_expert_id,
+    int64_t end_expert_id,
+    int64_t topk);
+
+void scatter_tokens_to_experts(
+    const torch::Tensor& input_tensor, const torch::Tensor& src2dst_map, torch::Tensor& output_tensor);
+
+void apply_shuffle_mul_sum(
+    const torch::Tensor& input,
+    torch::Tensor& output,
+    const torch::Tensor& permutation,
+    double routed_scaling_factor,
+    const std::optional<torch::Tensor>& factors);
+
+void cutlass_fp4_group_mm(
+    torch::Tensor& output,
+    const torch::Tensor& a,
+    const torch::Tensor& b,
+    const torch::Tensor& a_blockscale,
+    const torch::Tensor& b_blockscales,
+    const torch::Tensor& alphas,
+    const torch::Tensor& ab_strides,
+    const torch::Tensor& c_strides,
+    const torch::Tensor& problem_sizes,
+    const torch::Tensor& expert_offsets,
+    const torch::Tensor& sf_offsets);
+
+void scaled_fp4_experts_quant(
+    torch::Tensor& output,
+    torch::Tensor& output_scale,
+    torch::Tensor const& input,
+    torch::Tensor const& input_global_scale,
+    torch::Tensor const& input_offset_by_experts,
+    torch::Tensor const& output_scale_offset_by_experts);
+
+void hc_split_sinkhorn(
+    const at::Tensor& mixes,
+    const at::Tensor& hc_scale,
+    const at::Tensor& hc_base,
+    at::Tensor& pre,
+    at::Tensor& post,
+    at::Tensor& comb,
+    int64_t hc_mult,
+    int64_t sinkhorn_iters,
+    double eps);
+
+at::Tensor fused_hc_head(
+    const at::Tensor& x,
+    const at::Tensor& hc_fn,
+    const at::Tensor& hc_scale,
+    const at::Tensor& hc_base,
+    double norm_eps,
+    double hc_eps);
+
+void hc_pre_big_fuse(
+    const at::Tensor& gemm_out_mul,
+    const at::Tensor& gemm_out_sqrsum,
+    const at::Tensor& hc_scale,
+    const at::Tensor& hc_base,
+    const at::Tensor& residual_flat,
+    at::Tensor& post_mix,
+    at::Tensor& comb_mix,
+    at::Tensor& layer_input,
+    int64_t hc_mult,
+    int64_t sinkhorn_iters,
+    int64_t n_splits,
+    double rms_eps,
+    double hc_pre_eps,
+    double hc_sinkhorn_eps,
+    double hc_post_mult_value,
+    std::optional<at::Tensor> norm_weight = std::nullopt,
+    std::optional<double> norm_eps = std::nullopt);
+
+/*
+ * hc_post
+ */
+void hc_post(
+    const at::Tensor& x,
+    const at::Tensor& residual,
+    const at::Tensor& post_layer_mix,
+    const at::Tensor& comb_res_mix,
+    at::Tensor& out);
+
+/*
+ * hc_pre GEMM + row-wise square sum
+ */
+void hc_pre_gemm_sqr_sum(at::Tensor& C, at::Tensor& sqr_sum, const at::Tensor& A, const at::Tensor& B);
+
+std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> mhc_fused_post_pre(
+    const at::Tensor& x,
+    const at::Tensor& residual,
+    const at::Tensor& post_layer_mix,
+    const at::Tensor& comb_res_mix,
+    const at::Tensor& fn,
+    const at::Tensor& hc_scale,
+    const at::Tensor& hc_base,
+    double rms_eps = 1e-6,
+    double hc_pre_eps = 1e-6,
+    double hc_sinkhorn_eps = 1e-6,
+    double hc_post_mult_value = 2.0,
+    int64_t sinkhorn_repeat = 20,
+    int64_t n_splits = 0,
+    std::optional<at::Tensor> norm_weight = std::nullopt,
+    std::optional<double> norm_eps = std::nullopt);
+
+/*
+ * From csrc/speculative
+ */
+void tree_speculative_sampling_target_only(
+    at::Tensor predicts,          // mutable
+    at::Tensor accept_index,      // mutable
+    at::Tensor accept_token_num,  // mutable
+    at::Tensor candidates,
+    at::Tensor retrive_index,
+    at::Tensor retrive_next_token,
+    at::Tensor retrive_next_sibling,
+    at::Tensor uniform_samples,
+    at::Tensor target_probs,
+    at::Tensor draft_probs,
+    double threshold_single = 1,
+    double threshold_acc = 1,
+    bool deterministic = true,
+    int64_t sycl_stream = 0);
+
+void verify_tree_greedy(
+    at::Tensor& predicts,
+    at::Tensor& accept_index,
+    at::Tensor& accept_token_num,
+    const at::Tensor& candidates,
+    const at::Tensor& retrive_index,
+    const at::Tensor& retrive_next_token,
+    const at::Tensor& retrive_next_sibling,
+    const at::Tensor& target_predict);
+
+void build_tree_kernel_efficient(
+    const at::Tensor& parent_list,
+    const at::Tensor& selected_index,
+    const at::Tensor& verified_seq_len,
+    at::Tensor& tree_mask,
+    at::Tensor& positions,
+    at::Tensor& retrive_index,
+    at::Tensor& retrive_next_token,
+    at::Tensor& retrive_next_sibling,
+    int64_t topk,
+    int64_t depth,
+    int64_t draft_token_num,
+    int64_t tree_mask_mode = 0);
+
+void reconstruct_indices_from_tree_mask(
+    const at::Tensor& tree_mask,
+    const at::Tensor& verified_seq_len,
+    at::Tensor& positions,
+    at::Tensor& retrive_index,
+    at::Tensor& retrive_next_token,
+    at::Tensor& retrive_next_sibling,
+    int64_t batch_size,
+    int64_t draft_token_num);
+
+void segment_packbits(
+    at::Tensor x, at::Tensor input_indptr, at::Tensor output_indptr, at::Tensor y, int64_t sycl_stream);
+
+/*
+ * From FlashInfer
+ */
+void min_p_sampling_from_probs(
+    const at::Tensor& probs,
+    at::Tensor& output,
+    const std::optional<at::Tensor>& maybe_indices,
+    const std::optional<at::Tensor>& maybe_min_p_arr,
+    double min_p_val,
+    bool deterministic,
+    const std::optional<at::Generator>& gen);
+
+void top_k_renorm_probs(
+    const at::Tensor& probs,
+    at::Tensor& renorm_probs,
+    const std::optional<at::Tensor>& maybe_top_k_arr,
+    int64_t top_k_val);
+
+void top_p_renorm_probs(
+    const at::Tensor& probs,
+    at::Tensor& renorm_probs,
+    const std::optional<at::Tensor>& maybe_top_p_arr,
+    double top_p_val);
+
+void top_k_top_p_sampling_from_probs(
+    at::Tensor probs,
+    at::Tensor output,
+    std::optional<at::Tensor> maybe_indices,
+    std::optional<at::Tensor> maybe_top_k_arr,
+    int64_t top_k_val,
+    std::optional<at::Tensor> maybe_top_p_arr,
+    double top_p_val,
+    bool deterministic,
+    std::optional<at::Generator> gen);
+
+void top_p_sampling_from_probs(
+    at::Tensor probs,
+    at::Tensor output,
+    std::optional<at::Tensor> maybe_indices,
+    std::optional<at::Tensor> maybe_top_p_arr,
+    double top_p_val,
+    bool deterministic,
+    std::optional<at::Generator> gen);
+
+at::Tensor
+fast_topk(const at::Tensor& score, const at::Tensor& lengths, int64_t topk, std::optional<at::Tensor> row_starts_opt);
+
+at::Tensor qsa_sparse_attention(
+    const at::Tensor& q,
+    const at::Tensor& k_cache,
+    const at::Tensor& v_cache,
+    const at::Tensor& token_slots,
+    std::optional<double> softmax_scale);
+
+at::Tensor qsa_mqa_prefill(
+    const at::Tensor& q,
+    const at::Tensor& k,
+    const at::Tensor& row_starts,
+    const at::Tensor& row_ends,
+    std::optional<double> score_scale);
+
+at::Tensor qsa_mqa_decode(
+    const at::Tensor& q,
+    const at::Tensor& k_cache,
+    const at::Tensor& page_table,
+    const at::Tensor& context_lens,
+    int64_t max_model_len,
+    std::optional<double> score_scale);
+
+at::Tensor fast_topk_transform_fused(
+    const at::Tensor& score,
+    const at::Tensor& lengths,
+    const at::Tensor& src_page_table,
+    const at::Tensor& cu_seqlens_q,
+    int64_t topk,
+    std::optional<at::Tensor> row_starts_opt);
+
+at::Tensor fast_topk_transform_ragged_fused(
+    const at::Tensor& score,
+    const at::Tensor& lengths,
+    const at::Tensor& topk_indices_offset,
+    int64_t topk,
+    std::optional<at::Tensor> row_starts_opt);
+
+void topk_transform(
+    const at::Tensor& scores,
+    const at::Tensor& seq_lens,
+    const at::Tensor& page_tables,
+    at::Tensor& out_page_indices,
+    int64_t page_size,
+    std::optional<at::Tensor> out_raw_indices_opt);
+
+void topk_transform_paged(
+    const at::Tensor& scores,
+    const at::Tensor& seq_lens,
+    std::optional<at::Tensor> page_tables_opt,
+    at::Tensor& out_page_indices,
+    int64_t page_size,
+    const at::Tensor& metadata);
+
+void topk_transform_ragged(
+    const at::Tensor& scores,
+    const at::Tensor& seq_lens,
+    at::Tensor& out_indices,
+    const at::Tensor& out_offsets,
+    std::optional<at::Tensor> row_starts_opt);
+
+/*
+ * Compress plan and execution kernels
+ */
+namespace at::native::xpu {
+
+std::tuple<torch::Tensor, torch::Tensor> plan_compress_prefill(
+    torch::Tensor req_pool_indices,
+    torch::Tensor req_to_token,
+    torch::Tensor full_to_state,
+    torch::Tensor seq_lens,
+    torch::Tensor extend_lens,
+    torch::Tensor pin_buffer,
+    int64_t num_q_tokens,
+    int64_t compress_ratio,
+    int64_t swa_page_size,
+    int64_t ring_size,
+    bool use_cuda_graph);
+
+torch::Tensor plan_compress_decode(
+    torch::Tensor req_pool_indices,
+    torch::Tensor req_to_token,
+    torch::Tensor full_to_state,
+    torch::Tensor seq_lens,
+    int64_t compress_ratio,
+    int64_t swa_page_size,
+    int64_t ring_size);
+
+void flash_compress128_decode(
+    torch::Tensor kv_buffer, torch::Tensor kv_input, torch::Tensor kv_output, torch::Tensor ape, torch::Tensor plan_d);
+
+void flash_compress128_prefill(
+    torch::Tensor kv_buffer,
+    torch::Tensor kv_input,
+    torch::Tensor kv_output,
+    torch::Tensor ape,
+    torch::Tensor plan_c,
+    torch::Tensor plan_w);
+
+void flash_compress4_decode(
+    torch::Tensor kv_buffer, torch::Tensor kv_input, torch::Tensor kv_output, torch::Tensor ape, torch::Tensor plan_d);
+
+void flash_compress4_prefill(
+    torch::Tensor kv_buffer,
+    torch::Tensor kv_input,
+    torch::Tensor kv_output,
+    torch::Tensor ape,
+    torch::Tensor plan_c,
+    torch::Tensor plan_w);
+
+void fused_norm_rope_store(
+    torch::Tensor input,
+    torch::Tensor plan,
+    torch::Tensor norm_weight,
+    double norm_eps,
+    torch::Tensor freq_cis,
+    torch::Tensor out_loc,
+    torch::Tensor kvcache,
+    bool is_decode,
+    int64_t compress_ratio,
+    int64_t page_size,
+    bool use_fp4,
+    int64_t preshuffle_size,
+    bool use_bf16_store);
+
+}  // namespace at::native::xpu
+
+namespace flash {
+/*
+ * From fa2 sparse
+ */
+std::vector<at::Tensor> mha_fwd_sparse(
+    at::Tensor& q,        // batch_size x seqlen_q x num_heads x head_size
+    const at::Tensor& k,  // batch_size x seqlen_k x num_heads_k x head_size
+    const at::Tensor& v,  // batch_size x seqlen_k x num_heads_k x head_size
+    const at::Tensor& block_count,
+    const at::Tensor& block_offset,
+    const at::Tensor& column_count,
+    const at::Tensor& column_index,
+    const std::optional<at::Tensor>& out_,           // batch_size x seqlen_q x num_heads x head_size
+    const std::optional<at::Tensor>& alibi_slopes_,  // num_heads or batch_size x num_heads
+    const double p_dropout,
+    const double softmax_scale,
+    bool is_causal,
+    const double softcap,
+    const bool return_softmax,
+    std::optional<at::Generator> gen_);
+
+std::vector<at::Tensor> mha_varlen_fwd_sparse(
+    at::Tensor& q,        // total_q x num_heads x head_size, total_q := \sum_{i=0}^{b} s_i
+    const at::Tensor& k,  // total_k x num_heads_k x head_size, total_k := \sum_{i=0}^{b} s_i.
+    const at::Tensor& v,  // total_k x num_heads_k x head_size, total_k := \sum_{i=0}^{b} s_i.
+    const at::Tensor& block_count,
+    const at::Tensor& block_offset,
+    const at::Tensor& column_count,
+    const at::Tensor& column_index,
+    const c10::optional<at::Tensor>& out_,  // total_q x num_heads x head_size, total_k := \sum_{i=0}^{b} s_i
+    const at::Tensor& cu_seqlens_q,         // b+1
+    const at::Tensor& cu_seqlens_k,         // b+1
+    const c10::optional<at::Tensor>&
+        seqused_k,  // b. If given, only this many elements of each batch element's keys are used.
+    const c10::optional<at::Tensor>& alibi_slopes_,  // num_heads or b x num_heads
+    int64_t max_seqlen_q,
+    const int64_t max_seqlen_k,
+    const double p_dropout,
+    const double softmax_scale,
+    const bool zero_tensors,
+    bool is_causal,
+    const double softcap,
+    const bool return_softmax,
+    c10::optional<at::Generator> gen_);
+}  // namespace flash
+
+void convert_vertical_slash_indexes(
+    torch::Tensor& block_count,      // [BATCH, N_HEADS, NUM_ROWS]
+    torch::Tensor& block_offset,     // [BATCH, N_HEADS, NUM_ROWS, NNZ_S]
+    torch::Tensor& column_count,     // [BATCH, N_HEADS, NUM_ROWS]
+    torch::Tensor& column_index,     // [BATCH, N_HEADS, NUM_ROWS, NNZ_V]
+    torch::Tensor q_seqlens,         // [BATCH, ]
+    torch::Tensor kv_seqlens,        // [BATCH, ]
+    torch::Tensor vertical_indexes,  // [BATCH, N_HEADS, NNZ_V]
+    torch::Tensor slash_indexes,     // [BATCH, N_HEADS, NNZ_S]
+    int64_t context_size,
+    int64_t block_size_M,
+    int64_t block_size_N,
+    bool causal);
+
+void convert_vertical_slash_indexes_mergehead(
+    torch::Tensor& block_count,            // [BATCH, N_HEADS, NUM_ROWS]
+    torch::Tensor& block_offset,           // [BATCH, N_HEADS, NUM_ROWS, NNZ_S]
+    torch::Tensor& column_count,           // [BATCH, N_HEADS, NUM_ROWS]
+    torch::Tensor& column_index,           // [BATCH, N_HEADS, NUM_ROWS, NNZ_V]
+    torch::Tensor q_seqlens,               // [BATCH, ]
+    torch::Tensor kv_seqlens,              // [BATCH, ]
+    torch::Tensor vertical_indexes,        // [BATCH, N_HEADS, NNZ_V]
+    torch::Tensor slash_indexes,           // [BATCH, N_HEADS, NNZ_S]
+    torch::Tensor vertical_indices_count,  // [N_HEADS, ]
+    torch::Tensor slash_indices_count,
+    int64_t context_size,
+    int64_t block_size_M,
+    int64_t block_size_N,
+    bool causal);
+
+/*
+ * From XGrammar
+ */
+void ApplyTokenBitmaskInplace(at::Tensor logits, at::Tensor bitmask, at::optional<at::Tensor> indices = at::nullopt);
+
+/*
+ * From QServe
+ */
+void qserve_w4a8_per_chn_gemm(
+    const torch::Tensor& _in_feats,
+    const torch::Tensor& _kernel,
+    const torch::Tensor& _wscales,
+    const torch::Tensor& _ascales,
+    const torch::Tensor& _w_szs,
+    const torch::Tensor& _a_ssums,
+    torch::Tensor& _out_feats);
+
+void qserve_w4a8_per_group_gemm(
+    const torch::Tensor& _in_feats,
+    const torch::Tensor& _kernel,
+    const torch::Tensor& _zeros,
+    const torch::Tensor& _scales_i8,
+    const torch::Tensor& _wscales,
+    const torch::Tensor& _ascales,
+    torch::Tensor& _out_feats);
+
+std::tuple<int64_t, int64_t> query_device(int64_t device_index = -1);
+
+/*
+ * From LoRA
+ */
+void embedding_lora_a_fwd(
+    torch::Tensor& output,           // [num_tokens, max_rank]
+    const torch::Tensor& input_ids,  // [num_tokens,]
+    const torch::Tensor& weights,    // [num_loras, max_rank, vocab_size]
+    const int64_t vocab_size,
+    const torch::Tensor& seg_indptr,                       // [num_segments + 1,]
+    const torch::Tensor& weight_indices,                   // [num_segments,]
+    const torch::Tensor& lora_ranks,                       // [num_loras,]
+    const std::optional<torch::Tensor>& extra_embeddings,  // [num_loras, num_extra_tokens, max_rank]
+    const std::optional<torch::Tensor>& seg_lens           // [num_segments,]
+);
+
+void sgemm_lora_a_fwd(
+    torch::Tensor& output,         // [num_tokens, stacknum*max_rank]
+    const torch::Tensor& input_x,  // [num_tokens, input_dim]
+    const torch::Tensor& weights,  // [num_loras, stack_num*max_rank, input_dim]
+    const int64_t stack_num,
+    const torch::Tensor& seg_indptr,              // [num_segments + 1,]
+    const torch::Tensor& weight_indices,          // [num_segments,]
+    const torch::Tensor& lora_ranks,              // [num_loras,]
+    const std::optional<torch::Tensor>& seg_lens  // [num_segments,]
+);
+
+void sgemm_lora_b_fwd(
+    torch::Tensor& output,                           // [num_tokens, output_dim]
+    const torch::Tensor& input_x,                    // [num_tokens, max_rank]
+    const torch::Tensor& weights,                    // [num_loras, output_dim, max_rank]
+    const torch::Tensor& seg_indptr,                 // [num_segments + 1,]
+    const torch::Tensor& weight_indices,             // [num_segments,]
+    const torch::Tensor& lora_ranks,                 // [num_loras,]
+    const torch::Tensor& scalings,                   // [num_loras,]
+    const std::optional<torch::Tensor>& seg_lens,    // [num_segments,]
+    const std::optional<torch::Tensor>& base_output  // [num_tokens, output_dim]
+);
+
+void qkv_lora_b_fwd(
+    torch::Tensor& output,                           // [num_tokens, N_Q + 2N_{KV}]
+    const torch::Tensor& input_x,                    // [num_tokens, 3*max_rank]
+    const torch::Tensor& qkv_lora_b,                 // [num_loras, N_Q + 2N_{KV}, max_rank]
+    const torch::Tensor& output_offset,              // [4,]
+    const int64_t max_qkv_out_dim,                   // max(output_q_dim, output_kv_dim)
+    const torch::Tensor& seg_indptr,                 // [num_segments + 1,]
+    const torch::Tensor& weight_indices,             // [num_segments,]
+    const torch::Tensor& lora_ranks,                 // [num_loras,]
+    const torch::Tensor& scalings,                   // [num_loras,]
+    const std::optional<torch::Tensor>& seg_lens,    // [num_segments,]
+    const std::optional<torch::Tensor>& base_output  // [num_tokens, N_Q + 2N_{KV}]
+);
+
+void gate_up_lora_b_fwd(
+    torch::Tensor& output,                           // [num_tokens, 2*N]
+    const torch::Tensor& input_x,                    // [num_tokens, 2*max_rank]
+    const torch::Tensor& gate_up_lora_b,             // [num_loras, 2*N, max_rank]
+    const int64_t output_dim,                        // N
+    const torch::Tensor& seg_indptr,                 // [num_segments + 1,]
+    const torch::Tensor& weight_indices,             // [num_segments,]
+    const torch::Tensor& lora_ranks,                 // [num_loras,]
+    const torch::Tensor& scalings,                   // [num_loras,]
+    const std::optional<torch::Tensor>& seg_lens,    // [num_segments,]
+    const std::optional<torch::Tensor>& base_output  // [num_tokens, 2*N]
+);
+
+void chunked_sgmv_lora_shrink_fwd(
+    torch::Tensor& output,         // [num_tokens, num_slices*max_rank]
+    const torch::Tensor& x,        // [num_tokens, input_dim]
+    const torch::Tensor& weights,  // [num_loras, num_slices*max_rank, input_dim]
+    const int64_t num_slices,      // stacked projections (qkv=3, gate_up=2, else 1)
+    const int64_t num_segments,
+    const torch::Tensor& seg_indptr,                 // [num_segments + 1,]
+    const torch::Tensor& weight_indices,             // [num_segments,]
+    const torch::Tensor& lora_ranks,                 // [num_loras,]
+    const std::optional<torch::Tensor>& permutation  // [num_tokens,] logical -> physical (optional)
+);
+
+void chunked_sgmv_lora_expand_fwd(
+    torch::Tensor& output,               // [num_tokens, N_total]
+    const torch::Tensor& x,              // [num_tokens, num_slices*max_rank]
+    const torch::Tensor& weights,        // [num_loras, N_total, max_rank]
+    const torch::Tensor& slice_offsets,  // [num_slices + 1,]
+    const int64_t max_slice_size,        // max per-slice output width
+    const int64_t num_slices,            // stacked projections (qkv=3, gate_up=2, else 1)
+    const int64_t num_segments,
+    const torch::Tensor& seg_indptr,                  // [num_segments + 1,]
+    const torch::Tensor& weight_indices,              // [num_segments,]
+    const torch::Tensor& lora_ranks,                  // [num_loras,]
+    const torch::Tensor& scalings,                    // [num_loras,]
+    const std::optional<torch::Tensor>& permutation,  // [num_tokens,] logical -> physical (optional)
+    const std::optional<torch::Tensor>& base_output   // [num_tokens, N_total] optional residual
+);
+
+/*
+ * From GDN (Gated DeltaNet) attention
+ */
+void gdn_attention(
+    torch::Tensor& core_attn_out,
+    torch::Tensor& z,
+    const torch::Tensor& projected_states_qkvz,
+    const torch::Tensor& projected_states_ba,
+    const int64_t num_k_heads,
+    const int64_t num_v_heads,
+    const int64_t head_k_dim,
+    const int64_t head_v_dim,
+    torch::Tensor& conv_state,
+    torch::Tensor& ssm_state,
+    const torch::Tensor& conv_weights,
+    const std::optional<torch::Tensor>& conv_bias,
+    const std::string& activation,
+    const torch::Tensor& A_log,
+    const torch::Tensor& dt_bias,
+    const int64_t num_prefills,
+    const int64_t num_decodes,
+    const int64_t num_spec_decodes,
+    const std::optional<torch::Tensor>& has_initial_state,
+    const std::optional<torch::Tensor>& non_spec_query_start_loc,
+    const std::optional<torch::Tensor>& non_spec_token_indx,
+    const std::optional<torch::Tensor>& non_spec_state_indices_tensor,
+    const std::optional<torch::Tensor>& spec_query_start_loc,
+    const std::optional<torch::Tensor>& spec_token_indx,
+    const std::optional<torch::Tensor>& spec_state_indices_tensor,
+    const std::optional<torch::Tensor>& num_accepted_tokens,
+    const int64_t num_actual_tokens,
+    const int64_t tp_size,
+    const bool reorder_input,
+    // Optional pre-allocated scratch buffer: a single flat torch::kUInt8 tensor.
+    const std::optional<torch::Tensor>& workspace);
+
+// Exact number of bytes `gdn_attention` will carve out of its `workspace`
+// argument for a call with the given shapes/dtype.
+int64_t gdn_attention_workspace_bytes_needed(
+    const int64_t num_prefills,
+    const int64_t num_decodes,
+    const int64_t non_spec_token,
+    const int64_t batch_size,
+    const int64_t num_k_heads,
+    const int64_t num_v_heads,
+    const int64_t head_k_dim,
+    const int64_t head_v_dim,
+    const int64_t tp_size,
+    const torch::ScalarType dtype);
+
+// Standalone GDN recurrent op for plain (non-spec) prefill/decode.
+// `ssm_state` (the committed recurrent-state pool) is updated in place.
+// See `gated_delta_rule_verify` below for the separate spec-decode/verify
+// entry point, which never mutates the committed pool.
+void gated_delta_rule(
+    torch::Tensor& core_attn_out,
+    const torch::Tensor& q,
+    const torch::Tensor& k,
+    const torch::Tensor& v,
+    const torch::Tensor& b,
+    const torch::Tensor& a,
+    const torch::Tensor& A_log,
+    const torch::Tensor& dt_bias,
+    torch::Tensor& ssm_state,
+    const torch::Tensor& query_start_loc,
+    const std::optional<torch::Tensor>& token_indx,
+    const torch::Tensor& cache_indices,
+    const std::optional<torch::Tensor>& has_initial_state,
+    const int64_t num_prefills,
+    const int64_t num_decodes);
+
+// Standalone GDN recurrent target_verify (speculative-decode) op, using
+// SGLang's native `target_verify` convention (matches the Triton/KDA
+// recurrent verify kernels): seeds from the committed `ssm_state` pool via a
+// plain 1D `cache_indices`, and snapshots every draft position's state into
+// `intermediate_states_buffer` (indexed by `intermediate_state_indices` +
+// `cache_steps`) instead of the committed pool. Never mutates `ssm_state`.
+void gated_delta_rule_verify(
+    torch::Tensor& core_attn_out,
+    const torch::Tensor& q,
+    const torch::Tensor& k,
+    const torch::Tensor& v,
+    const torch::Tensor& b,
+    const torch::Tensor& a,
+    const torch::Tensor& A_log,
+    const torch::Tensor& dt_bias,
+    const torch::Tensor& ssm_state,
+    const torch::Tensor& cache_indices,
+    torch::Tensor& intermediate_states_buffer,
+    const torch::Tensor& intermediate_state_indices,
+    const int64_t cache_steps,
+    const std::optional<torch::Tensor>& token_indx,
+    const std::optional<torch::Tensor>& retrieve_parent_token);
+
+/*
+ * Mamba causal conv1d (XPU)
+ */
+void causal_conv1d_fwd(
+    at::Tensor& x,
+    const at::Tensor& weight,
+    const std::optional<at::Tensor>& bias_,
+    const std::optional<at::Tensor>& conv_states,
+    const std::optional<at::Tensor>& query_start_loc,
+    const std::optional<at::Tensor>& cache_indices,
+    const std::optional<at::Tensor>& has_initial_state,
+    bool silu_activation,
+    int64_t pad_slot_id);
+
+void causal_conv1d_update(
+    at::Tensor& x,
+    at::Tensor& conv_state,
+    const at::Tensor& weight,
+    const std::optional<at::Tensor>& bias_,
+    bool silu_activation,
+    const std::optional<at::Tensor>& cache_seqlens_,
+    const std::optional<at::Tensor>& conv_state_indices_,
+    int64_t pad_slot_id);
+
+// GDN target-verify (speculative decoding) conv1d update.
+at::Tensor causal_conv1d_update_verify(
+    const at::Tensor& x,
+    const at::Tensor& conv_state,
+    const at::Tensor& weight,
+    const std::optional<at::Tensor>& bias_,
+    bool silu_activation,
+    const std::optional<at::Tensor>& cache_indices_,
+    at::Tensor& intermediate_conv_window,
+    const at::Tensor& intermediate_state_indices,
+    const std::optional<at::Tensor>& retrieve_next_token,
+    const std::optional<at::Tensor>& retrieve_next_sibling,
+    const std::optional<at::Tensor>& retrieve_parent_token,
+    int64_t pad_slot_id);
+
+// Xe35 only kernels
+#if SYCL_INTEL_TARGET == 35
+void dsv3_router_gemm_xpu(torch::Tensor& output, const torch::Tensor& mat_a, const torch::Tensor& mat_b);
+void dsv3_fused_a_gemm_xpu(torch::Tensor& output, const torch::Tensor& mat_a, const torch::Tensor& mat_b);
+torch::Tensor fp8_scaled_mm_xpu(
+    const torch::Tensor& mat_a,
+    const torch::Tensor& mat_b,
+    const torch::Tensor& scales_a,
+    const torch::Tensor& scales_b,
+    const torch::Dtype& out_dtype,
+    const c10::optional<torch::Tensor>& bias);
+void mxfp4_blockwise_scaled_grouped_mm(
+    torch::Tensor& output,
+    torch::Tensor& a_ptrs,
+    torch::Tensor& b_ptrs,
+    torch::Tensor& out_ptrs,
+    torch::Tensor& a_scales_ptrs,
+    torch::Tensor& b_scales_ptrs,
+    const torch::Tensor& a,
+    const torch::Tensor& b,
+    const torch::Tensor& scales_a,
+    const torch::Tensor& scales_b,
+    const torch::Tensor& problem_sizes,
+    const torch::Tensor& expert_offsets,
+    const torch::Tensor& workspace);
+#endif
+
+/*
+ * HiSparse hierarchical sparse KV cache (DeepSeek DSA / V4)
+ */
+void transfer_cache_dsv4_mla(
+    const at::Tensor& src_ptrs,
+    const at::Tensor& dst_ptrs,
+    const at::Tensor& src_indices,
+    const at::Tensor& dst_indices,
+    int64_t block_size);
+
+void load_cache_to_device_buffer_mla(
+    const at::Tensor& top_k_tokens,
+    const at::Tensor& device_buffer_tokens,
+    const at::Tensor& host_cache_locs,
+    const at::Tensor& device_buffer_locs,
+    const at::Tensor& host_cache,
+    const at::Tensor& device_buffer,
+    const at::Tensor& top_k_device_locs,
+    const at::Tensor& req_pool_indices,
+    const at::Tensor& seq_lens,
+    const at::Tensor& lru_slots,
+    const std::optional<at::Tensor>& num_real_reqs,
+    int64_t item_size_bytes,
+    int64_t num_top_k,
+    int64_t hot_buffer_size,
+    int64_t page_size,
+    int64_t block_size,
+    bool is_dsv4_layout);
+
+/*
+ * MiniMax decode block top-k (MiniMax M3 sparse decode indexer)
+ */
+void minimax_decode_topk(
+    const at::Tensor& score, const at::Tensor& seq_lens, const at::Tensor& out, int64_t block_size, int64_t topk);
+
+std::tuple<at::Tensor, at::Tensor> minimax_decode_topk_page_table(
+    const at::Tensor& score,
+    const at::Tensor& seq_lens,
+    const at::Tensor& req_to_token,
+    const at::Tensor& slot_ids,
+    int64_t block_size,
+    int64_t topk,
+    int64_t page_size);
+
+#pragma GCC visibility pop
+
+#if SYCL_INTEL_TARGET == 35
+#include "sgl_kernel/xe35/activation.h"
+#include "sgl_kernel/xe35/routing_quant.h"
+#endif

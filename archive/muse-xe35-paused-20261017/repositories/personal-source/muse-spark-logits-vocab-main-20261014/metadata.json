@@ -1,0 +1,9 @@
+{
+  "directory": "/home/syk/worktrees/sgl-kernel-xpu/muse-spark-logits-vocab-main-20261014",
+  "head": "448f0c0cf6cd13de7c2d6ec28de1d392039fdaca",
+  "branch": "muse_logits_vocab",
+  "patch_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "tracked_paths": [],
+  "untracked_code": [],
+  "apply_check": "NO_CHANGES"
+}

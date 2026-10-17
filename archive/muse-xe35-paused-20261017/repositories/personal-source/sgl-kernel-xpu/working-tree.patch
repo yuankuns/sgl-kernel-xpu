@@ -1,0 +1,26 @@
+diff --git a/cmake/BuildFlags.cmake b/cmake/BuildFlags.cmake
+index c4638765e920f362e59de754fc1d2f7f2461b5fe..1824b677e9592734f84a2ee47499c50300a0edf4 100644
+--- a/cmake/BuildFlags.cmake
++++ b/cmake/BuildFlags.cmake
+@@ -77,7 +77,7 @@ if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+ 
+   set(SYCL_KERNEL_OPTIONS ${SYCL_KERNEL_OPTIONS} -ftemplate-backtrace-limit=0)
+   set(SYCL_KERNEL_OPTIONS ${SYCL_KERNEL_OPTIONS} -fno-sycl-unnamed-lambda)
+-  set(SYCL_KERNEL_OPTIONS ${SYCL_KERNEL_OPTIONS} -sycl-std=2020)
++  set(SYCL_KERNEL_OPTIONS ${SYCL_KERNEL_OPTIONS} -sycl-std=2020 -std=c++20)
+   set(SYCL_KERNEL_OPTIONS ${SYCL_KERNEL_OPTIONS} -fhonor-nans)
+   set(SYCL_KERNEL_OPTIONS ${SYCL_KERNEL_OPTIONS} -fhonor-infinities)
+   set(SYCL_KERNEL_OPTIONS ${SYCL_KERNEL_OPTIONS} -fno-associative-math)
+diff --git a/src/BuildOnLinux.cmake b/src/BuildOnLinux.cmake
+index ce2b5b95c3c5b4912eefb16b0b4043729d72fe56..1ecb21c259ca3d7ed0d029f280bb627d1f7b529d 100644
+--- a/src/BuildOnLinux.cmake
++++ b/src/BuildOnLinux.cmake
+@@ -21,7 +21,7 @@ setup_common_libraries()
+ if(SYCL_COMPILER_VERSION GREATER_EQUAL 20250806)
+   set(COMMON_DEVICE_LINK_FLAGS ${SYCL_DEVICE_LINK_FLAGS})
+   set(COMMON_DEVICE_LINK_FLAGS ${COMMON_DEVICE_LINK_FLAGS} -Xspirv-translator)
+-  set(COMMON_DEVICE_LINK_FLAGS ${COMMON_DEVICE_LINK_FLAGS} -spirv-ext=+SPV_INTEL_split_barrier,+SPV_INTEL_2d_block_io,+SPV_INTEL_subgroup_matrix_multiply_accumulate)
++  set(COMMON_DEVICE_LINK_FLAGS ${COMMON_DEVICE_LINK_FLAGS} -spirv-ext=+SPV_INTEL_split_barrier,+SPV_INTEL_2d_block_io,+SPV_INTEL_subgroup_matrix_multiply_accumulate,+SPV_INTEL_float4)
+ else()
+   message(FATAL_ERROR
+       "SYCL compiler version must be >= 20250806, "

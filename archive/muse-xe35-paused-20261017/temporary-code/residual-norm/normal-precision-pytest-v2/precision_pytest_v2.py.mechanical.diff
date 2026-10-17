@@ -1,0 +1,35 @@
+--- precision_pytest_v1.py
++++ precision_pytest_v2.py
+@@ -13,10 +13,10 @@
+ 
+ 
+ ROOT = Path(__file__).resolve().parent
+-OUTPUT = ROOT / "normal-precision-pytest-v1"
+-BARRIER = ROOT / "gpu9-normal-precision-pytest-v1-grant.json"
+-PHASE = "residual-normal-precision-pytest-v1"
+-SCRIPTS = ("precision_pytest_v1.py", "precision_pytest_stage_v1.py", "precision_pytest_container_v1.sh", "run_precision_pytest_v1.py")
++OUTPUT = ROOT / "normal-precision-pytest-v2"
++BARRIER = ROOT / "gpu9-normal-precision-pytest-v2-grant.json"
++PHASE = "residual-normal-precision-pytest-v2"
++SCRIPTS = ("precision_pytest_v2.py", "precision_pytest_stage_v2.py", "precision_pytest_container_v2.sh", "run_precision_pytest_v2.py", "precision_maps_preflight_v2.py")
+ 
+ 
+ def write(name, value):
+@@ -66,6 +66,8 @@
+     assert set(normalized["SOURCE"]) <= set(normalized["AFTER"])
+     record["mechanical_suffix_all69_preserved"] = True
+     record["counts"] = {"SOURCE": 69, "AFTER": 73}
++    import precision_maps_preflight_v2 as metadata
++    record["CPU_metadata_preflight"] = metadata.binding()
+     return record
+ 
+ 
+@@ -205,7 +207,7 @@
+         driver = {line.split()[-1] for line in Path("/proc/self/maps").read_text().splitlines()
+                   if "libze_intel_gpu" in line or "libsycl.so" in line}
+         driver_proof = json.loads((OUTPUT / f"CPU-{role}.json").read_text())["driver_proof"]
+-        mapped = {str(Path(name).resolve()): source.digest(name) for name in driver}
++        mapped = {str(Path(name).resolve()): source.digest(Path(name)) for name in driver}
+         candidates = driver_proof["GPU_driver_candidate_libraries_sha256"]
+         assert any("libze_intel_gpu" in name for name in mapped)
+         assert all(value == candidates[name] for name, value in mapped.items() if "libze_intel_gpu" in name)

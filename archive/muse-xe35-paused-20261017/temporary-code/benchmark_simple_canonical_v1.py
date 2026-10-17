@@ -1,0 +1,87 @@
+import argparse
+import json
+import os
+import time
+from pathlib import Path
+
+from canonical_tools_loader_v1 import digest_file
+
+
+def arguments():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('component', choices=('memory', 'position', 'logits-vocab'))
+    parser.add_argument('--label', choices=('before', 'after'), required=True)
+    parser.add_argument('--phase', choices=('accuracy', 'performance'), required=True)
+    parser.add_argument('--serving-batch', type=int, choices=(8,), default=8)
+    parser.add_argument('--samples', type=int, default=101)
+    parser.add_argument('--calls', type=int, default=128)
+    parser.add_argument('--output', type=Path, required=True)
+    args = parser.parse_args()
+    for name in ('BATCHES', 'BATCH', 'SERVING_BATCH', 'BATCH_SIZE', 'SGLANG_BATCH_SIZE', 'SGLANG_MUSE_BATCH_SIZE', 'MUSE_BATCH_SIZE', 'SERVING_BATCH_SIZE', 'MUSE_BS', 'BS'):
+        if os.environ.get(name, '8') != '8':
+            parser.error(f'B8-only: {name} must be 8')
+    for name, expected in {'ISL': '4096', 'OSL': '16', 'TP': '1', 'EP': '1'}.items():
+        if os.environ.get(name, expected) != expected:
+            parser.error(f'Production scope requires {name}={expected}')
+    gpu = os.environ.get('ZE_AFFINITY_MASK')
+    if args.phase == 'performance' and gpu not in {'4', '5', '6', '7'}:
+        parser.error('Performance requires stable GPU4–7; rejected before Torch import')
+    if gpu not in {'4', '5', '6', '7', '8', '9', '10', '11'}:
+        parser.error('Coordinator GPU allocation required')
+    if args.samples <= 0 or args.calls <= 0:
+        parser.error('samples and calls must be positive')
+    args.api = 'xe35'
+    return args
+
+
+def main():
+    args = arguments()
+    from benchmark_simple import logits_cases, memory_cases, native_operations, position_cases, time_graph
+    import sgl_kernel
+    import torch
+
+    if not torch.xpu.is_available() or not sgl_kernel.is_xe3_arch():
+        raise SystemExit('Xe35 compute capability 3.5 required')
+    torch.manual_seed(42)
+    cases = {'memory': memory_cases, 'position': position_cases, 'logits-vocab': logits_cases}[args.component]
+    operations = native_operations(torch, args)
+    results = []
+    for index, (name, launch, check, reset) in enumerate(cases(torch, operations)):
+        if index:
+            torch.xpu.synchronize()
+            time.sleep(2)
+        if reset:
+            reset()
+        launch()
+        torch.xpu.synchronize()
+        check()
+        result = {'case': name, 'accuracy': 'PASS'}
+        if args.phase == 'performance':
+            result.update(time_graph(torch, launch, args, reset))
+        results.append(result)
+        print(json.dumps(result), flush=True)
+    torch.xpu.synchronize()
+    names = {'memory': ('PagedAlloc', 'WriteReqToTokenPool'), 'position': ('ComputePosition',), 'logits-vocab': ('SoftcapLogits', 'VocabMask')}[args.component]
+    mapped = {line.split()[-1] for line in Path('/proc/self/maps').read_text().splitlines() if any('libsgl-ops-sycl-' + name + '.so' in line for name in names)}
+    if len(mapped) != len(names):
+        raise RuntimeError(f'Missing actual tested native libraries: {mapped}')
+    report = {
+        'component': args.component, 'label': args.label, 'phase': args.phase, 'api': args.api,
+        'registration': 'normal current official package initialization and real _xe35 registered operators',
+        'serving_batch': 8, 'isl': 4096, 'osl': 16, 'tp': 1, 'ep': 1,
+        'gpu_affinity': os.environ['ZE_AFFINITY_MASK'], 'device': torch.xpu.get_device_name(0),
+        'torch': torch.__version__, 'package': str(Path(sgl_kernel.__file__).resolve()),
+        'samples': args.samples if args.phase == 'performance' else 0,
+        'calls': args.calls if args.phase == 'performance' else 0,
+        'timing': 'XPU graph events; per graph node; input reset excluded' if args.phase == 'performance' else 'none: accuracy-only',
+        'libraries': {library: digest_file(Path(library)) for library in sorted(mapped)}, 'results': results,
+        'driver_sha256': digest_file(Path(__file__)), 'reference_driver_sha256': digest_file(Path(__file__).with_name('benchmark_simple.py')),
+    }
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+    if args.output.exists():
+        raise RuntimeError('Refusing to overwrite evidence')
+    args.output.write_text(json.dumps(report, indent=2) + '\n')
+
+
+if __name__ == '__main__':
+    main()

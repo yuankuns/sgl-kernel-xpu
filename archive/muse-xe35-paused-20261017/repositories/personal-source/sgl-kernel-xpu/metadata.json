@@ -1,0 +1,12 @@
+{
+  "directory": "/home/syk/sgl-kernel-xpu",
+  "head": "ea8e616159ec686f814b9a97ae88e5b41e770bb6",
+  "branch": "muse-spark",
+  "patch_sha256": "cd17eb875001c2ff6e959b0299c3a7d4ea190bef5937cd5801247071f9aeb5c6",
+  "tracked_paths": [
+    "cmake/BuildFlags.cmake",
+    "src/BuildOnLinux.cmake"
+  ],
+  "untracked_code": [],
+  "apply_check": "PASS"
+}

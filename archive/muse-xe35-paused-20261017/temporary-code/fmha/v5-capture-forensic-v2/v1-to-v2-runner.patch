@@ -1,0 +1,40 @@
+--- v5-capture-forensic-v1/forensic_runner.py
++++ v5-capture-forensic-v2/forensic_runner.py
+@@ -98,6 +98,20 @@
+         live_tensor_addresses=metadata, queue=queue_state(torch), native_binding=native_binding, output_validity=validity)
+ 
+ 
++def parse_fwd_arguments(schema, role, dtype, args=(), kwargs=None):
++    keywords = {} if kwargs is None else kwargs
++    arguments = {item.name: item.default_value for item in schema.arguments}
++    arguments.update(dict(zip((item.name for item in schema.arguments), args)))
++    arguments.update(keywords)
++    query, key, value, table = arguments['q'], arguments['k'], arguments['v'], arguments['page_table']
++    assert query.shape == (12288, 128, 64) and key.shape == value.shape == (512, 64, 16, 64)
++    assert query.dtype == key.dtype == value.dtype == dtype and table.shape == (3, 64)
++    assert arguments['max_seqlen_q'] == 4096 and arguments['is_causal'] is True
++    if role == 'source':
++        assert arguments['max_seqlen_k'] == 4096
++    return arguments
++
++
+ def capture_observer(torch, role, journal, generation, rows):
+     from torch.utils._python_dispatch import TorchDispatchMode
+ 
+@@ -106,15 +120,7 @@
+             keywords = {} if kwargs is None else kwargs
+             if function != torch.ops.sgl_kernel.fwd.default:
+                 return function(*args, **keywords)
+-            arguments = {item.name: item.default_value for item in function._schema.arguments}
+-            arguments.update(dict(zip((item.name for item in function._schema.arguments), args)))
+-            arguments.update(keywords)
+-            query, key, value, table = arguments['q'], arguments['k'], arguments['v'], arguments['page_table']
+-            assert query.shape == (12288, 128, 64) and key.shape == value.shape == (512, 64, 16, 64)
+-            assert query.dtype == key.dtype == value.dtype == torch.bfloat16 and table.shape == (3, 64)
+-            assert arguments['max_seqlen_q'] == 4096 and arguments['causal'] is True
+-            if role == 'source':
+-                assert arguments['max_seqlen_k'] == 4096
++            arguments = parse_fwd_arguments(function._schema, role, torch.bfloat16, args, keywords)
+             tensor_args = {name: tensor_metadata(value) for name, value in arguments.items() if isinstance(value, torch.Tensor)}
+             scalar_args = {name: value for name, value in arguments.items() if value is None or isinstance(value, (int, float, bool, str))}
+             row = {'call': len(rows) + 1, 'role': role, 'registered_operator': str(function),

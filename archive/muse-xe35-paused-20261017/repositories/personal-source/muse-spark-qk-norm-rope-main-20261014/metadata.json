@@ -1,0 +1,9 @@
+{
+  "directory": "/home/syk/worktrees/sgl-kernel-xpu/muse-spark-qk-norm-rope-main-20261014",
+  "head": "feed315712ea91e6becbb983f3a4d56ac0cc3b96",
+  "branch": "muse_qk_norm_rope",
+  "patch_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "tracked_paths": [],
+  "untracked_code": [],
+  "apply_check": "NO_CHANGES"
+}

@@ -1,0 +1,141 @@
+/***************************************************************************************************
+ * Copyright (C) 2026 Intel Corporation, All rights reserved.
+ * SPDX-License-Identifier: BSD-3-Clause
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met:
+ *
+ * 1. Redistributions of source code must retain the above copyright notice, this
+ * list of conditions and the following disclaimer.
+ *
+ * 2. Redistributions in binary form must reproduce the above copyright notice,
+ * this list of conditions and the following disclaimer in the documentation
+ * and/or other materials provided with the distribution.
+ *
+ * 3. Neither the name of the copyright holder nor the names of its
+ * contributors may be used to endorse or promote products derived from
+ * this software without specific prior written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+ * DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+ * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+ * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+ * SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+ * CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+ * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+ * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ *
+ **************************************************************************************************/
+// Auto-generated from mla_prefill_kernel.cpp.in
+// Template parameters: ELEM_TAG=half, PAGE_SIZE=64, ARCH_TAG=xe20
+#define SYCL_INTEL_TARGET 20
+
+#include "sycl/kernels/mla/xe20/device/mla_prefill_types.hpp"
+
+namespace mla_prefill {
+
+__attribute__((visibility("default"))) void launch_mla_prefill_half_64_small(
+    at::Tensor& out,
+    const std::optional<at::Tensor>& lse,
+    const at::Tensor& q_nope,
+    const at::Tensor& q_pe,
+    const at::Tensor& kv_c_and_k_pe_cache,
+    const at::Tensor& cu_seqlens_q,
+    const at::Tensor& seq_lens,
+    int64_t max_seqlen_q,
+    const at::Tensor& page_table,
+    at::Tensor& workspace,
+    double sm_scale,
+    bool causal,
+    int64_t num_kv_splits) {
+  runMlaPrefill<sycl::half, PageSizeOption<64>, MlaPrefillQTileSmall>(
+      out, lse, q_nope, q_pe, kv_c_and_k_pe_cache, cu_seqlens_q, seq_lens,
+      max_seqlen_q, page_table,
+      workspace, sm_scale, causal, num_kv_splits);
+}
+
+__attribute__((visibility("default"))) void launch_mla_prefill_half_64_medium(
+    at::Tensor& out,
+    const std::optional<at::Tensor>& lse,
+    const at::Tensor& q_nope,
+    const at::Tensor& q_pe,
+    const at::Tensor& kv_c_and_k_pe_cache,
+    const at::Tensor& cu_seqlens_q,
+    const at::Tensor& seq_lens,
+    int64_t max_seqlen_q,
+    const at::Tensor& page_table,
+    at::Tensor& workspace,
+    double sm_scale,
+    bool causal,
+    int64_t num_kv_splits) {
+  runMlaPrefill<sycl::half, PageSizeOption<64>, MlaPrefillQTileMedium>(
+      out, lse, q_nope, q_pe, kv_c_and_k_pe_cache, cu_seqlens_q, seq_lens,
+      max_seqlen_q, page_table,
+      workspace, sm_scale, causal, num_kv_splits);
+}
+
+__attribute__((visibility("default"))) void launch_mla_prefill_half_64_large(
+    at::Tensor& out,
+    const std::optional<at::Tensor>& lse,
+    const at::Tensor& q_nope,
+    const at::Tensor& q_pe,
+    const at::Tensor& kv_c_and_k_pe_cache,
+    const at::Tensor& cu_seqlens_q,
+    const at::Tensor& seq_lens,
+    int64_t max_seqlen_q,
+    const at::Tensor& page_table,
+    at::Tensor& workspace,
+    double sm_scale,
+    bool causal,
+    int64_t num_kv_splits) {
+  runMlaPrefill<sycl::half, PageSizeOption<64>, MlaPrefillQTileLarge>(
+      out, lse, q_nope, q_pe, kv_c_and_k_pe_cache, cu_seqlens_q, seq_lens,
+      max_seqlen_q, page_table,
+      workspace, sm_scale, causal, num_kv_splits);
+}
+
+}  // namespace mla_prefill
+
+#ifdef SGL_MLA_JIT_ENTRY
+// Stable C ABI entry for the runtime-JIT path. Tensors cross the dlopen boundary
+// as at::Tensor* (shared <torch/all.h> -> identical layout); the Q-tile bucket
+// (0=small, 1=medium, 2=large) is a runtime arg. One config (half,
+// 64) per .so, so the fixed symbol never collides across AOT TUs.
+extern "C" __attribute__((visibility("default"))) void sgl_mla_prefill_entry(
+    int bucket,
+    void* out,
+    const void* lse,  // const std::optional<at::Tensor>*
+    const void* q_nope,
+    const void* q_pe,
+    const void* kv_c_and_k_pe_cache,
+    const void* cu_seqlens_q,
+    const void* seq_lens,
+    int64_t max_seqlen_q,
+    const void* page_table,
+    void* workspace,
+    double sm_scale,
+    bool causal,
+    int64_t num_kv_splits) {
+  at::Tensor& o = *static_cast<at::Tensor*>(out);
+  const std::optional<at::Tensor>& ls = *static_cast<const std::optional<at::Tensor>*>(lse);
+  const at::Tensor& qn = *static_cast<const at::Tensor*>(q_nope);
+  const at::Tensor& qp = *static_cast<const at::Tensor*>(q_pe);
+  const at::Tensor& kv = *static_cast<const at::Tensor*>(kv_c_and_k_pe_cache);
+  const at::Tensor& cu = *static_cast<const at::Tensor*>(cu_seqlens_q);
+  const at::Tensor& sl = *static_cast<const at::Tensor*>(seq_lens);
+  const at::Tensor& pt = *static_cast<const at::Tensor*>(page_table);
+  at::Tensor& ws = *static_cast<at::Tensor*>(workspace);
+  if (bucket == 0) {
+    mla_prefill::launch_mla_prefill_half_64_small(
+        o, ls, qn, qp, kv, cu, sl, max_seqlen_q, pt, ws, sm_scale, causal, num_kv_splits);
+  } else if (bucket == 1) {
+    mla_prefill::launch_mla_prefill_half_64_medium(
+        o, ls, qn, qp, kv, cu, sl, max_seqlen_q, pt, ws, sm_scale, causal, num_kv_splits);
+  } else {
+    mla_prefill::launch_mla_prefill_half_64_large(
+        o, ls, qn, qp, kv, cu, sl, max_seqlen_q, pt, ws, sm_scale, causal, num_kv_splits);
+  }
+}
+#endif

@@ -1,0 +1,37 @@
+--- a/src/sycl/xe35/fmha/entry.cpp
++++ b/src/sycl/xe35/fmha/entry.cpp
+@@ -1,3 +1,4 @@
++#include <limits>
+ #include "sycl/xe35/fmha/dispatch.hpp"
+ 
+ SGL_KERNEL_EXPORT void mha_fwd_upstream_xe35(
+@@ -70,9 +71,18 @@
+     bool rel_bias_is_sheared,
+     std::optional<const at::Tensor>& bidirectional_block_ids_) {
+   const int batch_xe35 = cu_seqlens_q.dim() == 1 ? static_cast<int>(cu_seqlens_q.numel()) - 1 : 0;
++  const bool capacity_hint_xe35 = max_seqlen_k <= 0 && page_table.has_value() &&
++      page_table->dim() == 2 && k.dim() == 4 && k.size(1) == 64 &&
++      page_table->size(1) > 0 && page_table->size(1) <= std::numeric_limits<int>::max() / 64;
++  const int resolved_max_seqlen_k_xe35 = capacity_hint_xe35
++      ? static_cast<int>(page_table->size(1) * k.size(1)) : max_seqlen_k;
+   const bool production_shape_xe35 =
+-      (max_seqlen_q == 1 && batch_xe35 == 8 && max_seqlen_k >= 4097 && max_seqlen_k <= 4112) ||
+-      (max_seqlen_q == 4096 && (batch_xe35 == 1 || batch_xe35 == 7 || batch_xe35 == 8) && max_seqlen_k == 4096);
++      (max_seqlen_q == 1 && batch_xe35 == 8 &&
++       ((resolved_max_seqlen_k_xe35 >= 4097 && resolved_max_seqlen_k_xe35 <= 4112) ||
++        (capacity_hint_xe35 && resolved_max_seqlen_k_xe35 == 4160))) ||
++      (max_seqlen_q == 4096 &&
++       (batch_xe35 == 1 || batch_xe35 == 3 || batch_xe35 == 5 || batch_xe35 == 7 || batch_xe35 == 8) &&
++       resolved_max_seqlen_k_xe35 == 4096);
+   const bool use_port_xe35 = production_shape_xe35 &&
+       q.dim() == 3 && q.size(0) == batch_xe35 * max_seqlen_q &&
+       q.size(1) == 128 && q.size(2) == 64 && q.scalar_type() == at::kBFloat16 &&
+@@ -98,7 +108,7 @@
+   }
+   std::optional<at::Tensor> output_xe35 = out;
+   mha_fwd_xe35(
+-      q, k, v, q_v_, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k,
++      q, k, v, q_v_, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, resolved_max_seqlen_k_xe35,
+       page_table, kv_batch_idx_, leftpad_k_, rotary_cos_, rotary_sin_, seqlens_rotary_,
+       q_descale_, k_descale_, v_descale_, softmax_scale_, sinks_, is_causal,
+       window_size_left, window_size_right, softcap, is_rotary_interleaved,

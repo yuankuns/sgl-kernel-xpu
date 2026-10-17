@@ -1,0 +1,809 @@
+diff --git a/benchmark/bench_fused_norm_residual.py b/benchmark/bench_fused_norm_residual.py
+new file mode 100644
+index 0000000..9ae5684
+--- /dev/null
++++ b/benchmark/bench_fused_norm_residual.py
+@@ -0,0 +1,125 @@
++"""Device-event timing of the registered residual normalization operator."""
++
++import argparse
++import hashlib
++import json
++import statistics
++from pathlib import Path
++
++import sgl_kernel as sgl_kernel
++import torch
++
++# Muse-Spark B8 uses rows8 decode/rows32768 ISL4096 prefill, hidden8192, BF16 with FP32 stream.
++
++
++def main():
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument("--rows", type=int, nargs="+", default=[8, 32768])
++    parser.add_argument("--hidden-size", type=int, default=8192)
++    parser.add_argument("--warmup", type=int, default=15)
++    parser.add_argument("--iterations", type=int, default=40)
++    parser.add_argument("--samples", type=int, default=11)
++    parser.add_argument(
++        "--post-mode", choices=("none", "weight", "input_scale"), default="none"
++    )
++    parser.add_argument("--round-pre-norm-input", action="store_true")
++    parser.add_argument("--output-fp32", action="store_true")
++    args = parser.parse_args()
++    if (
++        min(*args.rows, args.hidden_size, args.iterations, args.samples) <= 0
++        or args.hidden_size % 8
++        or args.warmup < 0
++    ):
++        parser.error(
++            "positive counts and hidden-size divisible by 8 are required; "
++            "warmup may be zero"
++        )
++    torch.manual_seed(42)
++    for rows in args.rows:
++        branch = torch.randn(rows, args.hidden_size, device="xpu", dtype=torch.bfloat16)
++        stream = torch.randn(rows, args.hidden_size, device="xpu", dtype=torch.float32)
++        post_weight = (
++            torch.randn(args.hidden_size, device="xpu", dtype=torch.bfloat16)
++            if args.post_mode != "none"
++            else torch.empty(0, device="xpu", dtype=torch.bfloat16)
++        )
++        pre_weight = torch.randn(args.hidden_size, device="xpu", dtype=torch.bfloat16)
++        alpha = torch.rand(args.hidden_size, device="xpu", dtype=torch.float32)
++        beta = torch.rand(args.hidden_size, device="xpu", dtype=torch.float32)
++        output = torch.empty_like(branch)
++        new_stream = torch.empty_like(stream)
++        output_fp32 = torch.empty_like(stream) if args.output_fp32 else None
++
++        def invoke():
++            torch.ops.sgl_kernel.fused_post_norm_residual_pre_norm(
++                branch,
++                stream,
++                post_weight,
++                pre_weight,
++                alpha,
++                beta,
++                output,
++                new_stream,
++                1e-8,
++                1e-5,
++                args.post_mode == "input_scale",
++                args.round_pre_norm_input,
++                output_fp32,
++            )
++
++        for _ in range(args.warmup):
++            invoke()
++        torch.xpu.synchronize()
++        graph = torch.xpu.XPUGraph()
++        with torch.xpu.graph(graph):
++            for _ in range(args.iterations):
++                invoke()
++        torch.xpu.synchronize()
++        for _ in range(3):
++            graph.replay()
++        torch.xpu.synchronize()
++        values = []
++        for _ in range(args.samples):
++            start = torch.xpu.Event(enable_timing=True)
++            end = torch.xpu.Event(enable_timing=True)
++            start.record()
++            graph.replay()
++            end.record()
++            end.synchronize()
++            values.append(start.elapsed_time(end) * 1000 / args.iterations)
++        print(
++            json.dumps(
++                {
++                    "rows": rows,
++                    "hidden_size": args.hidden_size,
++                    "device": torch.xpu.get_device_name(0),
++                    "dtype": "branch/weights/output BF16; stream/alpha/beta FP32",
++                    "layout": "contiguous row-major",
++                    "post_mode": args.post_mode,
++                    "round_pre_norm_input": args.round_pre_norm_input,
++                    "output_fp32": args.output_fp32,
++                    "eps": [1e-8, 1e-5],
++                    "timing": "XPU event / graph replay iterations; setup outside timing",
++                    "iterations": args.iterations,
++                    "warmup": args.warmup,
++                    "samples_us": values,
++                    "p50_us": statistics.median(values),
++                    "range_us": [min(values), max(values)],
++                }
++            ),
++            flush=True,
++        )
++        del graph
++
++    paths = {
++        line.split()[-1]
++        for line in Path("/proc/self/maps").read_text().splitlines()
++        if "libsgl-ops-sycl-FusedNormResidual.so" in line
++    }
++    for path in sorted(paths):
++        digest = hashlib.sha256(Path(path).read_bytes()).hexdigest()
++        print(f"loaded_lib={path} sha256={digest}", flush=True)
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/include/sgl_kernel_ops.h b/include/sgl_kernel_ops.h
+index adb7c2a..3dd7765 100644
+--- a/include/sgl_kernel_ops.h
++++ b/include/sgl_kernel_ops.h
+@@ -115,6 +115,20 @@ void rmsnorm(torch::Tensor& output, torch::Tensor& input, torch::Tensor& weight,
+ void fused_add_rmsnorm(torch::Tensor input, torch::Tensor residual, torch::Tensor weight, double eps);
+ void gemma_rmsnorm(torch::Tensor& output, torch::Tensor& input, torch::Tensor& weight, double eps);
+ void gemma_fused_add_rmsnorm(torch::Tensor& input, torch::Tensor& residual, torch::Tensor& weight, double eps);
++void fused_post_norm_residual_pre_norm(
++    torch::Tensor branch,
++    torch::Tensor stream,
++    torch::Tensor post_weight,
++    torch::Tensor pre_weight,
++    torch::Tensor alpha,
++    torch::Tensor beta,
++    torch::Tensor output,
++    torch::Tensor new_stream,
++    double post_eps,
++    double pre_eps,
++    bool post_norm_input_scale,
++    bool round_pre_norm_input,
++    const std::optional<torch::Tensor>& output_fp32);
+ void topk_softmax(at::Tensor& topk_weights, at::Tensor& topk_indices, at::Tensor& gating_output, bool renormalize);
+ void topk_sigmoid(
+     at::Tensor& topk_weights,
+diff --git a/src/sycl/FusedNormResidual.cpp b/src/sycl/FusedNormResidual.cpp
+new file mode 100644
+index 0000000..f69a956
+--- /dev/null
++++ b/src/sycl/FusedNormResidual.cpp
+@@ -0,0 +1,282 @@
++#include <ATen/ATen.h>
++#include <c10/xpu/XPUStream.h>
++#include <torch/all.h>
++
++#include <cstdint>
++#include <limits>
++#include <sycl/sycl.hpp>
++
++#include "MemoryAccess.h"
++#include "SYCLHelpers.h"
++
++namespace at::native::xpu {
++namespace {
++
++constexpr int kVecSize = 8;
++using fp32_vec_t = aligned_vector_loop<float, kVecSize>;
++using bf16_vec_t = aligned_vector_loop<at::BFloat16, kVecSize>;
++
++inline at::BFloat16 accurate_bfloat16(double value) {
++  float high = static_cast<float>(value);
++  if ((sycl::bit_cast<uint32_t>(high) & 0xffffu) == 0x8000u && value != static_cast<double>(high)) {
++    high = sycl::nextafter(
++        high,
++        value > static_cast<double>(high) ? std::numeric_limits<float>::infinity()
++                                          : -std::numeric_limits<float>::infinity());
++  }
++  return static_cast<at::BFloat16>(high);
++}
++
++struct NormArgs {
++  const at::BFloat16* __restrict__ branch;
++  const float* __restrict__ stream;
++  const at::BFloat16* __restrict__ post_weight;
++  const at::BFloat16* __restrict__ pre_weight;
++  const float* __restrict__ alpha;
++  const float* __restrict__ beta;
++  at::BFloat16* __restrict__ output;
++  float* __restrict__ new_stream;
++  float* __restrict__ output_fp32;
++  int64_t hidden_size;
++  float post_eps;
++  float pre_eps;
++  bool has_post_weight;
++  bool post_norm_input_scale;
++  bool round_pre_norm_input;
++};
++
++// The register path retains at most four vectors per lane. Group size and
++// vector count are resource limits; hidden size remains a runtime dimension.
++template <int WorkGroupSize, int MaxIters>
++struct FusedPostNormResidualPreNorm {
++  NormArgs args;
++  [[sycl::reqd_sub_group_size(32)]] void operator()(sycl::nd_item<1> item) const {
++    const int64_t row_offset = item.get_group(0) * args.hidden_size;
++    const int64_t lane = item.get_local_id(0);
++
++    bf16_vec_t branch_reg[MaxIters];
++    double branch_sum_sq = 0.0;
++
++#pragma unroll
++    for (int it = 0; it < MaxIters; ++it) {
++      const int64_t offset = (it * WorkGroupSize + lane) * kVecSize;
++      if (offset >= args.hidden_size) {
++        continue;
++      }
++      bf16_vec_t value = *reinterpret_cast<const bf16_vec_t*>(args.branch + row_offset + offset);
++#pragma unroll
++      for (int v = 0; v < kVecSize; ++v) {
++        float x = static_cast<float>(value[v]);
++        if (args.has_post_weight && args.post_norm_input_scale) {
++          value[v] = static_cast<at::BFloat16>(x * static_cast<float>(args.post_weight[offset + v]));
++          x = static_cast<float>(value[v]);
++        }
++        branch_sum_sq += static_cast<double>(x) * static_cast<double>(x);
++      }
++      branch_reg[it] = value;
++    }
++
++    branch_sum_sq = sycl::reduce_over_group(item.get_group(), branch_sum_sq, sycl::plus<double>());
++    const double post_rstd = sycl::rsqrt(branch_sum_sq / static_cast<double>(args.hidden_size) + args.post_eps);
++
++    fp32_vec_t new_stream_reg[MaxIters];
++    float stream_sum_sq = 0.0f;
++
++#pragma unroll
++    for (int it = 0; it < MaxIters; ++it) {
++      const int64_t offset = (it * WorkGroupSize + lane) * kVecSize;
++      if (offset >= args.hidden_size) {
++        continue;
++      }
++      const fp32_vec_t stream_value = *reinterpret_cast<const fp32_vec_t*>(args.stream + row_offset + offset);
++      const fp32_vec_t alpha_value = *reinterpret_cast<const fp32_vec_t*>(args.alpha + offset);
++      const fp32_vec_t beta_value = *reinterpret_cast<const fp32_vec_t*>(args.beta + offset);
++      fp32_vec_t updated;
++
++#pragma unroll
++      for (int v = 0; v < kVecSize; ++v) {
++        // Match the model's BF16 post-norm output before the FP32 residual add.
++        float post_norm_value = static_cast<float>(branch_reg[it][v]);
++        double normalized_post = static_cast<double>(post_norm_value) * post_rstd;
++        if (args.has_post_weight && !args.post_norm_input_scale) {
++          normalized_post *= static_cast<double>(static_cast<float>(args.post_weight[offset + v]));
++        }
++        const at::BFloat16 normed_bf16 = accurate_bfloat16(normalized_post);
++        const float value = static_cast<float>(
++            static_cast<double>(alpha_value[v]) * static_cast<double>(stream_value[v]) +
++            static_cast<double>(beta_value[v]) * static_cast<double>(static_cast<float>(normed_bf16)));
++        updated[v] = value;
++        const float pre_norm_value =
++            args.round_pre_norm_input ? static_cast<float>(static_cast<at::BFloat16>(value)) : value;
++        stream_sum_sq += pre_norm_value * pre_norm_value;
++      }
++      new_stream_reg[it] = updated;
++    }
++
++    stream_sum_sq = sycl::reduce_over_group(item.get_group(), stream_sum_sq, sycl::plus<float>());
++    const float pre_rstd = sycl::rsqrt(stream_sum_sq / static_cast<float>(args.hidden_size) + args.pre_eps);
++
++#pragma unroll
++    for (int it = 0; it < MaxIters; ++it) {
++      const int64_t offset = (it * WorkGroupSize + lane) * kVecSize;
++      if (offset >= args.hidden_size) {
++        continue;
++      }
++      const bf16_vec_t weight = *reinterpret_cast<const bf16_vec_t*>(args.pre_weight + offset);
++      bf16_vec_t normalized;
++#pragma unroll
++      for (int v = 0; v < kVecSize; ++v) {
++        const float pre_norm_value = args.round_pre_norm_input
++                                         ? static_cast<float>(static_cast<at::BFloat16>(new_stream_reg[it][v]))
++                                         : new_stream_reg[it][v];
++        normalized[v] = static_cast<at::BFloat16>(pre_norm_value * pre_rstd * static_cast<float>(weight[v]));
++      }
++      *reinterpret_cast<fp32_vec_t*>(args.new_stream + row_offset + offset) = new_stream_reg[it];
++      *reinterpret_cast<bf16_vec_t*>(args.output + row_offset + offset) = normalized;
++      if (args.output_fp32 != nullptr) {
++        fp32_vec_t widened;
++#pragma unroll
++        for (int v = 0; v < kVecSize; ++v) {
++          widened[v] = static_cast<float>(normalized[v]);
++        }
++        *reinterpret_cast<fp32_vec_t*>(args.output_fp32 + row_offset + offset) = widened;
++      }
++    }
++  }
++};
++
++template <int WorkGroupSize, int MaxIters>
++void launch_fused_norm(const NormArgs& args, int64_t rows, sycl::queue& queue) {
++  FusedPostNormResidualPreNorm<WorkGroupSize, MaxIters> kernel{args};
++  sycl_kernel_submit(sycl::range<1>(rows * WorkGroupSize), sycl::range<1>(WorkGroupSize), queue, kernel);
++}
++
++template <int WorkGroupSize>
++void launch_for_group(const NormArgs& args, int64_t rows, sycl::queue& queue) {
++  if (args.hidden_size <= WorkGroupSize * kVecSize) {
++    launch_fused_norm<WorkGroupSize, 1>(args, rows, queue);
++  } else if (args.hidden_size <= WorkGroupSize * kVecSize * 2) {
++    launch_fused_norm<WorkGroupSize, 2>(args, rows, queue);
++  } else {
++    TORCH_CHECK(
++        args.hidden_size <= WorkGroupSize * kVecSize * 4,
++        "hidden size exceeds the four-vector per lane register budget");
++    launch_fused_norm<WorkGroupSize, 4>(args, rows, queue);
++  }
++}
++
++}  // namespace
++
++void fused_post_norm_residual_pre_norm(
++    torch::Tensor branch,
++    torch::Tensor stream,
++    torch::Tensor post_weight,
++    torch::Tensor pre_weight,
++    torch::Tensor alpha,
++    torch::Tensor beta,
++    torch::Tensor output,
++    torch::Tensor new_stream,
++    double post_eps,
++    double pre_eps,
++    bool post_norm_input_scale,
++    bool round_pre_norm_input,
++    const std::optional<torch::Tensor>& output_fp32) {
++  TORCH_CHECK(branch.device().is_xpu(), "branch must be an XPU tensor");
++  TORCH_CHECK(branch.scalar_type() == at::kBFloat16, "branch must be bfloat16");
++  TORCH_CHECK(stream.scalar_type() == at::kFloat, "stream must be float32");
++  TORCH_CHECK(post_weight.scalar_type() == at::kBFloat16, "post_weight must be bfloat16");
++  TORCH_CHECK(pre_weight.scalar_type() == at::kBFloat16, "pre_weight must be bfloat16");
++  TORCH_CHECK(alpha.scalar_type() == at::kFloat, "alpha must be float32");
++  TORCH_CHECK(beta.scalar_type() == at::kFloat, "beta must be float32");
++  TORCH_CHECK(output.scalar_type() == at::kBFloat16, "output must be bfloat16");
++  TORCH_CHECK(new_stream.scalar_type() == at::kFloat, "new_stream must be float32");
++  TORCH_CHECK(
++      branch.dim() == 2 && branch.size(1) > 0 && branch.size(1) % kVecSize == 0 && branch.size(1) <= 32768,
++      "branch must have shape [M, H] with positive H divisible by 8 and H <= 32768");
++  const int64_t hidden_size = branch.size(1);
++  TORCH_CHECK(stream.device() == branch.device(), "stream must be on the branch device");
++  TORCH_CHECK(post_weight.device() == branch.device(), "post_weight must be on the branch device");
++  TORCH_CHECK(pre_weight.device() == branch.device(), "pre_weight must be on the branch device");
++  TORCH_CHECK(alpha.device() == branch.device(), "alpha must be on the branch device");
++  TORCH_CHECK(beta.device() == branch.device(), "beta must be on the branch device");
++  TORCH_CHECK(output.device() == branch.device(), "output must be on the branch device");
++  TORCH_CHECK(new_stream.device() == branch.device(), "new_stream must be on the branch device");
++  TORCH_CHECK(stream.sizes() == branch.sizes(), "stream must match branch shape");
++  TORCH_CHECK(output.sizes() == branch.sizes(), "output must match branch shape");
++  TORCH_CHECK(new_stream.sizes() == branch.sizes(), "new_stream must match branch shape");
++  TORCH_CHECK(post_weight.numel() == 0 || post_weight.numel() == hidden_size, "post_weight must be empty or match H");
++  TORCH_CHECK(pre_weight.numel() == hidden_size, "pre_weight must match H");
++  TORCH_CHECK(alpha.numel() == hidden_size, "alpha must match H");
++  TORCH_CHECK(beta.numel() == hidden_size, "beta must match H");
++  TORCH_CHECK(branch.is_contiguous(), "branch must be contiguous");
++  TORCH_CHECK(stream.is_contiguous(), "stream must be contiguous");
++  TORCH_CHECK(post_weight.is_contiguous(), "post_weight must be contiguous");
++  TORCH_CHECK(pre_weight.is_contiguous(), "pre_weight must be contiguous");
++  TORCH_CHECK(alpha.is_contiguous(), "alpha must be contiguous");
++  TORCH_CHECK(beta.is_contiguous(), "beta must be contiguous");
++  TORCH_CHECK(output.is_contiguous(), "output must be contiguous");
++  TORCH_CHECK(new_stream.is_contiguous(), "new_stream must be contiguous");
++  // Optional FP32 widening of `output` for consumers with FP32 weights (the MoE
++  // router), saving them a separate cast launch.
++  float* output_fp32_ptr = nullptr;
++  if (output_fp32.has_value()) {
++    TORCH_CHECK(output_fp32->device() == branch.device(), "output_fp32 must be on the branch device");
++    TORCH_CHECK(output_fp32->scalar_type() == at::kFloat, "output_fp32 must be float32");
++    TORCH_CHECK(output_fp32->sizes() == branch.sizes(), "output_fp32 must match branch shape");
++    TORCH_CHECK(output_fp32->is_contiguous(), "output_fp32 must be contiguous");
++    output_fp32_ptr = output_fp32->data_ptr<float>();
++  }
++
++  const int64_t rows = branch.size(0);
++  if (rows == 0) {
++    return;
++  }
++
++  auto queue = at::xpu::getCurrentXPUStream().queue();
++  TORCH_CHECK(
++      queue.get_device().has(sycl::aspect::fp64), "Accurate fused residual normalization requires FP64 capability");
++  NormArgs args{
++      branch.data_ptr<at::BFloat16>(),
++      stream.data_ptr<float>(),
++      post_weight.data_ptr<at::BFloat16>(),
++      pre_weight.data_ptr<at::BFloat16>(),
++      alpha.data_ptr<float>(),
++      beta.data_ptr<float>(),
++      output.data_ptr<at::BFloat16>(),
++      new_stream.data_ptr<float>(),
++      output_fp32_ptr,
++      hidden_size,
++      static_cast<float>(post_eps),
++      static_cast<float>(pre_eps),
++      post_weight.numel() != 0,
++      post_norm_input_scale,
++      round_pre_norm_input};
++
++  // H ranges are vector-per-lane register capacities. Row ranges follow
++  // the workgroup crossover measurements on the target XPU.
++  int workgroup_size;
++  if (hidden_size <= 512 * kVecSize) {
++    if (rows <= 128 || (rows >= 768 && rows < 3584)) {
++      workgroup_size = 512;
++    } else if (rows < 768) {
++      workgroup_size = 256;
++    } else {
++      workgroup_size = 1024;
++    }
++  } else if (hidden_size <= 1024 * kVecSize) {
++    workgroup_size = rows > 128 && rows <= 256 ? 256 : 1024;
++  } else if (hidden_size <= 3 * 512 * kVecSize) {
++    workgroup_size = rows > 64 && rows <= 384 ? 512 : 1024;
++  } else {
++    workgroup_size = 1024;
++  }
++  if (workgroup_size == 256) {
++    launch_for_group<256>(args, rows, queue);
++  } else if (workgroup_size == 512) {
++    launch_for_group<512>(args, rows, queue);
++  } else {
++    launch_for_group<1024>(args, rows, queue);
++  }
++}
++
++}  // namespace at::native::xpu
+diff --git a/src/torch_extension_sycl.cc b/src/torch_extension_sycl.cc
+index 2d8ff26..e94f6a8 100644
+--- a/src/torch_extension_sycl.cc
++++ b/src/torch_extension_sycl.cc
+@@ -47,6 +47,12 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
+   m.def("gemma_fused_add_rmsnorm(Tensor! input, Tensor! residual, Tensor weight, float eps) -> ()");
+   m.impl("gemma_fused_add_rmsnorm", torch::kXPU, &at::native::xpu::gemma_fused_add_rmsnorm);
+ 
++  m.def(
++      "fused_post_norm_residual_pre_norm(Tensor branch, Tensor stream, Tensor post_weight, Tensor pre_weight, Tensor "
++      "alpha, Tensor beta, Tensor! output, Tensor! new_stream, float post_eps, float pre_eps, bool "
++      "post_norm_input_scale, bool round_pre_norm_input, Tensor(a!)? output_fp32=None) -> ()");
++  m.impl("fused_post_norm_residual_pre_norm", torch::kXPU, &at::native::xpu::fused_post_norm_residual_pre_norm);
++
+   m.def("topk_softmax(Tensor! topk_weights, Tensor! topk_indices, Tensor gating_output, bool renormalize) -> ()");
+   m.impl("topk_softmax", torch::kXPU, &at::native::xpu::topk_softmax);
+ 
+diff --git a/tests/test_fused_norm_residual.py b/tests/test_fused_norm_residual.py
+new file mode 100644
+index 0000000..b2d60d7
+--- /dev/null
++++ b/tests/test_fused_norm_residual.py
+@@ -0,0 +1,342 @@
++import argparse
++import json
++import statistics
++import tempfile
++from pathlib import Path
++
++import pytest
++import sgl_kernel  # noqa: F401
++import torch
++
++POST_EPS = 1e-8
++PRE_EPS = 1e-5
++
++
++def round_bfloat16(values: torch.Tensor) -> torch.Tensor:
++    """Round an independent FP64 oracle directly to BF16, without an FP32 double-round."""
++    high = values.float()
++    midpoint = ((high.view(torch.int32) & 0xFFFF) == 0x8000) & (values != high.double())
++    if midpoint.any():
++        direction = torch.where(
++            values[midpoint] > high[midpoint].double(), float("inf"), float("-inf")
++        ).float()
++        high[midpoint] = torch.nextafter(high[midpoint], direction)
++    return high.bfloat16()
++
++
++def reference(
++    branch: torch.Tensor,
++    stream: torch.Tensor,
++    post_weight: torch.Tensor,
++    pre_weight: torch.Tensor,
++    alpha: torch.Tensor,
++    beta: torch.Tensor,
++    post_norm_input_scale: bool,
++    round_pre_norm_input: bool,
++) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
++    """Independent FP64 mathematics with the model's BF16 boundaries and FP32 stream store."""
++    post_input = branch.double()
++    if post_weight.numel() and post_norm_input_scale:
++        post_input = round_bfloat16(post_input * post_weight.double()).double()
++    post_eps = torch.tensor(POST_EPS, dtype=torch.float32, device="cpu").double()
++    pre_eps = torch.tensor(PRE_EPS, dtype=torch.float32, device="cpu").double()
++    post_rstd = torch.rsqrt(post_input.square().mean(dim=-1, keepdim=True) + post_eps)
++    normed_branch = post_input * post_rstd
++    if post_weight.numel() and not post_norm_input_scale:
++        normed_branch = normed_branch * post_weight.double()
++    normed_branch = round_bfloat16(normed_branch)
++    rounded_post_norm = normed_branch.float()
++    new_stream = (
++        alpha.double() * stream.double() + beta.double() * rounded_post_norm.double()
++    ).float()
++    pre_norm_input = (
++        new_stream.bfloat16().double() if round_pre_norm_input else new_stream.double()
++    )
++    pre_rstd = torch.rsqrt(pre_norm_input.square().mean(dim=-1, keepdim=True) + pre_eps)
++    output = (pre_norm_input * pre_rstd * pre_weight.double()).float()
++    return output, new_stream, normed_branch
++
++
++def run_op(
++    branch: torch.Tensor,
++    stream: torch.Tensor,
++    post_weight: torch.Tensor,
++    pre_weight: torch.Tensor,
++    alpha: torch.Tensor,
++    beta: torch.Tensor,
++    post_norm_input_scale: bool = False,
++    round_pre_norm_input: bool = False,
++    output_fp32: torch.Tensor | None = None,
++) -> tuple[torch.Tensor, torch.Tensor]:
++    output = torch.empty_like(branch)
++    new_stream = torch.empty_like(stream)
++    torch.ops.sgl_kernel.fused_post_norm_residual_pre_norm(
++        branch,
++        stream,
++        post_weight,
++        pre_weight,
++        alpha,
++        beta,
++        output,
++        new_stream,
++        POST_EPS,
++        PRE_EPS,
++        post_norm_input_scale,
++        round_pre_norm_input,
++        output_fp32,
++    )
++    return output, new_stream
++
++
++def test_round_bfloat16_reference_midpoints():
++    midpoint = 1.30859375
++    values = torch.tensor(
++        [midpoint - 2**-40, midpoint, midpoint + 2**-40], dtype=torch.float64
++    )
++    expected = torch.tensor([1.3046875, 1.3125, 1.3125], dtype=torch.bfloat16)
++    torch.testing.assert_close(round_bfloat16(values), expected, rtol=0, atol=0)
++    torch.testing.assert_close(round_bfloat16(-values), -expected, rtol=0, atol=0)
++
++
++def test_fused_norm_residual_fp32_fma_boundary():
++    device = torch.device("xpu")
++    branch = -torch.ones(1, 8, dtype=torch.bfloat16, device=device)
++    stream = torch.full((1, 8), 1 - 2**-23, dtype=torch.float32, device=device)
++    alpha = torch.full((8,), 1 + 2**-23, dtype=torch.float32, device=device)
++    beta = torch.ones_like(alpha)
++    post = torch.empty(0, dtype=torch.bfloat16, device=device)
++    pre = torch.ones(8, dtype=torch.bfloat16, device=device)
++    _, updated = run_op(branch, stream, post, pre, alpha, beta)
++    torch.testing.assert_close(
++        updated.cpu(), torch.full((1, 8), -(2**-46)), rtol=0, atol=0
++    )
++
++
++@pytest.mark.parametrize("rows", [1, 37, 257])
++@pytest.mark.parametrize("hidden_size", [4096, 8192, 16384])
++@pytest.mark.parametrize("post_mode", ["none", "weight", "input_scale"])
++@pytest.mark.parametrize("round_pre_norm_input", [False, True])
++def test_fused_norm_residual(
++    rows: int, hidden_size: int, post_mode: str, round_pre_norm_input: bool
++) -> None:
++    torch.manual_seed(1234 + rows)
++    device = torch.device("xpu")
++    branch = torch.randn(rows, hidden_size, device=device, dtype=torch.bfloat16)
++    stream = torch.randn(rows, hidden_size, device=device, dtype=torch.float32)
++    post_weight = (
++        torch.empty(0, device=device, dtype=torch.bfloat16)
++        if post_mode == "none"
++        else torch.randn(hidden_size, device=device, dtype=torch.bfloat16)
++    )
++    pre_weight = torch.randn(hidden_size, device=device, dtype=torch.bfloat16)
++    alpha = torch.rand(hidden_size, device=device, dtype=torch.float32)
++    beta = torch.rand(hidden_size, device=device, dtype=torch.float32)
++
++    # The XPU elementwise reference can produce incorrect values on CRI for
++    # these shapes. Compute the independent reference from the same inputs on
++    # CPU and compare there so the test checks the fused kernel itself.
++    branch_cpu, stream_cpu = branch.cpu(), stream.cpu()
++    post_weight_cpu, pre_weight_cpu = post_weight.cpu(), pre_weight.cpu()
++    alpha_cpu, beta_cpu = alpha.cpu(), beta.cpu()
++    actual_output, actual_stream = run_op(
++        branch,
++        stream,
++        post_weight,
++        pre_weight,
++        alpha,
++        beta,
++        post_mode == "input_scale",
++        round_pre_norm_input,
++    )
++
++    actual_output_cpu = actual_output.float().cpu()
++    actual_stream_cpu = actual_stream.cpu()
++    for start in range(0, rows, 512):
++        expected_output, expected_stream, _ = reference(
++            branch_cpu[start : start + 512],
++            stream_cpu[start : start + 512],
++            post_weight_cpu,
++            pre_weight_cpu,
++            alpha_cpu,
++            beta_cpu,
++            post_mode == "input_scale",
++            round_pre_norm_input,
++        )
++        torch.testing.assert_close(
++            actual_output_cpu[start : start + 512],
++            expected_output,
++            rtol=5e-3,
++            atol=5e-3,
++        )
++        torch.testing.assert_close(
++            actual_stream_cpu[start : start + 512],
++            expected_stream,
++            rtol=1e-5,
++            atol=1e-5,
++        )
++
++    output_fp32 = torch.empty_like(stream)
++    widened_output, widened_stream = run_op(
++        branch,
++        stream,
++        post_weight,
++        pre_weight,
++        alpha,
++        beta,
++        post_mode == "input_scale",
++        round_pre_norm_input,
++        output_fp32,
++    )
++    torch.testing.assert_close(
++        widened_output.cpu(), actual_output.cpu(), rtol=0, atol=0
++    )
++    torch.testing.assert_close(
++        widened_stream.cpu(), actual_stream.cpu(), rtol=0, atol=0
++    )
++    torch.testing.assert_close(
++        output_fp32.cpu(), actual_output.cpu().float(), rtol=0, atol=0
++    )
++
++
++def test_fused_norm_residual_hidden_tail_rows_boundary() -> None:
++    # H=8200 uses a partial final vector; rows=385 borders a workgroup change.
++    test_fused_norm_residual(385, 8200, "none", True)
++
++
++@pytest.mark.parametrize("rows", [8, 32768])
++@pytest.mark.parametrize("post_mode", ["none", "weight", "input_scale"])
++@pytest.mark.parametrize("round_pre_norm_input", [False, True])
++def test_fused_norm_residual_production_shapes(rows, post_mode, round_pre_norm_input):
++    # Muse-Spark B8: decode T8, ISL4096 prefill T32768, hidden8192, BF16/FP32 stream.
++    test_fused_norm_residual(rows, 8192, post_mode, round_pre_norm_input)
++
++
++def benchmark(
++    rows: int,
++    hidden_size: int,
++    warmup: int,
++    iterations: int,
++    post_norm_input_scale: bool,
++    round_pre_norm_input: bool,
++    profiler_events: bool = False,
++) -> None:
++    device = torch.device("xpu")
++    branch = torch.randn(rows, hidden_size, device=device, dtype=torch.bfloat16)
++    stream = torch.randn(rows, hidden_size, device=device, dtype=torch.float32)
++    post_weight = (
++        torch.randn(hidden_size, device=device, dtype=torch.bfloat16)
++        if post_norm_input_scale
++        else torch.empty(0, device=device, dtype=torch.bfloat16)
++    )
++    pre_weight = torch.randn(hidden_size, device=device, dtype=torch.bfloat16)
++    alpha = torch.rand(hidden_size, device=device, dtype=torch.float32)
++    beta = torch.rand(hidden_size, device=device, dtype=torch.float32)
++
++    for _ in range(warmup):
++        run_op(
++            branch,
++            stream,
++            post_weight,
++            pre_weight,
++            alpha,
++            beta,
++            post_norm_input_scale,
++            round_pre_norm_input,
++        )
++    torch.xpu.synchronize()
++
++    if profiler_events:
++        with torch.profiler.profile(
++            activities=[
++                torch.profiler.ProfilerActivity.CPU,
++                torch.profiler.ProfilerActivity.XPU,
++            ]
++        ) as profiler:
++            for _ in range(iterations):
++                run_op(
++                    branch,
++                    stream,
++                    post_weight,
++                    pre_weight,
++                    alpha,
++                    beta,
++                    post_norm_input_scale,
++                    round_pre_norm_input,
++                )
++            torch.xpu.synchronize()
++        with tempfile.TemporaryDirectory() as directory:
++            trace_path = Path(directory) / "trace.json"
++            profiler.export_chrome_trace(str(trace_path))
++            events = json.loads(trace_path.read_text())["traceEvents"]
++        kernels = [event for event in events if event.get("cat") == "kernel"]
++        if len(kernels) != iterations:
++            names = sorted({event.get("name", "") for event in kernels})
++            raise RuntimeError(
++                f"expected {iterations} XPU kernel events, got {len(kernels)}: {names}"
++            )
++        durations_us = [event["dur"] for event in kernels]
++        latency_us = statistics.median(durations_us)
++        print(
++            f"rows={rows} hidden={hidden_size} "
++            f"post_norm_input_scale={post_norm_input_scale} "
++            f"round_pre_norm_input={round_pre_norm_input} "
++            f"kernel_event_p50={latency_us:.3f} us "
++            f"kernel_event_range_us=[{min(durations_us):.3f},{max(durations_us):.3f}] "
++            f"kernel_event_samples_us={json.dumps(durations_us)}"
++        )
++        return
++
++    start = torch.xpu.Event(enable_timing=True)
++    end = torch.xpu.Event(enable_timing=True)
++    start.record()
++    for _ in range(iterations):
++        run_op(
++            branch,
++            stream,
++            post_weight,
++            pre_weight,
++            alpha,
++            beta,
++            post_norm_input_scale,
++            round_pre_norm_input,
++        )
++    end.record()
++    end.synchronize()
++    elapsed_ms = start.elapsed_time(end) / iterations
++
++    # Compulsory tensor traffic: branch + stream + output + new_stream.
++    bytes_per_row = hidden_size * (2 + 4 + 2 + 4)
++    bandwidth_gbs = bytes_per_row * rows / (elapsed_ms * 1e6)
++    print(
++        f"rows={rows} hidden={hidden_size} "
++        f"post_norm_input_scale={post_norm_input_scale} "
++        f"round_pre_norm_input={round_pre_norm_input} time_ms={elapsed_ms:.4f} "
++        f"three_layers_ms={elapsed_ms * 3:.4f} bandwidth_GBps={bandwidth_gbs:.1f}"
++    )
++
++
++if __name__ == "__main__":
++    parser = argparse.ArgumentParser()
++    parser.add_argument("--rows", type=int, default=32768)
++    parser.add_argument("--hidden-size", type=int, default=8192)
++    parser.add_argument("--warmup", type=int, default=10)
++    parser.add_argument("--iterations", type=int, default=30)
++    parser.add_argument("--profiler", action="store_true")
++    parser.add_argument("--post-norm-input-scale", action="store_true")
++    parser.add_argument("--round-pre-norm-input", action="store_true")
++    args = parser.parse_args()
++    if args.rows <= 0 or args.hidden_size <= 0 or args.hidden_size % 8:
++        parser.error(
++            "rows must be positive and hidden-size must be a positive multiple of 8"
++        )
++    if args.warmup < 0 or args.iterations <= 0:
++        parser.error("warmup must be nonnegative and iterations must be positive")
++    benchmark(
++        args.rows,
++        args.hidden_size,
++        args.warmup,
++        args.iterations,
++        args.post_norm_input_scale,
++        args.round_pre_norm_input,
++        args.profiler,
++    )

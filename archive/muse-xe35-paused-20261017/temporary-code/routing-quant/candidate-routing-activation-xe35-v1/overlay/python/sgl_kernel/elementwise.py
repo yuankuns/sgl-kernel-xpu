@@ -1,0 +1,723 @@
+from typing import List, Optional
+
+import torch
+from sgl_kernel.utils import get_xpu_stream, is_xe3_arch
+
+
+def rmsnorm(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float = 1e-6,
+    out: Optional[torch.Tensor] = None,
+    enable_pdl: Optional[bool] = None,
+) -> torch.Tensor:
+    r"""Root mean square normalization.
+
+    ``out[i] = (input[i] / RMS(input)) * weight[i]``
+
+    Parameters
+    ----------
+    input: torch.Tensor
+        Input tensor, shape ``(batch_size, hidden_size)`` or
+        ``(batch_size, seq_len, hidden_size)``.
+    weight: torch.Tensor
+        Weight tensor, shape (hidden_size,).
+    eps: float
+        Epsilon for numerical stability.
+    out: Optional[torch.Tensor]
+        The output tensor, if specified, the kernel will update this tensor inplace.
+    enable_pdl: Optional[bool]
+        Not Used on XPU.
+
+    Returns
+    -------
+    output: torch.Tensor
+        Normalized tensor, same shape as input.
+    """
+    if out is None:
+        out = torch.empty_like(input)
+    torch.ops.sgl_kernel.rmsnorm(out, input, weight, eps)
+    return out
+
+
+def fused_add_rmsnorm(
+    input: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float = 1e-6,
+    enable_pdl: Optional[bool] = None,
+) -> None:
+    r"""Fused add root mean square normalization.
+
+    Step 1:
+    ``residual[i] += input[i]``
+
+    Step 2:
+    ``input[i] = (residual[i] / RMS(residual)) * weight[i]``
+
+    Parameters
+    ----------
+    input: torch.Tensor
+        Input tensor, shape ``(batch_size, hidden_size)`` or
+        ``(batch_size, seq_len, hidden_size)``.
+    residual: torch.Tensor
+        Residual tensor, same shape as input.
+    weight: torch.Tensor
+        Weight tensor, shape (hidden_size,).
+    eps: float
+        Epsilon for numerical stability.
+    enable_pdl: Optional[bool]
+        Not Used on XPU.
+    """
+    torch.ops.sgl_kernel.fused_add_rmsnorm(input, residual, weight, eps)
+
+
+def gemma_rmsnorm(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float = 1e-6,
+    out: Optional[torch.Tensor] = None,
+    enable_pdl: Optional[bool] = None,
+) -> torch.Tensor:
+    r"""Gemma-style root mean square normalization.
+
+    ``out[i] = (input[i] / RMS(input)) * (weight[i] + 1)``
+
+    Parameters
+    ----------
+    input: torch.Tensor
+        Input tensor, shape ``(batch_size, hidden_size)`` or
+        ``(batch_size, seq_len, hidden_size)``.
+    weight: torch.Tensor
+        Weight tensor, shape (hidden_size,).
+    eps: float
+        Epsilon for numerical stability.
+    out: Optional[torch.Tensor]
+        The output tensor, if specified, the kernel will update this tensor inplace.
+    enable_pdl: Optional[bool]
+        Not Used on XPU.
+
+    Returns
+    -------
+    output: torch.Tensor
+        Gemma Normalized tensor, same shape as input.
+    """
+    if out is None:
+        out = torch.empty_like(input)
+    torch.ops.sgl_kernel.gemma_rmsnorm(out, input, weight, eps)
+    return out
+
+
+def gemma_fused_add_rmsnorm(
+    input: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float = 1e-6,
+    enable_pdl: Optional[bool] = None,
+) -> None:
+    r"""Gemma-style fused add root mean square normalization.
+
+    Step 1:
+    ``residual[i] += input[i]``
+
+    Step 2:
+    ``input[i] = (residual[i] / RMS(residual)) * (weight + 1)``
+
+    Parameters
+    ----------
+    input: torch.Tensor
+        Input tensor, shape ``(batch_size, hidden_size)`` or
+        ``(batch_size, seq_len, hidden_size)``.
+    residual: torch.Tensor
+        Residual tensor, same shape as input.
+    weight: torch.Tensor
+        Weight tensor, shape (hidden_size,).
+    eps: float
+        Epsilon for numerical stability.
+    enable_pdl: Optional[bool]
+        Not Used on XPU.
+    """
+    torch.ops.sgl_kernel.gemma_fused_add_rmsnorm(input, residual, weight, eps)
+
+
+def fused_inplace_qknorm_rope(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    q_weight: torch.Tensor,
+    k_weight: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    positions: torch.Tensor,
+    is_neox: bool,
+    eps: float = 1e-6,
+    head_dim: int = 0,
+    rope_dim: int = 0,
+) -> None:
+    r"""Apply fused RMSNorm + RoPE to Q/K using a precomputed cos/sin cache.
+
+    Step 1:
+    ``q = RMSNorm(q, q_weight)`` and ``k = RMSNorm(k, k_weight)``
+
+    Step 2:
+    ``q`` and ``k`` are rotated in-place using the cached cosine/sine values
+    indexed by ``positions``.
+
+    Parameters
+    ----------
+    q: torch.Tensor
+        Query tensor updated in-place.
+    k: torch.Tensor
+        Key tensor updated in-place.
+    q_weight: torch.Tensor
+        RMSNorm weights for query, shape ``(head_dim,)``.
+    k_weight: torch.Tensor
+        RMSNorm weights for key, shape ``(head_dim,)``.
+    cos_sin_cache: torch.Tensor
+        Precomputed RoPE cosine/sine cache, shape ``(max_pos, rope_dim)``.
+    positions: torch.Tensor
+        Position indices used to select rows from ``cos_sin_cache``.
+    is_neox: bool
+        Whether to apply NeoX-style rotary layout.
+    eps: float
+        Epsilon for RMS normalization.
+    head_dim: int
+        Optional explicit head dimension. Defaults to ``q.size(-1)`` when set to 0.
+    rope_dim: int
+        Optional explicit rotary dimension. Defaults to ``cos_sin_cache.size(-1)`` when set to 0.
+
+    Note
+    ----
+    This is an in-place operation that modifies ``q`` and ``k`` directly.
+    """
+    torch.ops.sgl_kernel.fused_inplace_qknorm_rope(
+        q,
+        k,
+        q_weight,
+        k_weight,
+        cos_sin_cache,
+        positions,
+        is_neox,
+        eps,
+        head_dim,
+        rope_dim,
+    )
+
+
+def _check_shape(input: torch.Tensor, output: torch.Tensor) -> None:
+    assert input.ndim == output.ndim, f"{input.ndim} != {output.ndim}"
+    assert (
+        input.shape[:-1] == output.shape[:-1]
+    ), f"{input.shape[:-1]} != {output.shape[:-1]}"
+    assert (
+        input.shape[-1] == 2 * output.shape[-1]
+    ), f"{input.shape[-1]} != {2 * output.shape[-1]}"
+
+
+def silu_and_mul(input: torch.Tensor, out: torch.Tensor = None) -> torch.Tensor:
+    if input.shape[-1] * input.dtype.itemsize % 16 != 0:
+        raise ValueError("The pointers must be multiple of 16 bytes.")
+    if out is not None:
+        _check_shape(input, out)
+    else:
+        out = torch.empty(
+            input.shape[:-1] + (input.shape[-1] // 2,),
+            device=input.device,
+            dtype=input.dtype,
+        )
+    if input.device.type == "xpu" and is_xe3_arch():
+        torch.ops.sgl_kernel.silu_and_mul_xe35(out, input)
+    else:
+        torch.ops.sgl_kernel.silu_and_mul(out, input)
+    return out
+
+
+def silu_and_mul_clamp(
+    input: torch.Tensor,
+    out: torch.Tensor,
+    swiglu_limit: float,
+) -> None:
+    """Fused SiLU-and-Mul with BF16 clamping (DeepSeek-V4 / DeepGEMM style).
+
+    Writes result into *output* in-place; returns nothing.
+
+    Parameters
+    ----------
+    input : torch.Tensor
+        Shape ``(M, 2*H)``, dtype bf16 or fp16.  Gate and up halves are
+        concatenated on the last dimension (split layout, not interleaved).
+    output : torch.Tensor
+        Shape ``(M, H)``, same dtype as *input*, pre-allocated output buffer.
+    swiglu_limit : float
+        Positive clamping bound.  Applied in BF16 precision to match the
+        DeepGEMM ``__hmin2`` / ``__hmax2`` semantics:
+          - gate is upper-clamped:  gate  = min(gate, limit)
+          - up is two-sided-clamped: up   = clamp(up, -limit, limit)
+    """
+    if input.shape[-1] * input.dtype.itemsize % 16 != 0:
+        raise ValueError("The pointers must be multiple of 16 bytes.")
+    _check_shape(input, out)
+    torch.ops.sgl_kernel.silu_and_mul_clamp(out, input, swiglu_limit)
+
+
+def gelu_tanh_and_mul(input: torch.Tensor, out: torch.Tensor = None) -> torch.Tensor:
+    if input.shape[-1] * input.dtype.itemsize % 16 != 0:
+        raise ValueError("The pointers must be multiple of 16 bytes.")
+    if out is not None:
+        _check_shape(input, out)
+    else:
+        out = torch.empty(
+            input.shape[:-1] + (input.shape[-1] // 2,),
+            device=input.device,
+            dtype=input.dtype,
+        )
+    torch.ops.sgl_kernel.gelu_tanh_and_mul(out, input)
+    return out
+
+
+def gelu_and_mul(input: torch.Tensor, out: torch.Tensor = None) -> torch.Tensor:
+    if input.shape[-1] * input.dtype.itemsize % 16 != 0:
+        raise ValueError("The pointers must be multiple of 16 bytes.")
+    if out is not None:
+        _check_shape(input, out)
+    else:
+        out = torch.empty(
+            input.shape[:-1] + (input.shape[-1] // 2,),
+            device=input.device,
+            dtype=input.dtype,
+        )
+    torch.ops.sgl_kernel.gelu_and_mul(out, input)
+    return out
+
+
+def store_cache_xpu(
+    k: torch.Tensor,
+    v: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    indices: torch.Tensor,
+) -> None:
+    r"""Fused KV-cache store for XPU.
+
+    Writes K and V into the flat KV-cache at the given slot indices in a
+    single SYCL kernel launch (replacing 2x aten::_index_put_impl_).
+
+    Parameters
+    ----------
+    k : torch.Tensor
+        Key tensor, shape: ``(num_tokens, row_dim)``. Rows may be strided
+        (e.g. a per-head slice of a wider tensor); only the inner row must be
+        contiguous (``k.stride(1) == 1``). Supported dtypes: fp16, bf16,
+        uint8.
+    v : torch.Tensor
+        Value tensor, shape: ``(num_tokens, row_dim)``. Same row-contiguity
+        rule as ``k``.
+    k_cache : torch.Tensor
+        Key cache buffer, shape: ``(cache_size, row_dim)``.
+    v_cache : torch.Tensor
+        Value cache buffer, shape: ``(cache_size, row_dim)``.
+    indices : torch.Tensor
+        Flat cache slot indices, shape: ``(num_tokens,)``, dtype int64.
+        Use -1 to skip a token.
+    """
+    torch.ops.sgl_kernel.store_cache(k, v, k_cache, v_cache, indices.long())
+
+
+def apply_rope_with_cos_sin_cache_inplace(
+    positions: torch.Tensor,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    head_size: int,
+    cos_sin_cache: torch.Tensor,
+    is_neox: bool = True,
+) -> None:
+    r"""
+    Apply rotary embedding to keys and queries with precomputed cos/sin values.
+    This is designed to be compatible with the SGL/vLLM implementation.
+    The result is inplace applied to the input tensors.
+
+    Parameters
+    ----------
+    positions : torch.Tensor
+        Position indices, shape: ``(nnz)``.
+    query : torch.Tensor
+        Query tensor, shape: ``(nnz, num_q_heads * head_size)``.
+    key : torch.Tensor
+        Key tensor, shape: ``(nnz, num_k_heads * head_size)``.
+    cos_sin_cache : torch.Tensor
+        Cosine and Sine cache tensor, shape: ``(max_seq_len, rotary_dim)``.
+        Cosine is the first half and Sine is the second half on rotary_dim.
+    is_neox : bool
+        Whether to use Neox style RoPE, default: ``True``.
+
+        * If ``True``, the last dimension of the query/key tensor is not interleaved, i.e.,
+          we rotate the first half dimensions ``([..., :head_dim//2])`` and the second half
+          dimensions ``([..., head_dim//2:])``.
+
+        * If ``False``, the last dimension of the query/key tensor is interleaved, i.e.,
+          we rotate the even dimensions ``([..., ::2])`` and odd dimensions ``([..., 1::2])``.
+    Note
+    ----
+    The rotary dimension is determined by the cosine cache and sine cache.
+    """
+    if cos_sin_cache.dtype != torch.float32:
+        raise ValueError("cos_sin_cache should be float32")
+
+    torch.ops.sgl_kernel.apply_rope_pos_ids_cos_sin_cache.default(
+        query.view(query.shape[0], -1, head_size),
+        key.view(key.shape[0], -1, head_size),
+        query.view(query.shape[0], -1, head_size),
+        key.view(key.shape[0], -1, head_size),
+        cos_sin_cache,
+        positions.long(),
+        (not is_neox),
+        get_xpu_stream(),
+    )
+
+
+def fused_qk_norm_rope(
+    qkv: torch.Tensor,
+    num_heads_q: int,
+    num_heads_k: int,
+    num_heads_v: int,
+    head_dim: int,
+    eps: float,
+    q_weight: torch.Tensor,
+    k_weight: torch.Tensor,
+    base: float,
+    is_neox: bool,
+    position_ids: torch.Tensor,
+    factor: float = 1.0,
+    low: float = 1.0,
+    high: float = 1.0,
+    attention_factor: float = 1.0,
+    rotary_dim: int = None,
+) -> None:
+    r"""Fused QK RMS normalization and RoPE application.
+
+    This operator applies RMS normalization and RoPE (Rotary Position Embedding)
+    to Q and K tensors in a single CUDA/SYCL kernel. The operation is performed
+    in-place on the input qkv tensor.
+
+    Parameters
+    ----------
+    qkv : torch.Tensor
+        Combined QKV tensor, shape: ``(num_tokens, (num_heads_q + num_heads_k + num_heads_v) * head_dim)``.
+        The tensor is modified in-place.
+    num_heads_q : int
+        Number of query heads.
+    num_heads_k : int
+        Number of key heads.
+    num_heads_v : int
+        Number of value heads.
+    head_dim : int
+        Dimension per head.
+    eps : float
+        Epsilon for RMS normalization.
+    q_weight : torch.Tensor
+        RMSNorm weights for query, shape: ``(head_dim,)``.
+    k_weight : torch.Tensor
+        RMSNorm weights for key, shape: ``(head_dim,)``.
+    base : float
+        Base for RoPE computation.
+    is_neox : bool
+        Whether RoPE is applied in Neox style.
+
+        * If ``True``, the last dimension of the query/key tensor is not interleaved.
+        * If ``False``, the last dimension of the query/key tensor is interleaved.
+    position_ids : torch.Tensor
+        Position IDs for RoPE, shape: ``(num_tokens,)``.
+    factor : float, optional
+        Scaling factor for YARN (YaRN: Yet another RoPE extensioN method).
+        When it is not 1.0, the model is using YARN. Default: 1.0.
+    low : float, optional
+        YARN low frequency threshold. Default: 1.0.
+    high : float, optional
+        YARN high frequency threshold. Default: 1.0.
+    attention_factor : float, optional
+        Attention factor applied on cos and sin values. Default: 1.0.
+    rotary_dim : int, optional
+        Rotary dimension. If None, defaults to head_dim.
+
+    Note
+    ----
+    This is an in-place operation that modifies the qkv tensor directly.
+    Only the Q and K portions of the tensor are modified; V remains unchanged.
+    """
+    if rotary_dim is None:
+        rotary_dim = head_dim
+
+    torch.ops.sgl_kernel.fused_qk_norm_rope(
+        qkv,
+        num_heads_q,
+        num_heads_k,
+        num_heads_v,
+        head_dim,
+        eps,
+        q_weight,
+        k_weight,
+        base,
+        is_neox,
+        position_ids,
+        factor,
+        low,
+        high,
+        attention_factor,
+        rotary_dim,
+    )
+
+
+def fused_qk_rope(
+    qkv: torch.Tensor,
+    num_heads_q: int,
+    num_heads_k: int,
+    num_heads_v: int,
+    head_dim: int,
+    q_weight: torch.Tensor,
+    k_weight: torch.Tensor,
+    base: float,
+    is_neox: bool,
+    position_ids: torch.Tensor,
+    factor: float = 1.0,
+    low: float = 1.0,
+    high: float = 1.0,
+    attention_factor: float = 1.0,
+    rotary_dim: int = None,
+) -> None:
+    r"""Fused QK per-dimension weight scaling and RoPE application (no RMSNorm).
+
+    Unlike :func:`fused_qk_norm_rope`, no RMS normalization is performed.
+    The operator applies per-dimension weight scaling followed by RoPE
+    (Rotary Position Embedding) to Q and K tensors in a single SYCL kernel.
+    The operation is performed in-place on the input qkv tensor.
+
+    Parameters
+    ----------
+    qkv : torch.Tensor
+        Combined QKV tensor, shape: ``(num_tokens, (num_heads_q + num_heads_k + num_heads_v) * head_dim)``.
+        The tensor is modified in-place.
+    num_heads_q : int
+        Number of query heads.
+    num_heads_k : int
+        Number of key heads.
+    num_heads_v : int
+        Number of value heads.
+    head_dim : int
+        Dimension per head.
+    q_weight : torch.Tensor
+        Per-dimension weights for query, shape: ``(head_dim,)``.
+    k_weight : torch.Tensor
+        Per-dimension weights for key, shape: ``(head_dim,)``.
+    base : float
+        Base for RoPE computation.
+    is_neox : bool
+        Whether RoPE is applied in Neox style.
+
+        * If ``True``, the last dimension of the query/key tensor is not interleaved.
+        * If ``False``, the last dimension of the query/key tensor is interleaved.
+    position_ids : torch.Tensor
+        Position IDs for RoPE, dtype: ``torch.int32`` (``torch.int``), shape: ``(num_tokens,)``.
+    factor : float, optional
+        Scaling factor for YARN. Default: 1.0.
+    low : float, optional
+        YARN low frequency threshold. Default: 1.0.
+    high : float, optional
+        YARN high frequency threshold. Default: 1.0.
+    attention_factor : float, optional
+        Attention factor applied on cos and sin values. Default: 1.0.
+    rotary_dim : int, optional
+        Rotary dimension. If None, defaults to head_dim.
+
+    Note
+    ----
+    This is an in-place operation that modifies the qkv tensor directly.
+    Only the Q and K portions of the tensor are modified; V remains unchanged.
+    """
+    if rotary_dim is None:
+        rotary_dim = head_dim
+
+    torch.ops.sgl_kernel.fused_qk_rope(
+        qkv,
+        num_heads_q,
+        num_heads_k,
+        num_heads_v,
+        head_dim,
+        q_weight,
+        k_weight,
+        base,
+        is_neox,
+        position_ids,
+        factor,
+        low,
+        high,
+        attention_factor,
+        rotary_dim,
+    )
+
+
+def fused_qk_rope_with_cos_sin_cache_inplace(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    positions: torch.Tensor,
+    rope_dim: int,
+    is_neox: bool,
+) -> None:
+    r"""Apply RoPE to Q/K using precomputed cos/sin cache.
+
+    Parameters
+    ----------
+    q: torch.Tensor
+        Query tensor updated in-place.
+    k: torch.Tensor
+        Key tensor updated in-place.
+    cos_sin_cache: torch.Tensor
+        Precomputed RoPE cos/sin cache.
+    positions: torch.Tensor
+        Position indices used to index the cache.
+    rope_dim: int
+        Rotary/RoPE dimension represented by ``cos_sin_cache`` (that is,
+        the size of the cached cos/sin concatenation), not the full attention
+        head dimension.
+    is_neox: bool
+        Whether to apply NeoX-style rotary layout.
+    """
+    torch.ops.sgl_kernel.fused_qk_rope_with_cos_sin_cache_inplace(
+        q,
+        k,
+        cos_sin_cache,
+        positions,
+        rope_dim,
+        is_neox,
+    )
+
+
+def multimodal_rotary_embedding(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    positions: torch.Tensor,
+    mrope_section: List[int],
+    head_size: int,
+    rotary_dim: int,
+    mrope_interleaved: bool,
+    mrope_interleaved_glm: bool,
+    is_neox: bool,
+    axis_map: Optional[torch.Tensor],
+) -> None:
+    r"""Apply multimodal RoPE to Q/K using precomputed cos/sin cache.
+
+    Parameters
+    ----------
+    query: torch.Tensor
+        Query tensor updated in-place.
+    key: torch.Tensor
+        Key tensor updated in-place.
+    cos_sin_cache: torch.Tensor
+        Precomputed RoPE cos/sin cache.
+    positions: torch.Tensor
+        Position indices used to index the cache.
+    mrope_section: List[int]
+        Per-axis section sizes for multimodal RoPE.
+    head_size: int
+        Full attention head size for Q/K.
+    rotary_dim: int
+        Rotary/RoPE dimension represented by ``cos_sin_cache``.
+    mrope_interleaved: bool
+        Whether multimodal rotary dimensions are interleaved.
+    mrope_interleaved_glm: bool
+        Whether to use GLM-style interleaving behavior.
+    is_neox: bool
+        Whether to apply NeoX-style rotary layout.
+    axis_map: Optional[torch.Tensor]
+        Optional axis remapping tensor for multimodal position handling.
+    """
+    torch.ops.sgl_kernel.multimodal_rotary_embedding(
+        query,
+        key,
+        cos_sin_cache,
+        positions,
+        mrope_section,
+        head_size,
+        rotary_dim,
+        mrope_interleaved,
+        mrope_interleaved_glm,
+        is_neox,
+        axis_map,
+    )
+
+
+def fused_q_norm_rope(
+    q_input: torch.Tensor,  # (B, num_q_heads, head_dim)  any float dtype
+    q_output: torch.Tensor,  # (B, num_q_heads, head_dim)  same dtype, pre-allocated
+    freqs_cis: torch.Tensor,  # (max_pos, rope_dim) fp32, interleaved re/im
+    positions: torch.Tensor,  # (B,) int32 or int64
+    eps: float,
+) -> None:
+    r"""Fused unweighted RMSNorm-self + RoPE for the DeepSeek-V4 Q path.
+
+    Writes the result into ``q_output`` (same shape/dtype as ``q_input``).
+    Dispatches to a sub-group ("warp") kernel for ``head_dim`` in
+    ``{64, 128, 192, 256}`` when ``rope_dim`` aligns with a lane boundary
+    (i.e. ``rope_dim % (head_dim // 16) == 0``), and to a work-group ("CTA")
+    kernel otherwise (including all ``head_dim > 256``, e.g. DeepSeek-V4's ``512``).
+
+    Algorithm (per token, per head):
+      1. RMSNorm-self  -- normalize the full head_dim vector (no learned weight).
+      2. NoPE region   -- first ``(head_dim - rope_dim)`` elements written as-is.
+      3. RoPE region   -- last ``rope_dim`` elements rotated with ``freqs_cis``.
+
+    Parameters
+    ----------
+    q_input: torch.Tensor
+        Shape ``(B, num_q_heads, head_dim)``.
+    q_output: torch.Tensor
+        Pre-allocated output, same shape/dtype as ``q_input``.
+    freqs_cis: torch.Tensor
+        Shape ``(max_pos, rope_dim)`` fp32, interleaved
+        ``[re0, im0, re1, im1, ...]`` (i.e.
+        ``torch.view_as_real(freqs_cis_complex).flatten(-2)``).
+    positions: torch.Tensor
+        Shape ``(B,)``, int32 or int64.
+    eps: float
+        RMSNorm epsilon.
+
+    Note
+    ----
+    This is an in-place operation that writes into ``q_output`` directly.
+    """
+    torch.ops.sgl_kernel.fused_q_norm_rope(q_input, q_output, freqs_cis, positions, eps)
+
+
+def fused_k_norm_rope_flashmla(
+    kv: torch.Tensor,
+    kv_weight: torch.Tensor,
+    freqs_cis: torch.Tensor,
+    positions: torch.Tensor,
+    out_loc: torch.Tensor,
+    kvcache: torch.Tensor,
+    eps: float,
+    page_size: int,
+) -> None:
+    r"""Fused K-norm + RoPE + FlashMLA paged cache store for DeepSeek-V4.
+
+    Parameters
+    ----------
+    kv: torch.Tensor
+        Shape ``(B, 512)``, bf16/fp16/fp32.
+    kv_weight: torch.Tensor
+        Shape ``(512,)``, same dtype as ``kv``.
+    freqs_cis: torch.Tensor
+        Shape ``(max_pos, 64)`` fp32, interleaved ``[re0, im0, re1, im1, ...]``.
+    positions: torch.Tensor
+        Shape ``(B,)``, int32 or int64.
+    out_loc: torch.Tensor
+        Shape ``(B,)``, int32 cache slot indices. Negative values skip store.
+    kvcache: torch.Tensor
+        Shape ``(npages, kPageBytes)``, uint8 tensor.
+    eps: float
+        RMSNorm epsilon.
+    page_size: int
+        Page size (must be a power of 2).
+    """
+    torch.ops.sgl_kernel.fused_k_norm_rope_flashmla(
+        kv, kv_weight, freqs_cis, positions, out_loc, kvcache, eps, page_size
+    )

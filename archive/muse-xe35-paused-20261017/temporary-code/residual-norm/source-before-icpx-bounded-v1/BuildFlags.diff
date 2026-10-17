@@ -1,0 +1,19 @@
+--- ec29f7a/cmake/BuildFlags.cmake
++++ snapshot/cmake/BuildFlags.cmake
+@@ -26,7 +26,7 @@
+ endfunction()
+ 
+ # Support GCC on Linux.
+-if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
++if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" OR CMAKE_CXX_COMPILER_ID STREQUAL "IntelLLVM")
+   set(SYCL_HOST_FLAGS)
+   set(SYCL_KERNEL_OPTIONS)
+   set(SYCL_COMPILE_FLAGS ${SYCL_FLAGS})
+@@ -172,6 +172,6 @@
+ 
+   set(SYCL_OFFLINE_COMPILER_FLAGS "${SYCL_OFFLINE_COMPILER_AOT_OPTIONS}${SYCL_OFFLINE_COMPILER_CG_OPTIONS}")
+ else()
+-  message("Not compiling with XPU. Currently only support GCC compiler on Linux as CXX compiler.")
++  message("Not compiling with XPU. Currently only support GCC or IntelLLVM compiler on Linux as CXX compiler.")
+   return()
+ endif()

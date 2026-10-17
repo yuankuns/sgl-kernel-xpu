@@ -1,0 +1,21 @@
+{
+  "directory": "/home/syk/worktrees/sgl-kernel-xpu-up/pr/muse-position-xe35",
+  "head": "833c95208dccd2af5628c121222f91186a5b2de7",
+  "branch": "pr/muse-position-xe35",
+  "patch_sha256": "0a365fab2dcb440a645671fb57ee7d2cb802897e27980e9bc6d2a79a00ce6812",
+  "tracked_paths": [
+    "cmake/BuildFlags.cmake",
+    "include/sgl_kernel_ops.h",
+    "src/sycl/Device.cpp",
+    "src/sycl/HCHead.cpp",
+    "src/torch_extension_sycl.cc"
+  ],
+  "untracked_code": [
+    "benchmark/bench_position_occupancy.py",
+    "include/sgl_kernel/xe35/position_ops.h",
+    "src/sycl/xe35/ComputePosition.cpp",
+    "tests/test_compute_position.py",
+    "tests/test_position_benchmark_scope.py"
+  ],
+  "apply_check": "PASS"
+}

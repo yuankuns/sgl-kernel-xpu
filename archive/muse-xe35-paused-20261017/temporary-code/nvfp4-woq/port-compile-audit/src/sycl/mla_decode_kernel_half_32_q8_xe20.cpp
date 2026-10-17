@@ -1,0 +1,84 @@
+/***************************************************************************************************
+ * Copyright (C) 2026 Intel Corporation, All rights reserved.
+ * SPDX-License-Identifier: BSD-3-Clause
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met:
+ *
+ * 1. Redistributions of source code must retain the above copyright notice, this
+ * list of conditions and the following disclaimer.
+ *
+ * 2. Redistributions in binary form must reproduce the above copyright notice,
+ * this list of conditions and the following disclaimer in the documentation
+ * and/or other materials provided with the distribution.
+ *
+ * 3. Neither the name of the copyright holder nor the names of its
+ * contributors may be used to endorse or promote products derived from
+ * this software without specific prior written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+ * DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+ * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+ * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+ * SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+ * CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+ * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+ * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ *
+ **************************************************************************************************/
+// Auto-generated from mla_decode_kernel.cpp.in
+// Template parameters: ELEM_TAG=half, PAGE_SIZE=32, Q_TILE=8, ARCH_TAG=xe20
+#define SYCL_INTEL_TARGET 20
+
+#include "sycl/kernels/mla/xe20/device/mla_decode_types.hpp"
+
+namespace mla_decode {
+
+__attribute__((visibility("default"))) void launch_mla_decode_half_32_q8(
+    at::Tensor& out,
+    const std::optional<at::Tensor>& lse,
+    const at::Tensor& q_nope,
+    const at::Tensor& q_pe,
+    const at::Tensor& kv_c_and_k_pe_cache,
+    const at::Tensor& seq_lens,
+    const at::Tensor& page_table,
+    at::Tensor& workspace,
+    double sm_scale,
+    int64_t num_kv_splits) {
+  runMla<sycl::half, PageSizeOption<32>, 8>(
+      out, lse, q_nope, q_pe, kv_c_and_k_pe_cache, seq_lens, page_table,
+      workspace, sm_scale, num_kv_splits);
+}
+
+}  // namespace mla_decode
+
+#ifdef SGL_MLA_JIT_ENTRY
+// Stable C ABI entry for the runtime-JIT path. Tensors cross the dlopen boundary
+// as at::Tensor* (both sides share <torch/all.h> -> identical layout). One config
+// per .so, so the fixed symbol name never collides across AOT TUs.
+extern "C" __attribute__((visibility("default"))) void sgl_mla_decode_entry(
+    void* out,
+    const void* lse,  // const std::optional<at::Tensor>*
+    const void* q_nope,
+    const void* q_pe,
+    const void* kv_c_and_k_pe_cache,
+    const void* seq_lens,
+    const void* page_table,
+    void* workspace,
+    double sm_scale,
+    int64_t num_kv_splits) {
+  mla_decode::launch_mla_decode_half_32_q8(
+      *static_cast<at::Tensor*>(out),
+      *static_cast<const std::optional<at::Tensor>*>(lse),
+      *static_cast<const at::Tensor*>(q_nope),
+      *static_cast<const at::Tensor*>(q_pe),
+      *static_cast<const at::Tensor*>(kv_c_and_k_pe_cache),
+      *static_cast<const at::Tensor*>(seq_lens),
+      *static_cast<const at::Tensor*>(page_table),
+      *static_cast<at::Tensor*>(workspace),
+      sm_scale,
+      num_kv_splits);
+}
+#endif

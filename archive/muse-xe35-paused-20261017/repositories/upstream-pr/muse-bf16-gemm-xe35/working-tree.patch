@@ -1,0 +1,951 @@
+diff --git a/benchmark/bench_bf16_gemm_nt.py b/benchmark/bench_bf16_gemm_nt.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..ca988f87dd6820afbfc99503e5135ae9f719a64d
+--- /dev/null
++++ b/benchmark/bench_bf16_gemm_nt.py
+@@ -0,0 +1,194 @@
++"""Compare BF16 GEMM dispatch and kernels with XPU graph event timing."""
++
++import argparse
++import csv
++import os
++import statistics
++import time
++from contextlib import nullcontext
++
++
++def capture_xe35(function, warmup, calls):
++    for _ in range(warmup):
++        function()
++    torch.xpu.synchronize()
++    graph = torch.xpu.XPUGraph()
++    with torch.xpu.graph(graph):
++        for _ in range(calls):
++            function()
++    for _ in range(warmup):
++        graph.replay()
++    torch.xpu.synchronize()
++    return graph
++
++
++def measure_xe35(graph, calls):
++    start = torch.xpu.Event(enable_timing=True)
++    end = torch.xpu.Event(enable_timing=True)
++    start.record()
++    graph.replay()
++    end.record()
++    end.synchronize()
++    return start.elapsed_time(end) / calls
++
++
++def force_kernel_xe35(output, activations, weight, packed):
++    torch.ops.sgl_kernel.bf16_gemm_nt_xe35.default(
++        output, activations, weight, 2 if packed else 0
++    )
++    return output
++
++
++def parse_args_xe35():
++    if os.environ.get("BATCHES", "8") != "8":
++        raise SystemExit("BATCHES must be 8; rejected before GPU work")
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument("--serving-batch", type=int, choices=(8,), default=8)
++    parser.add_argument("--mode", choices=("all", "dispatch", "kernel"), default="all")
++    parser.add_argument(
++        "--shape", nargs=2, action="append", type=int, metavar=("N", "K")
++    )
++    parser.add_argument(
++        # M counts GEMM rows, not the serving batch size.
++        "--m",
++        type=int,
++        nargs="+",
++        default=[8],
++    )
++    parser.add_argument("--n", type=int, default=32768)
++    parser.add_argument("--k", type=int, default=8192)
++    parser.add_argument("--warmup", type=int, default=5)
++    parser.add_argument("--repeat", "--repeats", dest="repeats", type=int, default=20)
++    parser.add_argument("--calls", type=int, default=20)
++    parser.add_argument("--seed", type=int, default=42)
++    parser.add_argument("--output", help="Optional CSV with medians and sample spans")
++    args = parser.parse_args()
++    args.shapes = args.shape or [(args.n, args.k)]
++    if any(
++        columns <= 0 or inner <= 0 or columns % 16 or inner % 16
++        for columns, inner in args.shapes
++    ) or any(rows <= 0 for rows in args.m):
++        parser.error("positive shapes with N and K divisible by 16 are required")
++    if args.warmup < 0 or args.repeats <= 0 or args.calls <= 0:
++        parser.error("--warmup must be nonnegative; repeats and calls must be positive")
++    return args
++
++
++def benchmark_case_xe35(args, weight, packed_weight, rows, names):
++    columns, inner = weight.shape
++    activations = torch.randn((rows, inner), dtype=torch.bfloat16, device=weight.device)
++    native_output = torch.empty(
++        (rows, columns), dtype=activations.dtype, device=activations.device
++    )
++    packed_output = torch.empty(
++        (rows, packed_weight.shape[1]),
++        dtype=activations.dtype,
++        device=activations.device,
++    )
++    functions = {
++        "native_mm": lambda: torch.mm(activations, weight.T),
++        "native_cute": lambda: force_kernel_xe35(
++            native_output, activations, weight, False
++        ),
++        "packed_mm": lambda: torch.mm(activations, packed_weight),
++        "packed_cute": lambda: force_kernel_xe35(
++            packed_output, activations, packed_weight, True
++        ),
++        "native_dispatch": lambda: bf16_gemm_nt_xe35(activations, weight),
++        "packed_dispatch": lambda: bf16_gemm_nt_xe35(
++            activations, packed_weight, packed_weight=True
++        ),
++        "native_mm_after": lambda: torch.mm(activations, weight.T),
++    }
++    reference = torch.mm(activations.float().cpu(), weight.float().cpu().T)
++    for name in names:
++        output = functions[name]()
++        torch.testing.assert_close(
++            output[:, :columns].float().cpu(), reference, atol=5e-3, rtol=5e-3
++        )
++    graphs = {
++        name: capture_xe35(functions[name], args.warmup, args.calls) for name in names
++    }
++    samples = {name: [] for name in names}
++    for index in range(args.repeats):
++        comparison_names = tuple(name for name in names if name != "native_mm_after")
++        order = (
++            comparison_names if index % 2 == 0 else tuple(reversed(comparison_names))
++        )
++        if "native_mm_after" in names:
++            order = (*order, "native_mm_after")
++        for name in order:
++            samples[name].append(measure_xe35(graphs[name], args.calls))
++    result = {"m": rows, "n": columns, "k": inner}
++    for name in names:
++        result[name + "_ms"] = statistics.median(samples[name])
++        result[name + "_span_ms"] = max(samples[name]) - min(samples[name])
++    return result
++
++
++def main_xe35():
++    global torch, bf16_gemm_nt_xe35, pack_bf16_gemm_weight_xe35
++    args = parse_args_xe35()
++    import sgl_kernel
++    import torch
++    from sgl_kernel import bf16_gemm_nt_xe35, pack_bf16_gemm_weight_xe35
++
++    if not torch.xpu.is_available() or not sgl_kernel.is_xe3_arch():
++        raise RuntimeError("BF16 NT GEMM benchmark requires Xe35 (capability 3.5)")
++
++    names = {
++        "kernel": ("native_mm", "native_cute", "packed_mm", "packed_cute"),
++        "dispatch": (
++            "native_mm",
++            "native_dispatch",
++            "packed_mm",
++            "packed_dispatch",
++        ),
++        "all": (
++            "native_mm",
++            "native_cute",
++            "packed_mm",
++            "packed_cute",
++            "native_dispatch",
++            "packed_dispatch",
++            "native_mm_after",
++        ),
++    }[args.mode]
++    torch.manual_seed(args.seed)
++    print(
++        f"device={torch.xpu.get_device_name(0)} torch={torch.__version__} "
++        f"timing=xpu_graph_events mode={args.mode} "
++        f"calls={args.calls} repeats={args.repeats}",
++        flush=True,
++    )
++    fields = ["m", "n", "k"]
++    fields += [name + "_ms" for name in names]
++    fields += [name + "_span_ms" for name in names]
++    output_context = (
++        open(args.output, "w", newline="") if args.output else nullcontext(None)
++    )
++    with output_context as handle:
++        writer = csv.DictWriter(handle, fieldnames=fields) if handle else None
++        if writer:
++            writer.writeheader()
++        completed_cases = 0
++        for columns, inner in args.shapes:
++            weight = torch.randn((columns, inner), dtype=torch.bfloat16, device="xpu")
++            packed_weight = pack_bf16_gemm_weight_xe35(weight)
++            for rows in args.m:
++                if completed_cases:
++                    torch.xpu.synchronize()
++                    time.sleep(2)
++                result = benchmark_case_xe35(args, weight, packed_weight, rows, names)
++                if writer:
++                    writer.writerow(result)
++                    handle.flush()
++                timings = " ".join(
++                    f"{name}={result[name + '_ms']:.5f}ms" for name in names
++                )
++                print(f"M={rows} N={columns} K={inner} {timings}", flush=True)
++                completed_cases += 1
++
++
++if __name__ == "__main__":
++    main_xe35()
+diff --git a/cmake/BuildFlags.cmake b/cmake/BuildFlags.cmake
+index 5dfb191b37ff61b04b4329536b487308b197cc44..086239cefe6af99520acbb1c4423744a46d9a4cc 100644
+--- a/cmake/BuildFlags.cmake
++++ b/cmake/BuildFlags.cmake
+@@ -26,7 +26,7 @@ function(CHECK_SYCL_FLAG FLAG VARIABLE_NAME)
+ endfunction()
+ 
+ # Support GCC on Linux.
+-if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
++if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" OR CMAKE_CXX_COMPILER_ID STREQUAL "IntelLLVM")
+   message(STATUS "sgl-kernel-xpu build type: ${CMAKE_BUILD_TYPE}")
+   set(SYCL_HOST_FLAGS)
+   set(SYCL_KERNEL_OPTIONS)
+@@ -185,6 +185,6 @@ if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+ 
+   set(SYCL_OFFLINE_COMPILER_FLAGS "${SYCL_OFFLINE_COMPILER_AOT_OPTIONS}${SYCL_OFFLINE_COMPILER_CG_OPTIONS}")
+ else()
+-  message("Not compiling with XPU. Currently only support GCC compiler on Linux as CXX compiler.")
++  message("Not compiling with XPU. Currently only support GNU or IntelLLVM compiler on Linux as CXX compiler.")
+   return()
+ endif()
+diff --git a/include/sgl_kernel/xe35/bf16_gemm_ops.h b/include/sgl_kernel/xe35/bf16_gemm_ops.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..96206dc238a0a340348174812bc59984683d74c8
+--- /dev/null
++++ b/include/sgl_kernel/xe35/bf16_gemm_ops.h
+@@ -0,0 +1,8 @@
++#pragma once
++
++#include <torch/types.h>
++
++#include "sgl_kernel_export.h"
++
++SGL_KERNEL_EXPORT void bf16_gemm_nt_xpu_xe35(
++    torch::Tensor& output, const torch::Tensor& mat_a, const torch::Tensor& mat_b, int64_t config);
+diff --git a/include/sgl_kernel_ops.h b/include/sgl_kernel_ops.h
+index 0b71dcef0d0cd28a7b2bf892845c95d6c12a547f..2c71579173bf9aa20cb060758720567b09c14ba7 100644
+--- a/include/sgl_kernel_ops.h
++++ b/include/sgl_kernel_ops.h
+@@ -26,6 +26,10 @@ limitations under the License.
+ #include <tuple>
+ #include <vector>
+ 
++#if SYCL_INTEL_TARGET == 35
++#include "sgl_kernel/xe35/bf16_gemm_ops.h"
++#endif
++
+ #define _CONCAT(A, B) A##B
+ #define CONCAT(A, B) _CONCAT(A, B)
+ 
+diff --git a/python/sgl_kernel/__init__.py b/python/sgl_kernel/__init__.py
+index a9a03451df67b5d0d712636f0ef87e9a7a766c12..1977cd4ea7697d2531a97ab83fbd1ee34d827aaa 100644
+--- a/python/sgl_kernel/__init__.py
++++ b/python/sgl_kernel/__init__.py
+@@ -5,6 +5,8 @@ from typing import Optional
+ 
+ import torch
+ 
++from sgl_kernel.bf16_gemm import bf16_gemm_nt_xe35, pack_bf16_gemm_weight_xe35
++
+ SYSTEM_ARCH = platform.machine()
+ 
+ 
+diff --git a/python/sgl_kernel/bf16_gemm.py b/python/sgl_kernel/bf16_gemm.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..c687e70f41ac393f04a081f51f4c5a809579c3dd
+--- /dev/null
++++ b/python/sgl_kernel/bf16_gemm.py
+@@ -0,0 +1,141 @@
++from typing import Optional
++
++import torch
++
++
++def _bf16_gemm_nt_use_cute_xe35(
++    mat_a: torch.Tensor, m: int, n: int, k: int, packed_weight: bool
++) -> bool:
++    major, minor = torch.ops.sgl_kernel.query_device.default(mat_a.device.index or 0)
++    if (major, minor) != (3, 5):
++        return False
++    if not packed_weight:
++        # Paired native-B timings cross sharply at M=8/9. Around 4K, the
++        # crossover also follows K tile alignment and weight size; use the
++        # measured contiguous regions rather than individual model widths.
++        if not 0 < m <= 8:
++            return False
++        weight_elems = n * k
++        if k % 1024 == 0 and 3 * 1024 <= k <= 4 * 1024:
++            min_elems = 20 * 1024 * 1024 if k >= 4 * 1024 else 30 * 1024 * 1024
++            return min_elems <= weight_elems <= 100 * 1024 * 1024
++        if (
++            k % 16 != 0
++            or not 4 * 1024 - 96 <= k <= 4 * 1024 + 96
++            or weight_elems > 82 * 1024 * 1024
++        ):
++            return False
++        # A power-of-two row count avoids the N crossover at this smaller
++        # weight size. Neighboring non-power-of-two N favored torch.mm.
++        if (
++            (n & (n - 1)) == 0
++            and abs(k - 4 * 1024) <= 16
++            and weight_elems >= 31 * 1024 * 1024
++        ):
++            return True
++        if abs(k - 4 * 1024) <= 16 and weight_elems >= 43 * 1024 * 1024:
++            return True
++        if k % 64 == 32 and weight_elems >= 39 * 1024 * 1024:
++            return True
++        # The edge K tiles have a short throughput dip just above 16K rows.
++        min_large_elems = 65 * 1024 * 1024 if k % 64 == 48 else 66 * 1024 * 1024
++        return (
++            abs(k - 4 * 1024) <= 48
++            and weight_elems >= 47 * 1024 * 1024
++            and (n <= 16 * 1024 or weight_elems >= min_large_elems)
++        )
++    # On this Xe35 device, paired BF16 graph timings favor CuTe for packed
++    # weights above roughly 200 MiB. Smaller weights and power-of-two row
++    # strides favor torch.mm. The M bounds follow the measured kernel
++    # crossover; larger M needs a smaller weight to stay ahead of torch.mm.
++    if m <= 0 or n < 14336 or n * k < 100 * 1024 * 1024 or n & (n - 1) == 0:
++        return False
++    if m <= 16 or 33 <= m <= 80:
++        return True
++    return 81 <= m <= 128 and n >= 16384 and n * k <= 200 * 1024 * 1024
++
++
++def _bf16_gemm_nt_torch_fallback_xe35(
++    mat_a: torch.Tensor, mat_b: torch.Tensor, packed_weight: bool
++) -> torch.Tensor:
++    if packed_weight:
++        return torch.mm(mat_a, mat_b)
++    if (
++        mat_a.device.type == "xpu"
++        and mat_a.dtype == torch.bfloat16
++        and mat_b.dtype == torch.bfloat16
++    ):
++        return torch.mm(mat_a, mat_b.T, out_dtype=torch.bfloat16)
++    return torch.mm(mat_a, mat_b.T)
++
++
++def bf16_gemm_nt_xe35(
++    mat_a: torch.Tensor,
++    mat_b: torch.Tensor,
++    *,
++    packed_weight: bool = False,
++    output_n: Optional[int] = None,
++) -> torch.Tensor:
++    """Compute an XPU BF16 GEMM with a model-native or prepacked weight.
++
++    ``mat_b`` is ``[N, K]`` by default. When ``packed_weight`` is true it is
++    a contiguous ``[K, padded_N]`` tensor produced by
++    :func:`pack_bf16_gemm_weight_xe35`. ``output_n`` selects the logical output
++    width while retaining the packed weight's physical stride.
++    """
++    assert mat_a.ndim == 2 and mat_b.ndim == 2
++    k = mat_b.shape[0] if packed_weight else mat_b.shape[1]
++    n = mat_b.shape[1] if packed_weight else mat_b.shape[0]
++    assert mat_a.shape[1] == k
++    if output_n is not None and (not packed_weight or not 0 < output_n <= n):
++        raise ValueError(
++            "output_n requires a packed weight and must be within its width"
++        )
++    logical_n = output_n if output_n is not None else n
++    fallback_b = mat_b[:, :logical_n] if packed_weight and logical_n != n else mat_b
++    if (
++        mat_a.device.type != "xpu"
++        or mat_a.dtype != torch.bfloat16
++        or mat_b.dtype != torch.bfloat16
++        or not mat_a.is_contiguous()
++        or not mat_b.is_contiguous()
++        or k % 16 != 0
++        or n % 16 != 0
++        or logical_n % 16 != 0
++    ):
++        return _bf16_gemm_nt_torch_fallback_xe35(mat_a, fallback_b, packed_weight)
++    if not _bf16_gemm_nt_use_cute_xe35(mat_a, mat_a.shape[0], n, k, packed_weight):
++        return _bf16_gemm_nt_torch_fallback_xe35(mat_a, fallback_b, packed_weight)
++    out = torch.empty(
++        (mat_a.shape[0], logical_n), dtype=torch.bfloat16, device=mat_a.device
++    )
++    torch.ops.sgl_kernel.bf16_gemm_nt_xe35.default(
++        out, mat_a, mat_b, 2 if packed_weight else 0
++    )
++    return out
++
++
++def pack_bf16_gemm_weight_xe35(weight: torch.Tensor) -> torch.Tensor:
++    """Pack a contiguous ``[N, K]`` BF16 weight as padded ``[K, N]``."""
++    assert weight.ndim == 2
++    assert weight.dtype == torch.bfloat16
++    assert weight.is_contiguous()
++    n, k = weight.shape
++    padded_n = (n + 255) // 256 * 256
++    # Power-of-two row strides from 16K onward show a repeatable packed GEMM
++    # throughput cliff on this Xe35 device. One more block avoids it.
++    power_of_two_stride = padded_n >= 16384 and padded_n & (padded_n - 1) == 0
++    if power_of_two_stride:
++        padded_n += 256
++    # For very large weights with an N that is not 32-aligned, writing into a
++    # sliced packed tensor is much slower than padding before the transpose.
++    if power_of_two_stride or (n * k >= 1 << 30 and n % 32 != 0):
++        return torch.nn.functional.pad(weight, (0, 0, 0, padded_n - n)).T.contiguous()
++    # Materialize the transpose before writing into a padded slice. XPU
++    # copy_ from a transposed source can leave isolated columns unwritten.
++    transposed = weight.T.contiguous()
++    if padded_n == n:
++        return transposed
++    packed = torch.zeros((k, padded_n), dtype=weight.dtype, device=weight.device)
++    packed[:, :n].copy_(transposed)
++    return packed
+diff --git a/src/BuildOnLinux.cmake b/src/BuildOnLinux.cmake
+index 1568e7e1fd1433b7c598d3460cb6f61ab5d451cb..0f6d82ae9ea9d0e74841a0f355e114b4836bb5d0 100644
+--- a/src/BuildOnLinux.cmake
++++ b/src/BuildOnLinux.cmake
+@@ -268,9 +268,13 @@ if(DPCPP_SYCL_TARGET MATCHES "cri")
+   foreach(sycl_src ${ATen_XPU_SYCL_XE35})
+     get_filename_component(name ${sycl_src} NAME_WLE REALPATH)
+     set(sycl_lib sgl-ops-sycl-${name})
++    set(sycl_src_flags "${XE35_OFFLINE_COMPILER_FLAGS}")
++    if(sycl_src MATCHES "/bf16_gemm_nt\\.cpp$")
++      string(APPEND sycl_src_flags " -internal_options -cl-intel-256-GRF-per-thread")
++    endif()
+     sycl_add_library(
+       ${sycl_lib}
+-      ${XE35_OFFLINE_COMPILER_FLAGS}
++      ${sycl_src_flags}
+       ${COMMON_DEVICE_LINK_FLAGS}
+       SHARED
+       SYCL_SOURCES ${sycl_src})
+diff --git a/src/sycl/Device.cpp b/src/sycl/Device.cpp
+index 44590db8a7c078bf6d8526548e75f80608b757af..2ab1b2262242d5741f5da3d55703004c257bb013 100644
+--- a/src/sycl/Device.cpp
++++ b/src/sycl/Device.cpp
+@@ -22,7 +22,8 @@ SGL_KERNEL_EXPORT std::tuple<int64_t, int64_t> query_device(int64_t device_index
+ // Need oneAPI 2026.2 or later to support `architecture::intel_gpu_cri`. Check the release
+ // (__INTEL_LLVM_COMPILER) rather than the build date (__SYCL_COMPILER_VERSION): 2026.1.x
+ // patch releases (e.g. 2026.1.3, 20260724) are built later but still lack this enum.
+-#if defined(__INTEL_LLVM_COMPILER) && __INTEL_LLVM_COMPILER >= 20260200
++#if (defined(__INTEL_LLVM_COMPILER) && __INTEL_LLVM_COMPILER >= 20260200) || \
++    (defined(__INTEL_LLVM_COMPILER_VERSION) && __INTEL_LLVM_COMPILER_VERSION >= 20260200)
+     case syclex::architecture::intel_gpu_cri:
+       return std::make_tuple(3, 5);
+ #endif
+diff --git a/src/sycl/HCHead.cpp b/src/sycl/HCHead.cpp
+index 78464246ed88cb8056af87e388bad9fc222d4053..1b2ace4419e74f6e6276cea4a8bcffc0b2078a6e 100644
+--- a/src/sycl/HCHead.cpp
++++ b/src/sycl/HCHead.cpp
+@@ -67,7 +67,10 @@ struct FusedHCHeadKernel : public __SYCL_KER_CONFIG_CONVENTION__ {
+     slm_ = sycl::local_accessor<float, 1>(slm_size, cgh);
+   }
+ 
+-  [[sycl::reqd_work_group_size(WG_SIZE)]] [[sycl::reqd_sub_group_size(SG_SIZE)]] void
++#ifdef __SYCL_DEVICE_ONLY__
++  [[sycl::reqd_work_group_size(WG_SIZE)]] [[sycl::reqd_sub_group_size(SG_SIZE)]]
++#endif
++  void
+   operator()(sycl::nd_item<1> item) const {
+     const int token_id = static_cast<int>(item.get_group(0));
+     const int tid = static_cast<int>(item.get_local_id(0));
+diff --git a/src/sycl/xe35/bf16_gemm_nt.cpp b/src/sycl/xe35/bf16_gemm_nt.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..a2828d56b1426fdeb873f4821f9f81ff79650e4e
+--- /dev/null
++++ b/src/sycl/xe35/bf16_gemm_nt.cpp
+@@ -0,0 +1,204 @@
++/***************************************************************************************************
++ * Copyright 2026 SGLang Team
++ * SPDX-License-Identifier: Apache-2.0
++ **************************************************************************************************/
++
++#define SYCL_INTEL_TARGET 35
++
++#include <ATen/ATen.h>
++#include <c10/core/DeviceGuard.h>
++#include <c10/xpu/XPUStream.h>
++#include <torch/all.h>
++
++#include <cute/tensor.hpp>
++#include <type_traits>
++
++#include "sgl_kernel/xe35/bf16_gemm_ops.h"
++
++#include "cutlass/epilogue/collective/xe_epilogue.hpp"
++#include "cutlass/epilogue/fusion/xe_callbacks.hpp"
++#include "cutlass/gemm/collective/collective_mma.hpp"
++#include "cutlass/gemm/device/gemm_universal.h"
++#include "cutlass/gemm/device/gemm_universal_adapter.h"
++#include "cutlass/kernel_hardware_info.hpp"
++#include "cutlass/util/packed_stride.hpp"
++
++namespace {
++
++using namespace cute;
++
++template <int TileM, int TileN, int SgM, int SgN, int TileK = 32, bool PackedB = false, int Stages = 2>
++struct Bf16GemmNtConfig_xe35 {
++  using ElementAccumulator = float;
++  using Element = cutlass::bfloat16_t;
++  using LayoutB = std::conditional_t<PackedB, cutlass::layout::RowMajor, cutlass::layout::ColumnMajor>;
++  using TileShape = Shape<Int<TileM>, Int<TileN>, Int<TileK>>;
++  using SubgroupLayout = Layout<Shape<Int<SgM>, Int<SgN>, _1>, Stride<Int<SgN>, _1, _0>>;
++
++  using TiledMma =
++      typename TiledMMAHelper<MMA_Atom<XE_DPAS_TT<8, float, cute::bfloat16_t>>, Layout<TileShape>, SubgroupLayout>::
++          TiledMMA;
++
++  using EpiloguePolicy = cutlass::epilogue::IntelXeXMX16;
++  using EpilogueOp = cutlass::epilogue::fusion::LinearCombination<
++      Element,
++      float,
++      ElementAccumulator,
++      ElementAccumulator,
++      cutlass::FloatRoundStyle::round_to_nearest>;
++  using FusionCallbacks = cutlass::epilogue::fusion::
++      FusionCallbacks<EpiloguePolicy, EpilogueOp, TileShape, decltype(tile_shape(TiledMma()))>;
++  using CollectiveEpilogue = cutlass::epilogue::collective::CollectiveEpilogue<
++      EpiloguePolicy,
++      TileShape,
++      ElementAccumulator,
++      cutlass::gemm::TagToStrideC_t<cutlass::layout::RowMajor>,
++      Element,
++      cutlass::gemm::TagToStrideC_t<cutlass::layout::RowMajor>,
++      FusionCallbacks,
++      XE_2D_U32x8x16_LD_N,
++      void,
++      void,
++      XE_2D_U16x8x16_ST_N,
++      void,
++      void>;
++
++  using CollectiveMainloop = cutlass::gemm::collective::CollectiveMma<
++      cutlass::gemm::MainloopXeL1Staged<Stages>,
++      TileShape,
++      Element,
++      cutlass::gemm::TagToStrideA_t<cutlass::layout::RowMajor>,
++      Element,
++      cutlass::gemm::TagToStrideB_t<LayoutB>,
++      TiledMma,
++      void,
++      void,
++      void,
++      cute::identity,
++      void,
++      void,
++      void,
++      cute::identity>;
++  using Kernel =
++      cutlass::gemm::kernel::GemmUniversal<Shape<int, int, int, int>, CollectiveMainloop, CollectiveEpilogue>;
++  using Gemm = cutlass::gemm::device::GemmUniversalAdapter<Kernel>;
++};
++
++template <typename Gemm>
++cutlass::Status launch_xe35(
++    const at::Tensor& a,
++    const at::Tensor& b,
++    at::Tensor& out,
++    const cutlass::KernelHardwareInfo& hw_info,
++    sycl::queue& queue,
++    int n,
++    int k,
++    int packed_b_width) {
++  using ElementA = typename Gemm::ElementA;
++  using ElementB = typename Gemm::ElementB;
++  using ElementD = typename Gemm::CollectiveEpilogue::ElementOutput;
++  using StrideA = typename Gemm::GemmKernel::StrideA;
++  using StrideB = typename Gemm::GemmKernel::StrideB;
++  using StrideC = typename Gemm::GemmKernel::StrideC;
++  using StrideD = typename Gemm::GemmKernel::StrideD;
++
++  const int m = static_cast<int>(a.size(0));
++  auto problem = make_shape(m, n, k, 1);
++  StrideA stride_a = cutlass::make_cute_packed_stride(StrideA{}, make_shape(m, k, 1));
++  StrideB stride_b = cutlass::make_cute_packed_stride(StrideB{}, make_shape(packed_b_width, k, 1));
++  StrideC stride_c = cutlass::make_cute_packed_stride(StrideC{}, make_shape(m, n, 1));
++  StrideD stride_d = cutlass::make_cute_packed_stride(StrideD{}, make_shape(m, n, 1));
++
++  typename Gemm::GemmKernel::Arguments args{
++      cutlass::gemm::GemmUniversalMode::kGemm,
++      problem,
++      {static_cast<ElementA*>(a.data_ptr()), stride_a, static_cast<ElementB*>(b.data_ptr()), stride_b},
++      {{1.0f, 0.0f}, nullptr, stride_c, static_cast<ElementD*>(out.data_ptr()), stride_d},
++      hw_info};
++
++  Gemm op;
++  auto status = op.can_implement(args);
++  if (status != cutlass::Status::kSuccess) return status;
++  status = op.initialize(args, nullptr, &queue);
++  if (status != cutlass::Status::kSuccess) return status;
++  return op.run(&queue);
++}
++
++template <typename Config>
++cutlass::Status launch_config_xe35(
++    const at::Tensor& a,
++    const at::Tensor& b,
++    at::Tensor& out,
++    const cutlass::KernelHardwareInfo& hw_info,
++    sycl::queue& queue,
++    int n,
++    int k,
++    int packed_b_width) {
++  return launch_xe35<typename Config::Gemm>(a, b, out, hw_info, queue, n, k, packed_b_width);
++}
++
++}  // namespace
++
++void bf16_gemm_nt_xpu_xe35(at::Tensor& output, const at::Tensor& mat_a, const at::Tensor& mat_b, int64_t config) {
++  TORCH_CHECK(mat_a.dim() == 2 && mat_b.dim() == 2 && output.dim() == 2, "bf16_gemm_nt expects 2D tensors");
++  TORCH_CHECK(mat_a.is_xpu() && mat_b.is_xpu() && output.is_xpu(), "bf16_gemm_nt expects XPU tensors");
++  TORCH_CHECK(
++      mat_a.device() == mat_b.device() && mat_a.device() == output.device(),
++      "bf16_gemm_nt tensors must be on the same device");
++  TORCH_CHECK(
++      mat_a.scalar_type() == at::kBFloat16 && mat_b.scalar_type() == at::kBFloat16 &&
++          output.scalar_type() == at::kBFloat16,
++      "bf16_gemm_nt currently supports BF16 inputs and output");
++  TORCH_CHECK(mat_a.is_contiguous() && mat_b.is_contiguous() && output.is_contiguous(), "tensors must be contiguous");
++  const bool packed_b = config == 2;
++  TORCH_CHECK(mat_a.size(1) == (packed_b ? mat_b.size(0) : mat_b.size(1)), "K mismatch");
++  TORCH_CHECK(
++      output.size(0) == mat_a.size(0) && output.size(1) > 0 &&
++          (packed_b ? output.size(1) <= mat_b.size(1) : output.size(1) == mat_b.size(0)),
++      "output shape mismatch");
++  TORCH_CHECK(mat_a.size(0) > 0 && mat_b.size(0) > 0 && mat_a.size(1) > 0, "dimensions must be positive");
++  TORCH_CHECK(
++      mat_a.size(0) <= INT_MAX && mat_b.size(0) <= INT_MAX && mat_a.size(1) <= INT_MAX && mat_b.size(1) <= INT_MAX &&
++          output.size(1) <= INT_MAX,
++      "dimension too large");
++
++  c10::DeviceGuard guard(mat_a.device());
++  sycl::queue& queue = at::xpu::getCurrentXPUStream(mat_a.device().index()).queue();
++  cutlass::KernelHardwareInfo hw_info;
++  hw_info.device_id = mat_a.device().index();
++  hw_info.sm_count = cutlass::KernelHardwareInfo::query_device_multiprocessor_count(hw_info.device_id);
++
++  const int m = static_cast<int>(mat_a.size(0));
++  const int n = static_cast<int>(output.size(1));
++  const int k = static_cast<int>(mat_a.size(1));
++  const int packed_b_width = packed_b ? static_cast<int>(mat_b.size(1)) : n;
++  TORCH_CHECK(
++      n % 16 == 0 && k % 16 == 0 && packed_b_width % 16 == 0, "N, K, and packed B width must be multiples of 16");
++  cutlass::Status status;
++  if (config == 0 || config == 1) {
++    status =
++        launch_config_xe35<Bf16GemmNtConfig_xe35<64, 256, 8, 4, 64>>(mat_a, mat_b, output, hw_info, queue, n, k, packed_b_width);
++  } else if (config == 2) {
++    if (m <= 16) {
++      status = launch_config_xe35<Bf16GemmNtConfig_xe35<16, 256, 2, 16, 32, true, 2>>(
++          mat_a, mat_b, output, hw_info, queue, n, k, packed_b_width);
++    } else {
++      status = launch_config_xe35<Bf16GemmNtConfig_xe35<32, 256, 4, 8, 64, true, 2>>(
++          mat_a, mat_b, output, hw_info, queue, n, k, packed_b_width);
++    }
++  } else {
++    status = cutlass::Status::kErrorInvalidProblem;
++  }
++  TORCH_CHECK(
++      status == cutlass::Status::kSuccess,
++      "bf16_gemm_nt failed: ",
++      cutlassGetStatusString(status),
++      " for M=",
++      mat_a.size(0),
++      " N=",
++      n,
++      " K=",
++      mat_a.size(1));
++}
++
++#undef SYCL_INTEL_TARGET
+diff --git a/src/torch_extension_sycl.cc b/src/torch_extension_sycl.cc
+index 8603e536b016ae275cc7e77d48e1a312532d48c2..e1a8f9e192c90a5cf1ea0641008194e77c71b58e 100644
+--- a/src/torch_extension_sycl.cc
++++ b/src/torch_extension_sycl.cc
+@@ -301,6 +301,10 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
+   m.impl("dsv3_router_gemm", torch::kXPU, &dsv3_router_gemm_xpu);
+   m.def("dsv3_fused_a_gemm(Tensor! output, Tensor mat_a, Tensor mat_b) -> ()");
+   m.impl("dsv3_fused_a_gemm", torch::kXPU, &dsv3_fused_a_gemm_xpu);
++#if SYCL_INTEL_TARGET == 35
++  m.def("bf16_gemm_nt_xe35(Tensor! output, Tensor mat_a, Tensor mat_b, int config=0) -> ()");
++  m.impl("bf16_gemm_nt_xe35", torch::kXPU, &bf16_gemm_nt_xpu_xe35);
++#endif
+   m.def(
+       "fp8_scaled_mm(Tensor mat_a, Tensor mat_b, Tensor scales_a, Tensor scales_b, ScalarType out_dtype, Tensor? "
+       "bias) -> Tensor");
+diff --git a/tests/test_bf16_gemm_nt_xpu.py b/tests/test_bf16_gemm_nt_xpu.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..72fc5bc9c841844d262322dc9062a5a691b1bda5
+--- /dev/null
++++ b/tests/test_bf16_gemm_nt_xpu.py
+@@ -0,0 +1,208 @@
++import os
++import time
++
++if os.environ.get("BATCHES", "8") != "8":
++    raise SystemExit("BATCHES must be 8; rejected before GPU work")
++
++import pytest
++import sgl_kernel
++import torch
++from sgl_kernel import bf16_gemm_nt_xe35, pack_bf16_gemm_weight_xe35
++
++
++@pytest.fixture(autouse=True)
++def seed_inputs_xe35():
++    torch.manual_seed(42)
++    if torch.xpu.is_available() and sgl_kernel.is_xe3_arch():
++        torch.xpu.synchronize()
++        time.sleep(2)
++
++
++@pytest.mark.parametrize("capability,expected", [((3, 5), True), ((2, 0), False)])
++def test_bf16_gemm_nt_dispatch_capability_without_device_name_xe35(
++    monkeypatch, capability, expected
++):
++    from sgl_kernel.bf16_gemm import _bf16_gemm_nt_use_cute_xe35
++
++    monkeypatch.setattr(
++        torch.ops.sgl_kernel.query_device, "default", lambda index: capability
++    )
++
++    def reject_device_name(index):
++        raise AssertionError(
++            "dispatch must not use a device-model performance whitelist"
++        )
++
++    monkeypatch.setattr(torch.xpu, "get_device_name", reject_device_name)
++    assert (
++        _bf16_gemm_nt_use_cute_xe35(torch.empty(8, 4096), 8, 8192, 4096, False)
++        == expected
++    )
++
++
++@pytest.mark.parametrize(
++    "shape",
++    [
++        (1, 256, 32),  # Generic small GEMM.
++        (7, 257, 96),  # Generic non-divisible output tail.
++        (8, 202048, 8192),  # Muse B8 decode: M8, vocabulary N202048, K8192.
++        (
++            8,
++            8192,
++            4096,
++        ),  # Muse B8 MoE decompression: M8, hidden N8192, compressed K4096.
++        (8, 4096, 8192),  # Muse B8 MoE compression: M8, compressed N4096, hidden K8192.
++        (17, 4096, 8192),
++        (64, 202048, 8192),  # Synthetic GEMM row stress, not a serving batch.
++        (65, 8192, 4096),  # Generic tile-boundary stress, not a serving batch.
++    ],
++)
++def test_bf16_gemm_nt_xe35(shape):
++    if not torch.xpu.is_available() or not sgl_kernel.is_xe3_arch():
++        pytest.skip("Xe35 XPU is required")
++    m, n, k = shape
++    a = torch.randn((m, k), dtype=torch.bfloat16, device="xpu")
++    b = torch.randn((n, k), dtype=torch.bfloat16, device="xpu")
++    actual = bf16_gemm_nt_xe35(a, b)
++    expected = torch.mm(a.float().cpu(), b.float().cpu().T)
++    torch.testing.assert_close(actual.float().cpu(), expected, rtol=5e-3, atol=5e-3)
++
++
++def test_bf16_gemm_nt_packed_weight_xe35():
++    if not torch.xpu.is_available() or not sgl_kernel.is_xe3_arch():
++        pytest.skip("Xe35 XPU is required")
++    a = torch.randn((8, 96), dtype=torch.bfloat16, device="xpu")
++    b = torch.randn((257, 96), dtype=torch.bfloat16, device="xpu")
++    packed_b = pack_bf16_gemm_weight_xe35(b)
++    actual = bf16_gemm_nt_xe35(a, packed_b, packed_weight=True)[:, : b.shape[0]]
++    expected = torch.mm(a.float().cpu(), b.float().cpu().T)
++    torch.testing.assert_close(actual.float().cpu(), expected, rtol=5e-3, atol=5e-3)
++
++
++@pytest.mark.parametrize("m", [8, 9, 17, 32, 33, 96, 97, 256, 257])
++def test_bf16_gemm_nt_packed_dense_projection_xe35(m):
++    if not torch.xpu.is_available() or not sgl_kernel.is_xe3_arch():
++        pytest.skip("Xe35 XPU is required")
++    # Muse hidden projection N8192/K8192; only M8 is B8 decode, others are tile stress.
++    a = torch.randn((m, 8192), dtype=torch.bfloat16, device="xpu")
++    b = torch.randn((8192, 8192), dtype=torch.bfloat16, device="xpu")
++    packed_b = pack_bf16_gemm_weight_xe35(b)
++    actual = bf16_gemm_nt_xe35(a, packed_b, packed_weight=True)
++    expected = torch.mm(a.float().cpu(), b.float().cpu().T)
++    torch.testing.assert_close(actual.float().cpu(), expected, rtol=5e-3, atol=5e-3)
++
++
++@pytest.mark.parametrize("m", [1, 7, 8, 9])
++def test_bf16_gemm_nt_packed_qkv_projection_xe35(m):
++    if not torch.xpu.is_available() or not sgl_kernel.is_xe3_arch():
++        pytest.skip("Xe35 XPU is required")
++    # Muse Q/K/V+output-gate N18432/K8192; M8 is B8 decode, M1/7/9 are boundaries.
++    a = torch.randn((m, 8192), dtype=torch.bfloat16, device="xpu")
++    b = torch.randn((18432, 8192), dtype=torch.bfloat16, device="xpu")
++    packed_b = pack_bf16_gemm_weight_xe35(b)
++    actual = bf16_gemm_nt_xe35(a, packed_b, packed_weight=True)
++    expected = torch.mm(a.float().cpu(), b.float().cpu().T)
++    torch.testing.assert_close(actual.float().cpu(), expected, rtol=5e-3, atol=5e-3)
++
++
++@pytest.mark.parametrize("m", [1, 8, 9, 16, 17, 33])
++@pytest.mark.parametrize("n,k", [(512, 96), (4096, 256)])
++def test_bf16_gemm_nt_packed_tiles_xe35(m, n, k):
++    if not torch.xpu.is_available() or not sgl_kernel.is_xe3_arch():
++        pytest.skip("Xe35 XPU is required")
++    a = torch.randn((m, k), dtype=torch.bfloat16, device="xpu")
++    b = torch.randn((n, k), dtype=torch.bfloat16, device="xpu")
++    packed_b = pack_bf16_gemm_weight_xe35(b)
++    actual = torch.empty((m, n), dtype=torch.bfloat16, device="xpu")
++    torch.ops.sgl_kernel.bf16_gemm_nt_xe35.default(actual, a, packed_b, 2)
++    expected = torch.mm(a.float().cpu(), b.float().cpu().T)
++    torch.testing.assert_close(actual.float().cpu(), expected, rtol=5e-3, atol=5e-3)
++
++
++@pytest.mark.parametrize("m,n,k", [(8, 512, 96), (17, 4096, 256)])
++def test_bf16_gemm_nt_native_kernel_xe35(m, n, k):
++    if not torch.xpu.is_available() or not sgl_kernel.is_xe3_arch():
++        pytest.skip("Xe35 XPU is required")
++    a = torch.randn((m, k), dtype=torch.bfloat16, device="xpu")
++    b = torch.randn((n, k), dtype=torch.bfloat16, device="xpu")
++    actual = torch.empty((m, n), dtype=torch.bfloat16, device="xpu")
++    torch.ops.sgl_kernel.bf16_gemm_nt_xe35.default(actual, a, b, 0)
++    expected = torch.mm(a.float().cpu(), b.float().cpu().T)
++    torch.testing.assert_close(actual.float().cpu(), expected, rtol=5e-3, atol=5e-3)
++
++
++@pytest.mark.parametrize(
++    "m,n,k",
++    [
++        (8, 8192, 4112),
++        (9, 8192, 4112),
++        (8, 16640, 4080),
++        (9, 16640, 4080),
++        (8, 18432, 4080),
++        (9, 18432, 4080),
++    ],
++)
++def test_bf16_gemm_nt_native_dispatch_boundary_xe35(m, n, k):
++    if not torch.xpu.is_available() or not sgl_kernel.is_xe3_arch():
++        pytest.skip("Xe35 XPU is required")
++    a = torch.randn((m, k), dtype=torch.bfloat16, device="xpu")
++    b = torch.randn((n, k), dtype=torch.bfloat16, device="xpu")
++    torch.testing.assert_close(
++        bf16_gemm_nt_xe35(a, b).float().cpu(),
++        torch.mm(a.float().cpu(), b.float().cpu().T),
++        rtol=5e-3,
++        atol=5e-3,
++    )
++
++
++def test_bf16_gemm_nt_packed_logical_width_xe35():
++    if not torch.xpu.is_available() or not sgl_kernel.is_xe3_arch():
++        pytest.skip("Xe35 XPU is required")
++    for m, n, k in [
++        (8, 272, 96),
++        (8, 16384, 8192),
++        (8, 202032, 8192),
++        (8, 202048, 8192),
++        (8, 202064, 8192),
++    ]:
++        torch.xpu.synchronize()
++        time.sleep(2)
++        a = torch.randn((m, k), dtype=torch.bfloat16, device="xpu")
++        b = torch.randn((n, k), dtype=torch.bfloat16, device="xpu")
++        packed_b = pack_bf16_gemm_weight_xe35(b)
++        expected_width = (n + 255) // 256 * 256
++        if expected_width >= 16384 and expected_width & (expected_width - 1) == 0:
++            expected_width += 256
++        assert packed_b.shape == (k, expected_width)
++        torch.testing.assert_close(packed_b[:, :n], b.T, rtol=0, atol=0)
++        actual = bf16_gemm_nt_xe35(a, packed_b, packed_weight=True, output_n=n)
++        assert actual.shape == (m, n)
++        torch.testing.assert_close(
++            actual.float().cpu(),
++            torch.mm(a.float().cpu(), b.float().cpu().T),
++            rtol=5e-3,
++            atol=5e-3,
++        )
++
++
++def test_bf16_gemm_nt_output_n_validation_xe35():
++    a = torch.ones((1, 16), dtype=torch.bfloat16)
++    weight = torch.ones((16, 16), dtype=torch.bfloat16)
++    with pytest.raises(ValueError, match="requires a packed weight"):
++        bf16_gemm_nt_xe35(a, weight, output_n=16)
++    with pytest.raises(ValueError, match="within its width"):
++        bf16_gemm_nt_xe35(a, weight, packed_weight=True, output_n=17)
++
++
++def test_bf16_gemm_nt_prefill_projection_xe35():
++    if not torch.xpu.is_available() or not sgl_kernel.is_xe3_arch():
++        pytest.skip("Xe35 XPU is required")
++    # Muse B8 ISL4096 prefill: M32768, hidden projection N8192, K8192.
++    activations = torch.randn((8 * 4096, 8192), dtype=torch.bfloat16, device="xpu")
++    weights = torch.randn((8192, 8192), dtype=torch.bfloat16, device="xpu")
++    actual = bf16_gemm_nt_xe35(activations, weights)
++    selected = torch.tensor([0, 1, 4095, 4096, 8191, 16384, 32766, 32767])
++    expected = activations[selected.to("xpu")].float().cpu() @ weights.float().cpu().T
++    torch.testing.assert_close(
++        actual[selected.to("xpu")].float().cpu(), expected, rtol=5e-3, atol=5e-3
++    )
+diff --git a/tests/test_device_arch_guard.py b/tests/test_device_arch_guard.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..74b668d021c396bc4c041bb48b877bb075002e9f
+--- /dev/null
++++ b/tests/test_device_arch_guard.py
+@@ -0,0 +1,47 @@
++import re
++import shutil
++import subprocess
++import unittest
++from pathlib import Path
++
++
++class TestDeviceArchitectureGuard(unittest.TestCase):
++    def test_compiler_release_guard(self):
++        source = Path(__file__).resolve().parents[1] / "src/sycl/Device.cpp"
++        content = source.read_text()
++        match = re.search(
++            r"(?m)^#if[^\n]*__INTEL_LLVM_COMPILER[^\n]*(?:\\\n[^\n]*)*\n(?=\s*case syclex::architecture::intel_gpu_cri:)",
++            content,
++        )
++        self.assertIsNotNone(match)
++        compiler = shutil.which("c++")
++        self.assertIsNotNone(compiler)
++        program = match.group() + "CRI_ENABLED\n#else\nCRI_DISABLED\n#endif\n"
++        cases = (
++            ({}, False),
++            ({"__SYCL_COMPILER_VERSION": 20260724}, False),
++            ({"__INTEL_LLVM_COMPILER": 20260100}, False),
++            ({"__INTEL_LLVM_COMPILER": 20260103, "__SYCL_COMPILER_VERSION": 20260724}, False),
++            ({"__INTEL_LLVM_COMPILER": 20260200}, True),
++            ({"__INTEL_LLVM_COMPILER": 20260300}, True),
++            ({"__INTEL_LLVM_COMPILER_VERSION": 20260100}, False),
++            ({"__INTEL_LLVM_COMPILER_VERSION": 20260103, "__SYCL_COMPILER_VERSION": 20260724}, False),
++            ({"__INTEL_LLVM_COMPILER_VERSION": 20260200}, True),
++            ({"__INTEL_LLVM_COMPILER_VERSION": 20260300}, True),
++            ({"__INTEL_LLVM_COMPILER": 20260103, "__INTEL_LLVM_COMPILER_VERSION": 20260103}, False),
++            ({"__INTEL_LLVM_COMPILER": 20260200, "__INTEL_LLVM_COMPILER_VERSION": 20260200}, True),
++        )
++        for definitions, enabled in cases:
++            with self.subTest(definitions=definitions):
++                result = subprocess.run(
++                    [compiler, "-E", "-P", "-x", "c++", "-", *(f"-D{name}={value}" for name, value in definitions.items())],
++                    input=program,
++                    capture_output=True,
++                    text=True,
++                    check=True,
++                )
++                self.assertEqual(result.stdout.strip(), "CRI_ENABLED" if enabled else "CRI_DISABLED")
++
++
++if __name__ == "__main__":
++    unittest.main()
